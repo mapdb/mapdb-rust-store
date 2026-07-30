@@ -1,4 +1,4 @@
-//! Cross-port conformance harness (Stage 1) — consumes the checked-in
+//! Cross-port conformance harness (Stages 1+2) — consumes the checked-in
 //! `tests/xfixtures/` bundle produced by the sync script.
 //!
 //! These fixtures pin the CURRENT state of an UNSTABLE on-disk format for
@@ -9,10 +9,12 @@
 //! Flow: load `MANIFEST.tsv` (HARD-FAIL if missing or version != 1), gunzip
 //! every fixture file once into a session temp dir verifying length + SHA-256,
 //! then run every `expect` row with engine == rust in a fresh per-cell temp
-//! dir: accept cells run `verify()` + the per-recid contract + the
-//! `get_all_recids` set check; reject cells demand `DbError::DataCorruption`.
-//! Every cell asserts the working copy is byte-unchanged afterwards and that
-//! no files beyond the allowed `.lock` sidecars appeared.
+//! dir: accept cells (direct AND wal openers) run `verify()` + the per-recid
+//! contract + the `get_all_recids` set check; reject cells demand
+//! `DbError::DataCorruption`. Every cell asserts the working copy is
+//! byte-unchanged afterwards and that no files beyond the allowed `.lock`
+//! sidecars appeared (in particular, a `.ckpt` companion must NOT appear
+//! after a wal cell's clean close).
 
 use flate2::read::GzDecoder;
 use mapdb_rust_store::error::{DbError, Result};
@@ -221,10 +223,13 @@ fn dir_entries(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Accept cell, opener=direct: verify() + per-recid contract + recid-set check.
-fn run_accept_direct(path: &Path, recids: &[&RecidRow], ctx: &str) {
-    let s = StoreDirect::open_file(path)
-        .unwrap_or_else(|e| panic!("[{ctx}] accept cell failed to open: {e}"));
+/// Accept cell: verify() + per-recid contract + recid-set check + close.
+///
+/// Shared by the direct and wal arms — the SAME reader assertion block runs in
+/// both. `StoreWAL` DOES expose `verify()` (the `Store` trait requires it, see
+/// `impl Store for StoreWAL`), so wal cells run verify() too; nothing is
+/// skipped.
+fn run_accept<S: Store>(s: &S, recids: &[&RecidRow], ctx: &str) {
     s.verify()
         .unwrap_or_else(|e| panic!("[{ctx}] verify() failed: {e}"));
     let mut want_all: BTreeSet<Recid> = BTreeSet::new();
@@ -348,7 +353,7 @@ fn xfixture_conformance() {
             ex.fixture, ex.verdict, ex.opener, ex.place_as, ex.open_arg
         );
         let files: Vec<&FileRow> = m.files.iter().filter(|f| f.fixture == ex.fixture).collect();
-        // Stage 1: every fixture has exactly ONE file row.
+        // Stages 1+2: every fixture has exactly ONE file row.
         assert_eq!(files.len(), 1, "[{ctx}] fixture must have exactly one file");
         let baseline = &baselines[&(ex.fixture.clone(), files[0].rel.clone())];
 
@@ -366,7 +371,23 @@ fn xfixture_conformance() {
             .collect();
         match (ex.verdict.as_str(), ex.opener.as_str()) {
             ("accept", "direct") => {
-                run_accept_direct(&cell.join(&ex.open_arg), &recids, &ctx);
+                let s = StoreDirect::open_file(&cell.join(&ex.open_arg))
+                    .unwrap_or_else(|e| panic!("[{ctx}] accept cell failed to open: {e}"));
+                run_accept(&s, &recids, &ctx);
+            }
+            ("accept", "wal") => {
+                // openArg is the literal WAL file path within the cell dir
+                // (`StoreWAL::open` takes the WAL FILE path itself).
+                let s = StoreWAL::open(&cell.join(&ex.open_arg))
+                    .unwrap_or_else(|e| panic!("[{ctx}] accept wal cell failed to open: {e}"));
+                run_accept(&s, &recids, &ctx);
+                // A `.ckpt` companion must NOT exist after a clean close; its
+                // appearance is a failure (also enforced by the generic
+                // new-files check below, which only allows `.lock`).
+                assert!(
+                    !dir_entries(&cell).iter().any(|f| f.ends_with(".ckpt")),
+                    "[{ctx}] .ckpt companion must not exist after a clean close"
+                );
             }
             ("reject", "direct") => match StoreDirect::open_file(&cell.join(&ex.open_arg)) {
                 Err(DbError::DataCorruption(_)) => {}
@@ -390,7 +411,7 @@ fn xfixture_conformance() {
                     }
                 }
             }
-            (v, o) => panic!("[{ctx}] unsupported Stage-1 cell verdict={v} opener={o}"),
+            (v, o) => panic!("[{ctx}] unsupported cell verdict={v} opener={o}"),
         }
 
         // working copy must be byte-identical...

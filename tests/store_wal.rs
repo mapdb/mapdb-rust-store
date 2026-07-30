@@ -380,6 +380,34 @@ fn unsupported_version_is_rejected() {
     assert!(is_corrupt(StoreWAL::open(&p)));
 }
 
+#[test]
+fn nonzero_v1_header_flags_are_rejected_without_rewrite() {
+    let p = tmp();
+    {
+        let s = StoreWAL::open(&p).unwrap();
+        s.put(&1i64, &L).unwrap();
+        s.commit().unwrap();
+        s.close().unwrap();
+    }
+    // Set the flags word (offset 12..16) nonzero; magic and version stay v1.
+    // The open must fail with an EXPLICIT DataCorruption (not fall through to
+    // the framed-MDB guard or legacy replay) and leave the file byte-unchanged.
+    let f = OpenOptions::new().write(true).open(&p).unwrap();
+    f.write_all_at(&1i32.to_be_bytes(), 12).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let before = std::fs::read(&p).unwrap();
+    assert!(
+        is_corrupt(StoreWAL::open(&p)),
+        "nonzero v1 header flags must be rejected as DataCorruption"
+    );
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        before,
+        "failed open must leave the file byte-unchanged"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint: compacts the log to one snapshot section, preserving state.
 // ---------------------------------------------------------------------------

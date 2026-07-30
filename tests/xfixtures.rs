@@ -1,4 +1,5 @@
-//! Cross-port conformance fixture GENERATOR (Stage 1, D workload).
+//! Cross-port conformance fixture GENERATOR (Stage 1 D workload + Stage 2 W
+//! workloads).
 //!
 //! These fixtures pin the CURRENT state of an UNSTABLE on-disk format for
 //! divergence detection between the engines. Cross-engine openability is an
@@ -12,12 +13,12 @@
 //! ```
 //!
 //! Refuses a nonempty output dir unless `XFIXTURES_FORCE=1`. Writes
-//! `direct-v1-rust.db` plus `fragment.tsv` (fixture/file/recid/recidrange rows
-//! for the sync script; the file row's gzSha256 column is left empty for the
-//! script to fill).
+//! `direct-v1-rust.db`, `wal-v1-rust-tail.wal`, `wal-v1-rust-ckpt.wal` plus
+//! `fragment.tsv` (fixture/file/recid/recidrange rows for the sync script; the
+//! file rows' gzSha256 column is left empty for the script to fill).
 
 use mapdb_rust_store::error::Result;
-use mapdb_rust_store::store::{Recid, Store, StoreDirect};
+use mapdb_rust_store::store::{Recid, Store, StoreDirect, StoreTx, StoreWAL};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::io::Write as _;
@@ -169,6 +170,150 @@ fn assert_reader_contract(
     assert_eq!(all, want, "getAllRecids must be exactly {{A,B,C,F,G}}");
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2: W (WAL v1) fixtures — `wal-v1-rust-tail.wal` / `wal-v1-rust-ckpt.wal`
+// ---------------------------------------------------------------------------
+
+/// Recids allocated by one W-workload run (labels A..F per the contract; the
+/// tail namespace additionally records the rolled-back put's recid, which must
+/// stay invisible everywhere — no fragment row, absent after reopen).
+#[derive(PartialEq, Eq, Debug)]
+struct WalRecids {
+    a: Recid,
+    b: Recid,
+    c: Recid,
+    d: Recid,
+    e: Recid,
+    f: Recid,
+    rolled: Option<Recid>,
+}
+
+/// Stage-2 W workload (contract §2) against a fresh `StoreWAL` at `path`.
+/// `ckpt == false` (tail): T1..T4 committed, then a rollback-only T5 LAST.
+/// `ckpt == true`  (ckpt): T1..T3, public `checkpoint()`, then T4. No rollback.
+fn build_wal_fixture(path: &Path, base: u64, ckpt: bool) -> WalRecids {
+    if path.exists() {
+        std::fs::remove_file(path).expect("remove stale wal fixture");
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".ckpt");
+    let tmp = std::path::PathBuf::from(tmp);
+    if tmp.exists() {
+        std::fs::remove_file(&tmp).expect("remove stale wal checkpoint temp");
+    }
+    let s = StoreWAL::open(path).expect("create wal fixture store");
+    // T1
+    let a = s.put(&payload(base, 100), &R).unwrap();
+    let b = s.put(&payload(base + 1, 0), &R).unwrap();
+    let c = s.put(&payload(base + 2, 40), &R).unwrap();
+    s.commit().unwrap();
+    // T2: explicit null + committed prealloc
+    s.update::<Vec<u8>>(c, None, &R).unwrap();
+    let d = s.preallocate().unwrap();
+    s.commit().unwrap();
+    // T3: E plain + F oversize (1_200_000 B spans the ~1 MiB replay buffering)
+    let e = s.put(&payload(base + 3, 256), &R).unwrap();
+    let f = s.put(&payload(base + 4, 1_200_000), &R).unwrap();
+    s.commit().unwrap();
+    if ckpt {
+        // snapshot 'C' section; the T4 'S' section follows it in the log.
+        s.checkpoint().unwrap();
+    }
+    // T4
+    s.delete(e).unwrap();
+    s.update(a, Some(&payload(base + 5, 120)), &R).unwrap();
+    s.commit().unwrap();
+    // T5 (tail only): rollback LAST — writes nothing; the put must be invisible.
+    let rolled = if ckpt {
+        None
+    } else {
+        let r = s.put(&payload(base + 6, 64), &R).unwrap();
+        s.rollback().unwrap();
+        Some(r)
+    };
+    s.close().unwrap();
+    WalRecids {
+        a,
+        b,
+        c,
+        d,
+        e,
+        f,
+        rolled,
+    }
+}
+
+/// Local scan of the raw v1 WAL bytes returning the section tags in file
+/// order. Format per the `src/store/wal.rs` module comment: 16-byte file
+/// header (magic "MDBS.WAL" | version i32 BE | flags i32 BE), then sections
+/// `tag u8 | lsn i64 BE | bodyLen i64 BE | hdrCrc i32 | bodyCrc i32 | body` —
+/// the scan skips `bodyLen` body bytes after each 25-byte section header.
+fn wal_section_tags(bytes: &[u8]) -> Vec<u8> {
+    assert_eq!(&bytes[..8], b"MDBS.WAL", "fixture must carry the v1 magic");
+    let mut tags = Vec::new();
+    let mut pos = 16usize;
+    while pos < bytes.len() {
+        assert!(
+            pos + 25 <= bytes.len(),
+            "torn section header in generated fixture at offset {pos}"
+        );
+        let body_len = i64::from_be_bytes(bytes[pos + 9..pos + 17].try_into().unwrap());
+        assert!(body_len >= 0, "negative bodyLen in generated fixture");
+        tags.push(bytes[pos]);
+        pos += 25 + body_len as usize;
+    }
+    assert_eq!(
+        pos,
+        bytes.len(),
+        "sections must tile the generated fixture exactly"
+    );
+    tags
+}
+
+/// Full W reader contract against a reopened `StoreWAL` (same checks the
+/// cross-engine conformance harness runs; the generator must pass its own).
+fn assert_wal_reader_contract(s: &StoreWAL, base: u64, r: &WalRecids) {
+    s.verify().expect("verify() on reopened wal fixture");
+    assert_eq!(
+        s.get(r.a, &R).unwrap(),
+        Some(payload(base + 5, 120)),
+        "A content (updated in T4)"
+    );
+    assert_eq!(
+        s.get(r.b, &R).unwrap(),
+        Some(Vec::new()),
+        "B is present and zero-length, NOT null"
+    );
+    assert_eq!(s.get(r.c, &R).unwrap(), None, "C is explicit null");
+    assert_eq!(s.get(r.d, &R).unwrap(), None, "D prealloc reads as None");
+    assert!(
+        matches!(
+            s.get(r.e, &R),
+            Err(mapdb_rust_store::DbError::GetVoid(x)) if x == r.e.get()
+        ),
+        "E must be deleted (GetVoid)"
+    );
+    assert_eq!(
+        s.get(r.f, &R).unwrap(),
+        Some(payload(base + 4, 1_200_000)),
+        "F oversize content"
+    );
+    if let Some(rolled) = r.rolled {
+        // leak detector: the rolled-back put must be void after replay...
+        assert!(
+            matches!(
+                s.get(rolled, &R),
+                Err(mapdb_rust_store::DbError::GetVoid(x)) if x == rolled.get()
+            ),
+            "rolled-back put must be invisible after reopen"
+        );
+    }
+    // ...and the recid set must be EXACTLY {A,B,C,F} — plus nothing.
+    let all: std::collections::BTreeSet<Recid> = s.get_all_recids().unwrap().into_iter().collect();
+    let want: std::collections::BTreeSet<Recid> = [r.a, r.b, r.c, r.f].into_iter().collect();
+    assert_eq!(all, want, "getAllRecids must be exactly {{A,B,C,F}}");
+}
+
 /// D-workload fixture generator (contract `write_fixtures`). `#[ignore]`d: run
 /// explicitly with `XFIXTURES_OUT` set, see the module header.
 #[test]
@@ -280,6 +425,90 @@ fn write_fixtures() {
         churn.first().unwrap(),
         churn.last().unwrap()
     ));
+
+    // ---- Stage 2: W fixtures (payload-id bases: rust tail = 11, ckpt = 21) ----
+    let scratch = std::env::temp_dir().join(format!("mapdb5_xfix_gen_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("create determinism scratch dir");
+    for (fixture_id, base, ckpt) in [
+        ("wal-v1-rust-tail", 11u64, false),
+        ("wal-v1-rust-ckpt", 21, true),
+    ] {
+        let file_name = format!("{fixture_id}.wal");
+        let wal_path = out.join(&file_name);
+        let recids = build_wal_fixture(&wal_path, base, ckpt);
+        let pre = std::fs::read(&wal_path).expect("read wal fixture bytes");
+
+        // self-check: determinism — a second run must produce identical bytes
+        // and identical recids (the sync script's two-run check covers this
+        // cross-repo; the generator asserts it locally too).
+        let twin = scratch.join(&file_name);
+        let recids2 = build_wal_fixture(&twin, base, ckpt);
+        assert_eq!(recids, recids2, "{fixture_id}: recids differ across runs");
+        assert_eq!(
+            pre,
+            std::fs::read(&twin).expect("read twin wal bytes"),
+            "{fixture_id}: bytes differ across two generator runs"
+        );
+
+        // self-check: section-tag scan over the raw bytes.
+        let tags = wal_section_tags(&pre);
+        if ckpt {
+            assert_eq!(tags[0], b'C', "{fixture_id}: first section must be 'C'");
+            assert!(
+                tags[1..].contains(&b'S'),
+                "{fixture_id}: at least one 'S' section must follow the checkpoint"
+            );
+            assert!(
+                tags[1..].iter().all(|&x| x == b'S'),
+                "{fixture_id}: unexpected non-'S' tag after the checkpoint: {tags:?}"
+            );
+        } else {
+            assert!(
+                !tags.is_empty() && tags.iter().all(|&x| x == b'S'),
+                "{fixture_id}: every section tag must be 'S' (no 'C'), got {tags:?}"
+            );
+        }
+
+        // self-check: reopen and run the full W reader contract; byte-stable.
+        let s = StoreWAL::open(&wal_path).expect("reopen wal fixture");
+        assert_wal_reader_contract(&s, base, &recids);
+        s.close().unwrap();
+        assert_eq!(
+            pre,
+            std::fs::read(&wal_path).expect("re-read wal fixture bytes"),
+            "{fixture_id}: verification reopen must leave the bytes unchanged"
+        );
+        assert!(
+            !out.join(format!("{file_name}.ckpt")).exists(),
+            "{fixture_id}: no .ckpt companion may remain after a clean close"
+        );
+
+        // fragment rows: labels A..F only — NO row for the rolled-back put.
+        t.push_str(&format!(
+            "fixture\t{fixture_id}\tport-wal\trust\t{}\n",
+            generator_commit()
+        ));
+        t.push_str(&format!(
+            "file\t{fixture_id}\t{file_name}\t{}\t{}\t\n",
+            pre.len(),
+            sha256_hex(&pre)
+        ));
+        for (label, recid, state, pid, len) in [
+            ("A", recids.a, "live", base + 5, 120usize),
+            ("B", recids.b, "live", base + 1, 0),
+            ("C", recids.c, "null", base + 2, 40),
+            ("D", recids.d, "prealloc", 0, 0),
+            ("E", recids.e, "deleted", base + 3, 256),
+            ("F", recids.f, "live", base + 4, 1_200_000),
+        ] {
+            t.push_str(&format!(
+                "recid\t{fixture_id}\t{label}\t{recid}\t{state}\t{pid}\t{len}\n"
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&scratch).expect("remove determinism scratch dir");
+
     let mut fr = std::fs::File::create(out.join("fragment.tsv")).expect("create fragment.tsv");
     fr.write_all(t.as_bytes()).expect("write fragment.tsv");
     fr.sync_all().expect("sync fragment.tsv");

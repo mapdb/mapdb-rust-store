@@ -440,7 +440,8 @@ fn write_file_header(file: &File) -> Result<()> {
     Ok(())
 }
 
-/// True when the file carries the v1 magic; rejects unknown future versions.
+/// True when the file carries the v1 magic; rejects unknown future versions
+/// and nonzero header flags.
 fn is_v1(file: &File, size: u64) -> Result<bool> {
     if size < FILE_HDR {
         return Ok(false);
@@ -454,6 +455,18 @@ fn is_v1(file: &File, size: u64) -> Result<bool> {
     if version != FORMAT_VERSION {
         return Err(DbError::corrupt_msg(format!(
             "unsupported WAL format version {version}"
+        )));
+    }
+    // v1 declares flags == 0 (bytes 12..16); a nonzero word marks an
+    // incompatible variant this reader does not understand. This must be an
+    // EXPLICIT corruption error raised before any replay/truncation/legacy
+    // fallthrough — returning `false` here would route a current-magic file
+    // into the framed-MDB guard with a misleading error path. Strictness
+    // parity with Java v3, which rejects nonzero segment flags.
+    let flags = i32::from_be_bytes([h[12], h[13], h[14], h[15]]);
+    if flags != 0 {
+        return Err(DbError::corrupt_msg(format!(
+            "unsupported WAL header flags {flags:#x}"
         )));
     }
     Ok(true)
