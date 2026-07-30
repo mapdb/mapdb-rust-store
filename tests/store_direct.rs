@@ -7,6 +7,7 @@ use mapdb_rust_store::io::{DataInput2, DataOutput2};
 use mapdb_rust_store::ser::Serializer;
 use mapdb_rust_store::store::{AppendResult, Store, StoreByteArray, StoreDelta, StoreDirect};
 use std::cmp::Ordering;
+use std::os::unix::fs::FileExt;
 
 /// Raw-bytes serializer: content == value (uses the framed `size`), so a record's
 /// on-disk content equals the logical value — ideal for differential testing.
@@ -167,6 +168,26 @@ fn file_reopen_clean() {
         }
         s.close().unwrap();
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn old_file_magic_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("mapdb_rust_store_old_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.sd1");
+    {
+        let s = StoreDirect::open_file(&path).unwrap();
+        s.close().unwrap();
+    }
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.write_all_at(b"MDB5.SD1", 0).unwrap();
+
+    assert!(matches!(
+        StoreDirect::open_file(&path),
+        Err(DbError::DataCorruption(_))
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

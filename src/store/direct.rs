@@ -1,6 +1,6 @@
 //! `StoreDirect` — durable direct store: recid index, free lists, allocator
 //! metadata and record data all live on the volume (Java `StoreDirect`, spec 02
-//! §5). Algorithms ported faithfully; on-volume format v1, magic "MDB5.SD1".
+//! §5). Algorithms ported faithfully; on-volume format v1, magic "MDBS.SD1".
 //!
 //! v1 read path is the LOCKED baseline (accepted deviation D9.5): reads take the
 //! segment read lock. Java's optimistic seqlock is a data race in Rust; the
@@ -28,8 +28,8 @@ use std::sync::Arc;
 // ---------- on-volume geometry ----------
 
 const PAGE_SIZE: u64 = SLICE_SIZE;
-/// "MDB5.SD1" big-endian.
-const MAGIC: u64 = 0x4D44_4235_2E53_4431;
+/// "MDBS.SD1" big-endian.
+const MAGIC: u64 = 0x4D44_4253_2E53_4431;
 
 const O_FEATURES: u64 = 8;
 const O_HEAD_CHECKSUM: u64 = 16;
@@ -162,9 +162,7 @@ impl StoreDirect {
             return Err(DbError::corrupt("store file smaller than the header page"));
         }
         if self.vol.get_u64(0) != MAGIC {
-            return Err(DbError::corrupt(
-                "not a mapdb5 StoreDirect file (bad magic)",
-            ));
+            return Err(DbError::corrupt("not a MapDB StoreDirect file (bad magic)"));
         }
         if self.vol.get_i32(O_FEATURES) != 0 {
             return Err(DbError::corrupt("store uses unsupported feature bits"));

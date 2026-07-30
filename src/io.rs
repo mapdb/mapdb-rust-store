@@ -489,9 +489,9 @@ mod tests {
 
     #[test]
     fn match_bytes_always_advances() {
-        let b = b"MDB5.SD1extra";
+        let b = b"MDBS.SD1extra";
         let mut inp = SliceInput::new(b);
-        assert!(inp.match_bytes(b"MDB5.SD1").unwrap());
+        assert!(inp.match_bytes(b"MDBS.SD1").unwrap());
         assert_eq!(inp.pos(), 8);
         let mut inp2 = SliceInput::new(b);
         assert!(!inp2.match_bytes(b"XXXX.SD1").unwrap());

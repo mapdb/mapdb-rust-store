@@ -75,6 +75,53 @@ fn is_corrupt(r: Result<StoreWAL>) -> bool {
     matches!(r, Err(DbError::DataCorruption(_)))
 }
 
+#[test]
+fn old_framed_magic_is_rejected_without_rewrite() {
+    let p = tmp();
+    {
+        let s = StoreWAL::open(&p).unwrap();
+        s.close().unwrap();
+    }
+    let f = OpenOptions::new().write(true).open(&p).unwrap();
+    f.write_all_at(b"MDB5.WAL", 0).unwrap();
+    drop(f);
+    let before = std::fs::read(&p).unwrap();
+
+    assert!(is_corrupt(StoreWAL::open(&p)));
+    assert_eq!(std::fs::read(&p).unwrap(), before);
+}
+
+#[test]
+fn valid_legacy_headerless_wal_is_migrated() {
+    let p = tmp();
+    // PREALLOC recid 1, followed by the legacy COMMIT seal and the CRC32 of
+    // the operation bytes. A real legacy stream therefore begins with opcode
+    // 1, not an ASCII magic byte.
+    let ops = [1u8, 0x81];
+    let mut legacy = ops.to_vec();
+    legacy.push(8);
+    legacy.extend_from_slice(&(crc32fast::hash(&ops) as i32).to_be_bytes());
+    std::fs::write(&p, legacy).unwrap();
+
+    let s = StoreWAL::open(&p).unwrap();
+    s.verify().unwrap();
+    s.close().unwrap();
+    assert_eq!(&std::fs::read(&p).unwrap()[..8], b"MDBS.WAL");
+}
+
+#[test]
+fn one_and_two_byte_legacy_tails_are_safe() {
+    for tail in [&[1u8][..], &[1u8, 0x81][..]] {
+        let p = tmp();
+        std::fs::write(&p, tail).unwrap();
+
+        let s = StoreWAL::open(&p).unwrap();
+        s.verify().unwrap();
+        s.close().unwrap();
+        assert_eq!(&std::fs::read(&p).unwrap()[..8], b"MDBS.WAL");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Durability: only committed state survives a reopen.
 // ---------------------------------------------------------------------------

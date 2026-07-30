@@ -15,7 +15,7 @@
 //! compatibility is claimed.
 //! ```text
 //! file       := fileHeader section*
-//! fileHeader := magic "MDB5.WAL" (8) | version i32=1 | flags i32=0        (16 B)
+//! fileHeader := magic "MDBS.WAL" (8) | version i32=1 | flags i32=0        (16 B)
 //! section    := tag u8 ('S' commit, 'C' checkpoint)
 //!             | lsn i64 (strictly increasing)
 //!             | bodyLen i64
@@ -61,7 +61,7 @@ const T_DELETE: u8 = 4;
 /// Legacy (headerless format) trailing seal tag; v1 sections are length-prefixed.
 const T_COMMIT: u8 = 8;
 
-const MAGIC: [u8; 8] = *b"MDB5.WAL";
+const MAGIC: [u8; 8] = *b"MDBS.WAL";
 const FORMAT_VERSION: i32 = 1;
 /// File header: magic(8) + version(4) + flags(4).
 const FILE_HDR: u64 = 16;
@@ -459,6 +459,19 @@ fn is_v1(file: &File, size: u64) -> Result<bool> {
     Ok(true)
 }
 
+/// A framed MapDB-family header must never be reinterpreted as the legacy
+/// headerless WAL. In particular, this makes a hard magic swap reject old v1
+/// files instead of treating their first byte as a torn legacy instruction and
+/// destructively migrating an empty prefix.
+fn has_framed_magic_prefix(file: &File, size: u64) -> Result<bool> {
+    if size < 3 {
+        return Ok(false);
+    }
+    let mut prefix = [0u8; 3];
+    file.read_exact_at(&mut prefix, 0)?;
+    Ok(prefix == *b"MDB")
+}
+
 /// fsync the directory so a create/rename of `path` is itself durable. This is
 /// on the durability path (initial WAL creation, checkpoint promotion), so its
 /// failure MUST propagate — a swallowed error would report a commit/checkpoint
@@ -637,6 +650,8 @@ impl WalState {
             FILE_HDR
         } else if is_v1(&self.file, size)? {
             self.replay_v1(size)?
+        } else if has_framed_magic_prefix(&self.file, size)? {
+            return Err(DbError::corrupt("unsupported WAL magic"));
         } else {
             legacy = true;
             self.replay_legacy(size)?
