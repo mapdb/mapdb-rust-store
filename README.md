@@ -15,7 +15,7 @@ The reference implementation is the Java engine at
 <https://github.com/mapdb/mapdb-java-store>; there is a third, independent port
 in Zig at <https://github.com/mapdb/mapdb-zig-store>.
 
-Not to be confused with <https://github.com/mapdb/mapdb-rust-uring>, which is a
+Not to be confused with <https://github.com/mapdb/mapdb-rust-iouring>, which is a
 different, asynchronous, Linux-first engine with its own on-disk format.
 
 ## Support status
