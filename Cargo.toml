@@ -31,6 +31,10 @@ miniz_oxide = "0.8"
 
 [dev-dependencies]
 proptest = "1"
+# xfixtures conformance harness only: gunzip checked-in fixtures + verify their
+# manifest SHA-256 (the Stage-1 xfixtures contract).
+flate2 = "1"
+sha2 = "0.10"
 
 [lib]
 name = "mapdb_rust_store"
