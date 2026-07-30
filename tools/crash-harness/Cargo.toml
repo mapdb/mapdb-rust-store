@@ -1,0 +1,27 @@
+# Destructive test tooling for the external crash tier. NOT part of the shipped
+# `mapdb-rust-store` library and never published: `ci/crash/*.sh` builds it explicitly.
+# It uses only the crate's public API, so it imposes no support obligation on
+# `mapdb-rust-store` beyond what any user already has.
+[package]
+name = "mapdb-rust-store-crash-harness"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+description = "Deterministic workload generator, intent journal and checker for the mapdb-rust-store crash tier"
+
+[dependencies]
+mapdb-rust-store = { path = "../.." }
+crc32c = "0.6"
+
+[lib]
+name = "mapdb_rust_store_crash_harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crash_workload"
+path = "src/bin/crash_workload.rs"
+
+[[bin]]
+name = "crash_check"
+path = "src/bin/crash_check.rs"

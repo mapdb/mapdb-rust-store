@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["tools/crash-harness"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "EPL-1.0 OR BSD-3-Clause"
+repository = "https://github.com/mapdb/mapdb-rust-store"
+
+[package]
+name = "mapdb-rust-store"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of the MapDB5 storage engine"
+readme = "README.md"
+
+[dependencies]
+memmap2 = "0.9"
+parking_lot = "0.12"
+arc-swap = "1.7"
+crc32fast = "1.4"
+crc32c = "0.6"
+# Java BigInteger/BigDecimal wire parity (two's-complement toByteArray encoding)
+# and DEFLATE (zlib) parity for CompressionSerializer.
+num-bigint = "0.4"
+num-traits = "0.2"
+miniz_oxide = "0.8"
+
+[dev-dependencies]
+proptest = "1"
+
+[lib]
+name = "mapdb_rust_store"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

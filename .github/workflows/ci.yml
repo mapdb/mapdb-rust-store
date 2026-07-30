@@ -1,0 +1,68 @@
+# Always-on gate: runs on every push and pull request.
+#
+# The scheduled crash-campaign workflow describes itself as supplementing an
+# always-on tier — this is that tier. Every job resolves against the committed
+# Cargo.lock (`--locked`) so dependency drift shows up as a red job rather than
+# being silently re-resolved.
+name: ci
+on: [push, pull_request]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # The crash harness is a separate workspace member, not part of the shipped library; a root
+      # --all-targets pass does not reach it.
+      - run: cargo clippy --locked --all-targets -p mapdb-rust-store-crash-harness -- -D warnings
+      - run: cargo test --locked
+
+  # Unprivileged process-crash tier: SIGKILL + reopen through the real syscall
+  # path. This is not a power-cut claim — that is the crash campaign.
+  crash-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked -p mapdb-rust-store-crash-harness --bins
+      - run: ci/crash/crash-smoke.sh
+
+  # What a consumer actually receives. Guards against a manifest change that
+  # drops the README, the licences or the notice from the published crate, or
+  # that sweeps the crash harness into it.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked --list > /tmp/pkg.txt
+      - name: required files are present
+        run: |
+          set -euo pipefail
+          for f in README.md NOTICE.md LICENSE-EPL-1.0.txt LICENSE-EDL-1.0.txt; do
+            grep -qx "$f" /tmp/pkg.txt || { echo "missing from crate: $f"; exit 1; }
+          done
+      - name: crash harness is excluded
+        run: |
+          set -euo pipefail
+          ! grep -q '^tools/' /tmp/pkg.txt || { echo "crash harness leaked into the crate"; exit 1; }
+      - run: cargo package --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+          key: cargo-audit-0.22.2
+      - run: command -v cargo-audit >/dev/null || cargo install cargo-audit --version =0.22.2 --locked
+      - run: cargo audit
