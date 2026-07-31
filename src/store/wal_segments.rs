@@ -477,16 +477,28 @@ impl WalSegmentSet {
     /// store directory is allowed to contain other things. Sequence GAPS are
     /// legal: integrity comes from the recorded LSNs, not from contiguity.
     fn enumerate(&self) -> Vec<i64> {
-        let mut found: Vec<i64> = Vec::new();
         // Java's `dir.list()` answers null for an unreadable/absent directory
         // and the constructor treats that as "no segments"; a fresh store then
         // creates its first segment, which is where a genuinely broken
-        // directory surfaces as the I/O error it is.
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(e) => e,
-            Err(_) => return found,
-        };
-        for entry in entries.flatten() {
+        // directory surfaces as the I/O error it is. Open-time leniency only —
+        // see [`enumerate_checked`] for the callers that must not guess.
+        self.enumerate_checked().unwrap_or_default()
+    }
+
+    /// [`enumerate`](Self::enumerate) without the leniency: an unreadable
+    /// directory or a failed directory entry is an ERROR, not an empty
+    /// namespace.
+    ///
+    /// D2's delete needs this and open does not. Deleting is the one caller for
+    /// which "I could not read the directory" and "there is nothing here" have
+    /// opposite meanings: guessing the second reports a clean removal of files
+    /// that are still on disk, having already unlinked the lock and cleared the
+    /// in-memory list.
+    fn enumerate_checked(&self) -> Result<Vec<i64>> {
+        let mut found: Vec<i64> = Vec::new();
+        let entries = std::fs::read_dir(&self.dir)?;
+        for entry in entries {
+            let entry = entry?;
             // Matched as BYTES: a name is not required to be UTF-8 to be a
             // segment, and neither is the base path it hangs off.
             let name = entry.file_name();
@@ -521,7 +533,7 @@ impl WalSegmentSet {
             found.push(seq);
         }
         found.sort_unstable();
-        found
+        Ok(found)
     }
 
     pub(crate) fn segment_file(&self, seq: i64) -> PathBuf {
@@ -842,7 +854,9 @@ impl WalSegmentSet {
         // what recovery retained, and the directory may also hold names this
         // open legitimately left behind (a read-only-style residue kept by an
         // earlier writer, an interior gap). All of them are this base's.
-        for seq in self.enumerate() {
+        // CHECKED enumeration: a directory this process cannot read is an
+        // error, never an empty namespace (D2 requires propagation).
+        for seq in self.enumerate_checked()? {
             let path = self.segment_file(seq);
             wal_io_event(&self.io, WalOpKind::Unlink, seq, 0, 0, 0)?;
             remove_if_exists(&path)?;

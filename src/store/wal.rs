@@ -410,8 +410,12 @@ impl StoreWAL {
     /// Floor under the cleaning trigger (D8): a log smaller than this is never
     /// cleaned automatically, however small the live data is.
     pub fn set_min_log_bytes(&self, bytes: u64) -> Result<()> {
-        self.check_closed()?;
-        let mut st = self.st.write();
+        // Lock FIRST, then re-check under it: `close` publishes `closed` while
+        // holding this same lock, so a check taken before acquiring it can be
+        // overtaken and the setter would then mutate a torn-down state and
+        // report success (Java holds the write lock across its check,
+        // StoreWAL.java:2107-2135).
+        let mut st = self.write_open()?;
         st.min_log_bytes = bytes;
         // A configuration change invalidates every observation the current
         // episode made, latch included.
@@ -422,13 +426,13 @@ impl StoreWAL {
     /// Space-amplification target (D8): clean once the log exceeds this multiple
     /// of the live data.
     pub fn set_space_amplification(&self, factor: u32) -> Result<()> {
-        self.check_closed()?;
         if factor == 0 {
             return Err(DbError::wrong_config(
                 "space amplification must be at least 1".to_string(),
             ));
         }
-        let mut st = self.st.write();
+        // See `set_min_log_bytes`: lock first, re-check under it.
+        let mut st = self.write_open()?;
         st.space_amplification = factor;
         st.abandon_episode();
         Ok(())
@@ -615,12 +619,28 @@ impl WalState {
         Ok(ops)
     }
 
+    /// The LSN the next section may use, refusing BEFORE anything is written
+    /// when the space is exhausted.
+    ///
+    /// The reference advances `nextLsn` with an unchecked `long` add
+    /// (`StoreWAL.java:1838-1883`). The ports refuse instead — the adopted
+    /// divergence of §4 D6 / §7 Q8, already implemented on the recovery side —
+    /// and the check must happen HERE, before the write: advancing after the
+    /// force would durably land a section at `i64::MAX` and only then panic (or,
+    /// in release, install a negative next LSN), which is neither the
+    /// reference's ruling nor the port's.
+    fn reserve_lsn(&self) -> Result<(i64, i64)> {
+        let lsn = self.next_lsn;
+        let next = lsn.checked_add(1).ok_or(DbError::StoreFull)?;
+        Ok((lsn, next))
+    }
+
     fn commit_locked(&mut self, closed: &AtomicBool) -> Result<()> {
         if self.staged.is_empty() {
             return Ok(());
         }
         let ops = self.classify()?;
-        let section_lsn = self.next_lsn;
+        let (section_lsn, lsn_after) = self.reserve_lsn()?;
         // Validated BEFORE `append_section` can roll over or write, so a
         // mis-stamped delta fails the commit with the store open and the staged
         // transaction intact.
@@ -658,7 +678,7 @@ impl WalState {
             self.fail_closed(closed);
             return Err(e);
         }
-        self.next_lsn += 1;
+        self.next_lsn = lsn_after;
         // The cleaner's staleness clock: SELF-CONTAINED entries only. An append
         // extends a record whose image is already the log's youngest, so it
         // obsoletes nothing, while a record, a delete and a prealloc each
@@ -1034,7 +1054,7 @@ impl WalState {
         };
         let cap = byte_room.min(1 << 20);
         let mut out = DataOutput2::with_capacity(cap.clamp(4096, 1 << 16) as usize);
-        let lsn = self.next_lsn;
+        let (lsn, lsn_after) = self.reserve_lsn()?;
         // (recid, carries content) per emitted image, applied to the identities
         // only after the section is durable.
         let mut emitted: Vec<(u64, bool)> = Vec::new();
@@ -1143,7 +1163,7 @@ impl WalState {
                 self.fail_closed(closed);
                 return Err(e);
             }
-            self.next_lsn += 1;
+            self.next_lsn = lsn_after;
             written = SEC_HDR as i64 + body.len() as i64;
             // IMAGES, not entries walked: the staleness clock compares the
             // store's committed self-contained entries against the live set the
@@ -1283,6 +1303,24 @@ impl WalState {
             match step {
                 Ok(n) => records += n,
                 Err(e) => {
+                    // The two error classes part company HERE, and the
+                    // reference separates them explicitly: `IOException` goes
+                    // through `failClosed`, and only a `DBException` — a W10
+                    // refusal or an identity disagreement — rewinds and keeps
+                    // the handle (StoreWAL.java:2628-2660).
+                    //
+                    // Collapsing them is not cosmetic. Automatic cleaning runs
+                    // INSIDE commit, after the section is forced and applied
+                    // and the staged transaction cleared, so a read error while
+                    // reopening a retiring segment would return `Err` from
+                    // `commit()` with the store still open and later writes
+                    // still admitted — the store's I/O is broken and it says so
+                    // once, then carries on.
+                    if matches!(e, DbError::Io(_)) {
+                        self.fail_closed(closed);
+                        result = Err(e);
+                        break;
+                    }
                     // A unit refused — W10 caught an under-re-emission, or an
                     // identity map disagreed with the inner store. The cursor
                     // has ALREADY stepped past the entry that refused (it
@@ -1404,7 +1442,7 @@ impl WalState {
     ) -> Result<()> {
         let body = build_mark_body(cleaned_through_seq, log_start_lsn);
         debug_assert_eq!(body.len() as i64, MARK_BODY_LEN);
-        let lsn = self.next_lsn;
+        let (lsn, lsn_after) = self.reserve_lsn()?;
         let r = append_section(
             &mut self.segs,
             self.segment_bytes,
@@ -1418,7 +1456,7 @@ impl WalState {
             self.fail_closed(closed);
             return Err(e);
         }
-        self.next_lsn += 1;
+        self.next_lsn = lsn_after;
         Ok(())
     }
 }
@@ -2020,7 +2058,31 @@ impl StoreDelta for StoreWAL {
         let mut st = self.write_open()?;
         let rid = recid.get();
         let was_staged = st.staged.contains_key(&rid);
+        // Runs for its GetVoid validation even when nothing will be staged.
         st.staged_for_write(rid)?;
+        if data.is_empty() {
+            // A zero-length append stages NOTHING — not even the empty `Staged`
+            // entry `staged_for_write` just left behind, which would turn a
+            // contract-defined no-op into a section at commit: T_PREALLOC on an
+            // untouched record (burning an LSN, and naming a content-live recid
+            // in a prealloc, which §4.2 rejects on replay), or a zero-length
+            // T_APPEND that `inner.append` REFUSES on a linked record — after
+            // the section is durable, so the refusal arrives on the
+            // post-durability path and fails the store closed.
+            if !was_staged {
+                st.staged.remove(&rid);
+            }
+            let staged_base = st.staged.get(&rid).filter(|s| s.base_set);
+            let base_len = match staged_base {
+                Some(s) => s.base.as_ref().map_or(0, |b| b.len()),
+                None if st.inner.rec_state(rid)? == STATE_LIVE => {
+                    st.inner.raw_get(rid)?.map_or(0, |b| b.len())
+                }
+                None => 0,
+            };
+            let appends_len = st.staged.get(&rid).map_or(0, |s| s.appends_len);
+            return Ok(AppendResult::NewSize(base_len + appends_len));
+        }
         let base_live =
             !st.staged.get(&rid).unwrap().base_set && st.inner.rec_state(rid)? == STATE_LIVE;
         if base_live {

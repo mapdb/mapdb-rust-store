@@ -909,6 +909,107 @@ fn a_refused_append_stages_nothing() {
 }
 
 #[test]
+fn a_zero_length_append_is_a_no_op_on_every_record_shape() {
+    // The contract says a zero-length append changes nothing. Staging an empty
+    // entry for it breaks that in three different ways depending on what the
+    // record already is, so all three shapes are pinned here.
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+
+    // (1) A committed plain record: no section, so no LSN is burnt.
+    let plain = s.put(&bytes(3, 100), &R).unwrap();
+    s.commit().unwrap();
+    let lsn_before = s.next_lsn();
+    assert_eq!(
+        s.append(plain, &[]).unwrap(),
+        mapdb_rust_store::store::AppendResult::NewSize(100),
+        "the unchanged size is returned"
+    );
+    s.commit().unwrap();
+    assert_eq!(s.next_lsn(), lsn_before, "a no-op commits nothing");
+
+    // (2) A committed LINKED record, where the inner store refuses every
+    // append: a staged empty append would be emitted, forced, and only THEN
+    // refused — on the post-durability path, which fails the store closed.
+    let linked = s.put(&bytes(4, 1_200_000), &R).unwrap();
+    s.commit().unwrap();
+    let lsn_before = s.next_lsn();
+    s.append(linked, &[]).unwrap();
+    s.commit().unwrap();
+    assert_eq!(s.next_lsn(), lsn_before);
+    assert!(
+        !s.is_closed(),
+        "a documented no-op must not close the store"
+    );
+
+    // (3) A freshly preallocated recid, which must reopen preallocated rather
+    // than as a content-bearing empty record: the empty staged entry used to be
+    // classified T_PREALLOC on an untouched record, or T_RECORD with empty
+    // content once it carried an append.
+    let pre = s.preallocate().unwrap();
+    s.append(pre, &[]).unwrap();
+    s.commit().unwrap();
+    assert_eq!(s.get(pre, &R).unwrap(), None, "still preallocated");
+
+    s.close().unwrap();
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(plain, &R).unwrap(), Some(bytes(3, 100)));
+    assert_eq!(s.get(linked, &R).unwrap(), Some(bytes(4, 1_200_000)));
+    assert_eq!(s.get(pre, &R).unwrap(), None);
+    s.verify().unwrap();
+}
+
+#[test]
+fn a_zero_length_append_on_an_already_staged_record_keeps_the_staging() {
+    // The other half of the rule: it stages nothing NEW, but it must not
+    // discard staging that was already there.
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    let r = s.put(&bytes(5, 40), &R).unwrap();
+    // With headroom, or the pending append below is REFUSED for want of
+    // capacity and there is no staging left for the no-op to preserve.
+    s.update_with_headroom(r, &bytes(5, 40), &R, 64).unwrap();
+    s.commit().unwrap();
+    s.append(r, &bytes(6, 10)).unwrap();
+    assert_eq!(
+        s.append(r, &[]).unwrap(),
+        mapdb_rust_store::store::AppendResult::NewSize(50),
+        "the pending append is still counted"
+    );
+    s.commit().unwrap();
+    let mut want = bytes(5, 40);
+    want.extend_from_slice(&bytes(6, 10));
+    assert_eq!(s.get(r, &R).unwrap(), Some(want.clone()));
+    s.close().unwrap();
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(r, &R).unwrap(), Some(want));
+    s.verify().unwrap();
+}
+
+#[test]
+fn the_config_setters_refuse_after_close() {
+    // This pins the SEQUENTIAL contract only, and says so: the defect it was
+    // written for is a race — `close` publishes the flag while holding the
+    // write lock, so a check taken before acquiring that lock can be overtaken
+    // and the setter then mutates a torn-down state and reports success. The
+    // fix is to lock first and re-check under it; that fix is argued from the
+    // lock discipline, not proved here, because a deterministic race needs a
+    // hook the store does not have. Verified: reverting the fix leaves this
+    // test green.
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    s.close().unwrap();
+    assert!(matches!(
+        s.set_min_log_bytes(1 << 20),
+        Err(DbError::StoreClosed)
+    ));
+    assert!(matches!(
+        s.set_space_amplification(4),
+        Err(DbError::StoreClosed)
+    ));
+}
+
+#[test]
 fn streaming_replay_with_tiny_window() {
     let base = tmp();
     let mut recids = Vec::new();
