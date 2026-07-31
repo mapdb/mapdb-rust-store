@@ -61,6 +61,13 @@ pub enum DbError {
     /// genuine mis-typed reopen from an already-open-with-a-different-Rust-type
     /// collision. Carries a human-readable reason.
     CachedTypeMismatch(String),
+    /// Another handle — in this process or another one — holds the store lock
+    /// on the same namespace. Java raises a plain `DBException` for both the
+    /// cross-process case ("locked by another process") and the in-process one
+    /// (`OverlappingFileLockException`); the port keeps them one variant
+    /// because a caller can do nothing different about either. Carries the
+    /// human-readable reason.
+    Locked(String),
     /// Underlying I/O failure.
     Io(std::io::Error),
 }
@@ -116,6 +123,7 @@ impl fmt::Display for DbError {
             DbError::Unsupported(op) => write!(f, "unsupported operation: {op}"),
             DbError::WrongConfiguration(m) => write!(f, "wrong configuration: {m}"),
             DbError::CachedTypeMismatch(m) => write!(f, "cached type mismatch: {m}"),
+            DbError::Locked(m) => write!(f, "store is locked: {m}"),
             DbError::Io(e) => write!(f, "io error: {e}"),
         }
     }

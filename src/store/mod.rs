@@ -27,6 +27,9 @@ pub mod parity;
 pub mod readonly;
 pub mod volume;
 pub mod wal;
+/// WAL format v3 namespace layer (slice A0) — built and tested, not yet
+/// reachable from a public open. See the module docs.
+pub(crate) mod wal_segments;
 
 pub use bytearray::StoreByteArray;
 pub use direct::StoreDirect;
