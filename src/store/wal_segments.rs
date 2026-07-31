@@ -203,8 +203,7 @@ impl Segment {
     /// (Java's javadoc says `[0..28)`; the Java CODE, this port and the
     /// byte-level test kit all use all 36 bytes. 36 is authoritative.)
     pub(crate) fn crc_domain(&self, crc: &mut crc32fast::Hasher, section_offset: u64) {
-        crc.update(&self.header);
-        crc.update(&section_offset.to_be_bytes());
+        crc_domain_of(crc, &self.header, section_offset);
     }
 
     /// **The LSN this segment's first section holds** — `nextLsn` at the moment
@@ -866,6 +865,18 @@ fn read_header(
     Ok(HeaderVerdict::Ok)
 }
 
+/// [`Segment::crc_domain`] for a caller holding header BYTES rather than a
+/// segment — the section writer, which seals a section before the segment it
+/// extends has been re-read, and the byte-level test kit.
+pub(crate) fn crc_domain_of(
+    crc: &mut crc32fast::Hasher,
+    header: &[u8; SEG_HDR as usize],
+    section_offset: u64,
+) {
+    crc.update(header);
+    crc.update(&section_offset.to_be_bytes());
+}
+
 /// The 36 header bytes a conforming writer produces for `(seq, first_lsn)`.
 pub(crate) fn build_header(seq: i64, first_lsn: i64) -> [u8; SEG_HDR as usize] {
     let mut hdr = [0u8; SEG_HDR as usize];
@@ -887,7 +898,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 /// The file name for a DIAGNOSTIC. Lossy on purpose: a non-UTF-8 name must
 /// still appear in the message that names it, and a message is never a key.
-fn file_name(path: &Path) -> String {
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .unwrap_or_default()
         .to_string_lossy()

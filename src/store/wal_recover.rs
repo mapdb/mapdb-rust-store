@@ -1,0 +1,2634 @@
+//! The WAL's **v3 codec and recovery state machine** — sections, entries, the
+//! `'K'` clean mark, and the two-pass replay (R3-R7) that turns a segment set
+//! into an in-memory store.
+//!
+//! Port of the recovery half of Java `StoreWAL` (format v3); the namespace half
+//! (N/H/W2/W5/W6, the store lock) is [`wal_segments`](super::wal_segments) and
+//! ran already — R0-R2 happen inside [`WalSegmentSet::open`]. This module is
+//! everything after that.
+//!
+//! ```text
+//! section := tag u8 ('S' commit | 'C' image | 'K' clean mark)
+//!          | lsn i64 | bodyLen i64 | hdrCrc i32 | bodyCrc i32      // 25 bytes
+//!          | body
+//! mark    := cleanedThroughSeq i64 | logStartLsn i64               // 16 bytes
+//! entry   := T_PREALLOC recid
+//!          | T_RECORD   recid cap len+1|0 payload?
+//!          | T_APPEND   recid (lsn - baseLsn) len payload
+//!          | T_DELETE   recid                       // packLong framing
+//! ```
+//!
+//! Both CRCs are **domain-bound**: each is an ordinary CRC-32 fed the segment's
+//! 36 header bytes and the section's own offset as a prefix
+//! ([`Segment::crc_domain`]). A section byte-copied to another segment, or to
+//! another offset in its own, therefore fails its checksums — the property that
+//! lets the torn-tail lookahead below trust what it finds.
+//!
+//! # The shape of recovery, and why it is two passes
+//!
+//! Pass 1 ([`scan_segment`]) establishes **boundaries only**: how far each
+//! segment's valid section prefix runs, its LSN span, and whether anything in it
+//! is corrupt — with no per-recid state whatsoever. Pass 2 ([`apply_section`])
+//! replays entries in ascending LSN order and is the sole authority on content.
+//! A verdict found in pass 1 is **held**, not thrown: the segment carrying it
+//! may be below a clean mark and about to be deleted, and refusing to open a
+//! store over rot in bytes nobody will ever read is how a recoverable store gets
+//! bricked. R4 decides which held verdicts matter.
+//!
+//! The three questions recovery must answer — where does the retained log
+//! legitimately begin, is each missing segment authorized, and does each delta
+//! still have the image it extends — are all answered by comparing **numbers a
+//! conforming writer recorded** (`firstLsn` in every segment header,
+//! `logStartLsn` in every mark, the base LSN in every `T_APPEND`) rather than by
+//! inferring intent from LSN density or section tags. That is the whole reason
+//! v3 exists.
+//!
+//! # Status: slice A1, not yet reachable from a public open
+//!
+//! Like A0, this is built and tested but unhooked: the public
+//! [`StoreWAL`](super::wal::StoreWAL) still speaks v1 and never calls
+//! [`recover`]. The v3 *writer*, the cutover and the cleaner are A2/A3. What
+//! this module deliberately does NOT contain, so the boundary is legible: no
+//! section writer (A2), no `'K'` emitter or cleaning cycle (A3), and no public
+//! read-only surface (D7 — the internal read-only mode here is real and tested,
+//! and it is all of read-only that this workstream ships).
+
+// A1 ships this layer unhooked (see above); its consumers arrive in A2.
+#![allow(dead_code)]
+
+use super::direct::StoreDirect;
+use super::index_val as iv;
+use super::wal_segments::{crc_domain_of, Segment, WalSegmentSet, SEG_HDR};
+use super::{AppendResult, Recid, StoreDelta};
+use crate::error::{DbError, Result};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::num::NonZeroU64;
+use std::os::unix::fs::FileExt;
+
+/// tag(1) + lsn(8) + bodyLen(8) + hdrCrc(4) + bodyCrc(4).
+pub(crate) const SEC_HDR: usize = 25;
+/// Bytes of the section header covered by `hdrCrc` — everything before the two
+/// checksums.
+pub(crate) const SEC_HDR_CRC_LEN: usize = 17;
+
+/// A committed transaction.
+pub(crate) const TAG_SECTION: u8 = b'S';
+/// A cleaner-written image: semantically identical to `'S'`, and deliberately so
+/// — the retained `'C'` sections are collectively the checkpoint, so there is no
+/// "newest image wins" rule to implement.
+pub(crate) const TAG_IMAGE: u8 = b'C';
+/// A clean mark. Carries no entries and is never handed to the entry decoder.
+pub(crate) const TAG_MARK: u8 = b'K';
+/// `cleanedThroughSeq i64 | logStartLsn i64`, fixed width — a mark is a fact,
+/// not a record, so it is not packLong-framed.
+pub(crate) const MARK_BODY_LEN: i64 = 16;
+
+const T_PREALLOC: u8 = 1;
+const T_RECORD: u8 = 2;
+const T_APPEND: u8 = 3;
+const T_DELETE: u8 = 4;
+
+/// `'S'`, `'C'` and `'K'` — **all three**, in the main scan and in the
+/// lookahead alike.
+///
+/// Transcribing v1's two-tag set here is the single easiest way to port this
+/// format wrongly: a `'K'` sitting after a rotted section would not be
+/// recognised as a valid section, the lookahead would report "nothing valid
+/// follows", and deliberate mid-log rot would be silently truncated away as a
+/// torn tail.
+fn valid_tag(tag: u8) -> bool {
+    tag == TAG_SECTION || tag == TAG_IMAGE || tag == TAG_MARK
+}
+
+fn be32(b: &[u8], off: usize) -> i32 {
+    i32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+fn be64(b: &[u8], off: usize) -> i64 {
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&b[off..off + 8]);
+    i64::from_be_bytes(v)
+}
+
+/// Fallible recid conversion for decode paths: a CRC-valid but semantically
+/// invalid entry carrying recid 0 (reserved) must refuse, not panic.
+fn nz(recid: u64) -> Result<Recid> {
+    NonZeroU64::new(recid).ok_or_else(|| DbError::corrupt("WAL entry references reserved recid 0"))
+}
+
+pub(crate) fn parse_sec_hdr(hdr: &[u8; SEC_HDR]) -> (u8, i64, i64, i32, i32) {
+    (
+        hdr[0],
+        be64(hdr, 1),
+        be64(hdr, 9),
+        be32(hdr, 17),
+        be32(hdr, 21),
+    )
+}
+
+/// The 25 header bytes for a section, both CRCs computed in the section's own
+/// domain. The writer (A2) and the tests build sections through this one
+/// function, so there is exactly one encoding of a section header in the port.
+pub(crate) fn build_sec_hdr(
+    seg_header: &[u8; SEG_HDR as usize],
+    offset: u64,
+    tag: u8,
+    lsn: i64,
+    body: &[u8],
+) -> [u8; SEC_HDR] {
+    let mut hdr = [0u8; SEC_HDR];
+    hdr[0] = tag;
+    hdr[1..9].copy_from_slice(&lsn.to_be_bytes());
+    hdr[9..17].copy_from_slice(&(body.len() as i64).to_be_bytes());
+    let mut h = crc32fast::Hasher::new();
+    crc_domain_of(&mut h, seg_header, offset);
+    h.update(&hdr[..SEC_HDR_CRC_LEN]);
+    hdr[17..21].copy_from_slice(&(h.finalize() as i32).to_be_bytes());
+    let mut b = crc32fast::Hasher::new();
+    crc_domain_of(&mut b, seg_header, offset);
+    b.update(body);
+    hdr[21..25].copy_from_slice(&(b.finalize() as i32).to_be_bytes());
+    hdr
+}
+
+/// The 16-byte `'K'` body.
+pub(crate) fn build_mark_body(cleaned_through_seq: i64, log_start_lsn: i64) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&cleaned_through_seq.to_be_bytes());
+    b[8..].copy_from_slice(&log_start_lsn.to_be_bytes());
+    b
+}
+
+/// CRC-32 of a section header in its domain — compare against `hdrCrc`.
+fn hdr_crc(seg: &Segment, offset: u64, hdr: &[u8; SEC_HDR]) -> i32 {
+    let mut h = crc32fast::Hasher::new();
+    seg.crc_domain(&mut h, offset);
+    h.update(&hdr[..SEC_HDR_CRC_LEN]);
+    h.finalize() as i32
+}
+
+/// The segment's file handle, which every read helper here needs. Callers open
+/// it once per pass; a missing handle is a bug in this module, never a state a
+/// damaged store can produce.
+fn handle(seg: &Segment) -> Result<&File> {
+    seg.file()
+        .ok_or_else(|| DbError::corrupt("WAL segment handle released mid-pass"))
+}
+
+/// `Ok(None)` when the file is shorter than the read demands — the segment
+/// shrank under us, which recovery treats exactly as a torn tail.
+fn read_at_opt(file: &File, buf: &mut [u8], pos: u64) -> Result<Option<()>> {
+    match file.read_exact_at(buf, pos) {
+        Ok(()) => Ok(Some(())),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(DbError::Io(e)),
+    }
+}
+
+fn read_sec_hdr(seg: &Segment, pos: u64) -> Result<Option<[u8; SEC_HDR]>> {
+    let mut hdr = [0u8; SEC_HDR];
+    Ok(read_at_opt(handle(seg)?, &mut hdr, pos)?.map(|()| hdr))
+}
+
+/// CRC-32 over a section body in its domain, streamed through a bounded window
+/// so a body larger than memory still verifies.
+fn body_crc(
+    seg: &Segment,
+    section_offset: u64,
+    start: u64,
+    end: u64,
+    replay_buf: usize,
+) -> Result<Option<i32>> {
+    let file = handle(seg)?;
+    let mut crc = crc32fast::Hasher::new();
+    seg.crc_domain(&mut crc, section_offset);
+    if start < end {
+        let cap = ((end - start) as usize).min(replay_buf.max(16));
+        let mut buf = vec![0u8; cap];
+        let mut p = start;
+        while p < end {
+            let n = ((end - p) as usize).min(buf.len());
+            if read_at_opt(file, &mut buf[..n], p)?.is_none() {
+                return Ok(None);
+            }
+            crc.update(&buf[..n]);
+            p += n as u64;
+        }
+    }
+    Ok(Some(crc.finalize() as i32))
+}
+
+// ---------- streaming entry decoder ----------
+
+/// A fixed-size window over one section body, with `u64` file positions.
+///
+/// Never materializes a body, so a commit larger than memory replays: Java
+/// streams both writing and reading for exactly this reason, and a port that
+/// reads whole bodies regresses every large transaction into an allocation of
+/// its full size.
+///
+/// Separate from v1's `WalIn` in [`wal`](super::wal) on purpose, and not a
+/// candidate for sharing: that one folds an incremental CRC into every read to
+/// serve the *legacy* trailing-seal format, work v3 never needs because a v3
+/// section's CRCs are verified in pass 1 before a single entry is decoded
+/// ("garbage never allocates"). v1's copy is deleted at the A2 cutover.
+struct SecIn<'a> {
+    file: &'a File,
+    /// End of the section being decoded.
+    limit: u64,
+    win: Vec<u8>,
+    win_start: u64,
+    win_pos: usize,
+    win_len: usize,
+}
+
+impl<'a> SecIn<'a> {
+    fn new(file: &'a File, bufsize: usize) -> SecIn<'a> {
+        SecIn {
+            file,
+            limit: 0,
+            win: vec![0u8; bufsize.max(16)],
+            win_start: 0,
+            win_pos: 0,
+            win_len: 0,
+        }
+    }
+
+    fn reset(&mut self, start: u64, end: u64) {
+        self.win_start = start;
+        self.limit = end;
+        self.win_pos = 0;
+        self.win_len = 0;
+    }
+
+    fn pos(&self) -> u64 {
+        self.win_start + self.win_pos as u64
+    }
+
+    fn remaining(&self) -> u64 {
+        self.limit - self.pos()
+    }
+
+    /// A read past the section's end is **corruption**, not a torn tail: pass 1
+    /// already proved this section whole and CRC-valid, so an entry that runs
+    /// off its end means the body's framing disagrees with its own length.
+    fn refill(&mut self) -> Result<()> {
+        self.win_start = self.pos();
+        self.win_pos = 0;
+        if self.win_start >= self.limit {
+            return Err(DbError::corrupt_msg(format!(
+                "WAL entry overran its section body at {}",
+                self.limit
+            )));
+        }
+        let n = ((self.limit - self.win_start) as usize).min(self.win.len());
+        self.file
+            .read_exact_at(&mut self.win[..n], self.win_start)
+            .map_err(DbError::Io)?;
+        self.win_len = n;
+        Ok(())
+    }
+
+    fn read_byte(&mut self) -> Result<u8> {
+        if self.win_pos >= self.win_len {
+            self.refill()?;
+        }
+        let b = self.win[self.win_pos];
+        self.win_pos += 1;
+        Ok(b)
+    }
+
+    /// packLong: MSB-first 7-bit groups, high bit terminates.
+    ///
+    /// Capped at 10 bytes, where Java's decoder loops to the terminator. That
+    /// difference is deliberate and pre-existing (v1 caps it too): the canonical
+    /// encodings agree, so the cap only changes which *malformed* input is
+    /// refused and how quickly. It is recorded as a per-engine expectation in
+    /// the corruption fixtures rather than smoothed over.
+    fn unpack_long(&mut self) -> Result<u64> {
+        let mut ret: u64 = 0;
+        for _ in 0..10 {
+            let v = self.read_byte()?;
+            ret = (ret << 7) | (v & 0x7F) as u64;
+            if v & 0x80 != 0 {
+                return Ok(ret);
+            }
+        }
+        Err(DbError::corrupt("WAL packed long too long"))
+    }
+
+    fn read_fully(&mut self, dst: &mut [u8]) -> Result<()> {
+        let mut off = 0;
+        while off < dst.len() {
+            if self.win_pos >= self.win_len {
+                self.refill()?;
+            }
+            let n = (self.win_len - self.win_pos).min(dst.len() - off);
+            dst[off..off + n].copy_from_slice(&self.win[self.win_pos..self.win_pos + n]);
+            self.win_pos += n;
+            off += n;
+        }
+        Ok(())
+    }
+}
+
+/// Capacity as the writer encodes it: 0 for null content, else 16-aligned, big
+/// enough for header+content and within the plain-record limit — EXCEPT oversize
+/// (linked) records, which the writer encodes with capacity 0. Anything else
+/// never came from this writer.
+fn cap_valid(cap: u64, data: Option<&[u8]>) -> bool {
+    match data {
+        None => cap == 0,
+        Some(d) => {
+            let max = iv::MAX_CAPACITY as u64;
+            if cap == 0 {
+                4 + d.len() as u64 > max
+            } else {
+                cap >= 4 + d.len() as u64 && cap <= max && (cap & 15) == 0
+            }
+        }
+    }
+}
+
+// ---------- the two per-recid identities (§4.2) ----------
+
+/// The two per-recid identities replay maintains, plus the deferred skip audit.
+///
+/// **Not a replay floor under another name.** The v2 floor was derived by
+/// looking *ahead* for each recid's newest self-contained entry and then
+/// deciding what to apply, so a wrong floor silently recovered different data.
+/// These are derived purely from what has already been applied and decide
+/// nothing on their own: the only thing they can do when they are wrong is
+/// refuse the open (the audit), which is why they replaced it.
+///
+/// The maps survive recovery — A2's commit classifier stamps every `T_APPEND`
+/// with `content_base_lsn[recid]`, and fabricating that stamp instead of reading
+/// it is a silent-loss channel.
+#[derive(Default)]
+pub(crate) struct Identities {
+    /// LSN of the content image currently applied for a recid. Set by a
+    /// content-bearing `T_RECORD`; CLEARED by `T_DELETE`, by a null-content
+    /// `T_RECORD` and by `T_PREALLOC`.
+    pub(crate) content_base_lsn: HashMap<u64, i64>,
+    /// LSN at which a recid's state was last made self-contained. Set by EVERY
+    /// self-contained non-void entry; cleared by `T_DELETE`. Consumed by the
+    /// cleaner (A3).
+    pub(crate) state_lsn: HashMap<u64, i64>,
+    /// Recids whose stranded `T_APPEND` replay skipped, minus those a later
+    /// self-contained entry has since superseded.
+    skipped_appends: HashSet<u64>,
+}
+
+impl Identities {
+    /// A content-bearing image: both identities move to this section's LSN.
+    pub(crate) fn content(&mut self, recid: u64, lsn: i64) {
+        self.content_base_lsn.insert(recid, lsn);
+        self.state_lsn.insert(recid, lsn);
+        self.skipped_appends.remove(&recid);
+    }
+
+    /// A self-contained entry that leaves the record with NO content image — a
+    /// null `T_RECORD` or a `T_PREALLOC`. Merely declining to set a new content
+    /// base is not enough: a recid that was content-live and became null would
+    /// keep a stale base, and a later writer could then stamp an append from a
+    /// state in which append is not valid.
+    pub(crate) fn state_only(&mut self, recid: u64, lsn: i64) {
+        self.content_base_lsn.remove(&recid);
+        self.state_lsn.insert(recid, lsn);
+        self.skipped_appends.remove(&recid);
+    }
+
+    /// The record is gone: both identities cleared, any pending skip discharged.
+    pub(crate) fn void(&mut self, recid: u64) {
+        self.content_base_lsn.remove(&recid);
+        self.state_lsn.remove(&recid);
+        self.skipped_appends.remove(&recid);
+    }
+
+    /// End of replay: every skipped append must have been superseded. A recid
+    /// still here means the retained log holds a delta whose base is gone and
+    /// nothing later re-established it — the store cannot be reconstructed, so
+    /// the open refuses rather than return a record missing acknowledged bytes.
+    fn audit(&mut self) -> Result<()> {
+        if self.skipped_appends.is_empty() {
+            return Ok(());
+        }
+        let n = self.skipped_appends.len();
+        let recid = *self.skipped_appends.iter().next().expect("non-empty");
+        self.skipped_appends.clear();
+        Err(DbError::corrupt_msg(format!(
+            "WAL replay skipped {n} append(s) whose base image is absent and which no later entry \
+             superseded (recid {recid}): the log is missing sections it depends on"
+        )))
+    }
+}
+
+// ---------- R3: pass 1 ----------
+
+/// Records a verdict against a segment; the caller stops scanning it and R4
+/// decides whether it matters. First message wins.
+fn hold(seg: &mut Segment, message: String) {
+    if seg.held.is_none() {
+        seg.held = Some(message);
+    }
+}
+
+/// R3, one segment (table S). Leaves `valid_end`, `first_lsn`, `last_lsn` and at
+/// most one held verdict on `seg`; returns the highest `cleanedThroughSeq`
+/// attested by a valid `'K'` **inside this segment**.
+///
+/// `look_last` enters as the previous segment's last accepted LSN and is used
+/// ONLY as the suspect-header lookahead's anchor. The density checks (S2/S9)
+/// deliberately restart at every segment boundary — the cross-boundary link is
+/// R4's job, over the retained set alone. Checking it here would refuse a
+/// perfectly legitimate crash image (segment 1 present, segment 2 already
+/// unlinked, segment 3 carrying the mark that authorized it), and the verdict
+/// would originate in a retained segment while being caused by a superseded one
+/// — the one shape R4's "discard verdicts from below the mark" cannot rescue.
+///
+/// `is_active` marks the highest segment, the only one a torn tail can reach:
+/// W3 seals every other segment at a section boundary with `force(true)`, so a
+/// tear anywhere below the highest name is corruption by construction.
+fn scan_segment(
+    seg: &mut Segment,
+    mut look_last: i64,
+    is_active: bool,
+    replay_buf: usize,
+    mark_log_start: &mut i64,
+) -> Result<i64> {
+    let mut seg_through: i64 = 0;
+    let len = seg.file_len;
+    let mut pos = SEG_HDR;
+    seg.valid_end = pos;
+    while pos + SEC_HDR as u64 <= len {
+        let hdr = match read_sec_hdr(seg, pos)? {
+            Some(h) => h,
+            None => {
+                if !is_active {
+                    hold(
+                        seg,
+                        "non-final segment is shorter than its own sections claim".into(),
+                    );
+                }
+                return Ok(seg_through);
+            }
+        };
+        let (tag, lsn, body_len, stored_hdr_crc, stored_body_crc) = parse_sec_hdr(&hdr);
+        let body_start = pos + SEC_HDR as u64;
+
+        if hdr_crc(seg, pos, &hdr) != stored_hdr_crc || !valid_tag(tag) {
+            // S3. The declared bodyLen is UNTRUSTED — it lives in the bytes that
+            // just failed their own checksum — so proving corruption needs a
+            // section at exactly the declared end carrying exactly the LSN the
+            // damaged one would have been followed by.
+            if !is_active {
+                hold(
+                    seg,
+                    format!("section header damaged at offset {pos} in a non-final segment"),
+                );
+                return Ok(seg_through);
+            }
+            if body_len >= 0
+                && body_len as u64 <= len - body_start
+                && any_valid_section_from(
+                    seg,
+                    body_start + body_len as u64,
+                    len,
+                    look_last,
+                    true,
+                    replay_buf,
+                )?
+            {
+                hold(
+                    seg,
+                    format!(
+                        "mid-log corruption: section header damaged at offset {pos} but valid \
+                         sections follow (not a torn tail)"
+                    ),
+                );
+            }
+            return Ok(seg_through); // torn tail
+        }
+        if body_len < 0 || body_len as u64 > len - body_start {
+            // S5: a verified header whose body runs past the end of the file is
+            // a torn tail by construction — there is nothing to look ahead at.
+            if !is_active {
+                hold(
+                    seg,
+                    format!(
+                        "section body extends past the end of a non-final segment at offset {pos}"
+                    ),
+                );
+            }
+            return Ok(seg_through);
+        }
+        let body_end = body_start + body_len as u64;
+        match body_crc(seg, pos, body_start, body_end, replay_buf)? {
+            None => {
+                if !is_active {
+                    hold(
+                        seg,
+                        "non-final segment is shorter than its own sections claim".into(),
+                    );
+                }
+                return Ok(seg_through);
+            }
+            Some(c) if c != stored_body_crc => {
+                // S4. Here `body_end` IS trusted — the header sealed it — so the
+                // lookahead starts at a real section boundary and any strictly
+                // future LSN proves durable sections follow.
+                if !is_active {
+                    hold(
+                        seg,
+                        format!("section body CRC mismatch at offset {pos} in a non-final segment"),
+                    );
+                    return Ok(seg_through);
+                }
+                if any_valid_section_from(seg, body_end, len, look_last, false, replay_buf)? {
+                    hold(
+                        seg,
+                        format!(
+                            "mid-log corruption: section body CRC mismatch at offset {pos} but \
+                             valid sections follow"
+                        ),
+                    );
+                }
+                return Ok(seg_through);
+            }
+            Some(_) => {}
+        }
+
+        // The section is whole. Everything from here is a WRITER-defect class:
+        // CRC-valid means these bytes were produced deliberately, so the verdict
+        // is corruption rather than a torn tail — but it is still HELD, because
+        // this segment may be superseded.
+        if seg.last_lsn != 0 {
+            // Both density checks live under this guard, and that is frozen
+            // reference behaviour, not an oversight: 0 doubles as the "no
+            // section seen" sentinel, so an unguarded S2 would refuse the first
+            // section of every segment on `0 <= 0`. The visible consequence is
+            // that a whole LEADING RUN of crafted lsn==0 sections is accepted
+            // and replayed while staying invisible to first_lsn/last_lsn.
+            if lsn <= seg.last_lsn {
+                hold(
+                    seg,
+                    format!(
+                        "section LSN {lsn} at offset {pos} does not follow {}",
+                        seg.last_lsn
+                    ),
+                );
+                return Ok(seg_through);
+            }
+            if lsn != seg.last_lsn + 1 {
+                // S9. LSNs are DENSE by construction — one per section, the
+                // reservation never burns one, rollback never mints one — so
+                // recovery demands them consecutive rather than merely
+                // increasing. A gap is what detects a clean whose 'C' sections
+                // vanished WHOLLY, leaving the predecessor ending at a clean
+                // section boundary so nothing else looks wrong; without it the
+                // mark silently authorizes deleting the only surviving copy.
+                hold(
+                    seg,
+                    format!(
+                        "section LSNs must be consecutive: {lsn} at offset {pos} after {}",
+                        seg.last_lsn
+                    ),
+                );
+                return Ok(seg_through);
+            }
+        }
+        if tag == TAG_MARK {
+            match read_mark(seg, body_start, body_len, lsn, seg.seq)? {
+                Err(fault) => {
+                    hold(seg, fault);
+                    return Ok(seg_through);
+                }
+                Ok((through, log_start)) => {
+                    // The reduction is per-SEGMENT-scan and strict: an equal
+                    // through later in the same segment does not displace the
+                    // first one's logStartLsn. `mark_log_start` is whatever the
+                    // last segment-local maximum set it to and is never
+                    // re-derived from the global maximum below — frozen
+                    // behaviour, pinned by the Java edge tests.
+                    if through > seg_through {
+                        seg_through = through;
+                        *mark_log_start = log_start;
+                    }
+                }
+            }
+        }
+        if seg.first_lsn == 0 {
+            seg.first_lsn = lsn;
+        }
+        seg.last_lsn = lsn;
+        look_last = lsn;
+        pos = body_end;
+        seg.valid_end = pos;
+    }
+    if pos < len && !is_active {
+        // S6: W3 leaves no trailing bytes below the highest name.
+        hold(
+            seg,
+            format!(
+                "non-final segment has {} trailing bytes past its last section",
+                len - pos
+            ),
+        );
+    }
+    Ok(seg_through)
+}
+
+/// Reads and validates one `'K'` body. `Ok(Err(msg))` is a held fault; the outer
+/// `Err` is I/O.
+#[allow(clippy::type_complexity)]
+fn read_mark(
+    seg: &Segment,
+    body_start: u64,
+    body_len: i64,
+    lsn: i64,
+    seg_seq: i64,
+) -> Result<std::result::Result<(i64, i64), String>> {
+    if body_len != MARK_BODY_LEN {
+        return Ok(Err(format!(
+            "clean mark body is {body_len} bytes, not {MARK_BODY_LEN}"
+        )));
+    }
+    let mut body = [0u8; MARK_BODY_LEN as usize];
+    if read_at_opt(handle(seg)?, &mut body, body_start)?.is_none() {
+        return Ok(Err("clean mark body is truncated".into()));
+    }
+    let through = be64(&body, 0);
+    let log_start = be64(&body, 8);
+    if through <= 0 {
+        return Ok(Err(format!(
+            "clean mark attests cleanedThroughSeq {through}"
+        )));
+    }
+    if log_start <= 0 || log_start > lsn {
+        return Ok(Err(format!(
+            "clean mark attests logStartLsn {log_start}, which is not an LSN at or below the \
+             mark's own {lsn}"
+        )));
+    }
+    if through >= seg_seq {
+        // K4: a mark may never authorize removing its own segment, which is what
+        // makes the retained set non-empty by construction.
+        return Ok(Err(format!(
+            "clean mark in segment {seg_seq} authorizes removing segment {through}, including itself"
+        )));
+    }
+    Ok(Ok((through, log_start)))
+}
+
+/// True when `[from, limit)` holds at least one fully valid section, proving
+/// that durable committed sections follow a bad one — corruption, not a torn
+/// tail.
+///
+/// A **framed candidate walk**, not a bytewise search and not a full validation:
+/// a candidate is framing-valid on its header CRC, tag and body length alone.
+/// `'K'` body constraints, entry decoding and the one-entry-per-recid rule are
+/// deliberately NOT checked here — a port that calls its complete section
+/// validator classifies torn tails differently from the reference.
+///
+/// With `exact_next` (untrusted anchor: the damaged section's own bodyLen) the
+/// candidate must carry EXACTLY `last_lsn + 2`, the damaged section having been
+/// `last_lsn + 1`; otherwise (trusted anchor) any strictly future LSN counts.
+/// Both reject "embedded fake" patterns from user data holding copies of earlier
+/// sections: stale copies carry old LSNs, and under the CRC domain a copied
+/// section fails its checksums at any other offset anyway.
+///
+/// Never crosses a segment boundary — `limit` is this segment's length.
+fn any_valid_section_from(
+    seg: &Segment,
+    from: u64,
+    limit: u64,
+    last_lsn: i64,
+    exact_next: bool,
+    replay_buf: usize,
+) -> Result<bool> {
+    let mut pos = from;
+    while pos + SEC_HDR as u64 <= limit {
+        let hdr = match read_sec_hdr(seg, pos)? {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        let (tag, lsn, body_len, stored_hdr_crc, stored_body_crc) = parse_sec_hdr(&hdr);
+        let body_start = pos + SEC_HDR as u64;
+        if hdr_crc(seg, pos, &hdr) != stored_hdr_crc
+            || !valid_tag(tag)
+            || body_len < 0
+            || body_len as u64 > limit - body_start
+        {
+            return Ok(false);
+        }
+        let body_end = body_start + body_len as u64;
+        // Wrapping, like the reference: `last_lsn` is a number read off a disk
+        // that may hold anything, and a candidate LSN that matches the wrapped
+        // value is a legitimate (if unreachable) answer, where a panic is not.
+        let lsn_ok = if exact_next {
+            lsn == last_lsn.wrapping_add(2)
+        } else {
+            lsn > last_lsn.wrapping_add(1)
+        };
+        if lsn_ok {
+            match body_crc(seg, pos, body_start, body_end, replay_buf)? {
+                Some(c) if c == stored_body_crc => return Ok(true),
+                None => return Ok(false),
+                Some(_) => {}
+            }
+        }
+        pos = body_end;
+    }
+    Ok(false)
+}
+
+// ---------- R4: adjudicate ----------
+
+/// R4. Returns the index at which the **retained** suffix begins — the segments
+/// above `cleaned_through`. Verdicts and LSN discontinuities originating below
+/// it are DISCARDED: those segments are superseded and about to be deleted, so
+/// rot inside them is irrelevant and throwing on it would brick a store over
+/// bytes nobody will read.
+///
+/// Every check here is an **equality between two recorded numbers**. The lowest
+/// retained segment's stated start must equal the newest mark's `logStartLsn`,
+/// or 1 when there is no mark. Each subsequent segment's stated start must equal
+/// where its present predecessor ended — or, when that predecessor holds no
+/// section, where IT said it would start, which is exactly what separates W7's
+/// legitimately empty rotate target from a segment whose sections vanished. And
+/// a segment must hold what its own header promised.
+///
+/// A missing sequence number needs **no rule at all**: if it held sections its
+/// successor's stated start will not match its predecessor's end; if it held
+/// none, nothing is missing. That is why the sequence numbers W6 burns on
+/// create-crash residue are simply invisible here.
+fn adjudicate(segments: &[Segment], cleaned_through: i64, mark_log_start: i64) -> Result<usize> {
+    let start = segments
+        .iter()
+        .position(|s| s.seq > cleaned_through)
+        .unwrap_or(segments.len());
+    if start == segments.len() {
+        // Unreachable: K4 makes a mark's own segment outrank everything it
+        // authorizes removing, so the segment holding the newest mark is always
+        // retained. Checked rather than assumed, because everything below
+        // depends on it.
+        return Err(DbError::corrupt_msg(format!(
+            "WAL clean mark {cleaned_through} retires the whole segment set"
+        )));
+    }
+    let retained = &segments[start..];
+    for s in retained {
+        if let Some(held) = &s.held {
+            return Err(DbError::corrupt_msg(format!(
+                "WAL segment {}: {held}",
+                seg_name(s)
+            )));
+        }
+    }
+    // The floor runs ALWAYS, not only when there is no anchor. The two witness
+    // different things — the chain witnesses LSN continuity, the floor witnesses
+    // the mark-image contract — and making them alternatives leaves a hole: a
+    // mark with no image behind it, whose superseded segments are still present,
+    // satisfies the chain (their data is below the mark, so no LSN is missing)
+    // and violates the floor. The open would then succeed, pass 2 would replay
+    // only the retained set, and R5 would unlink the segments holding the only
+    // copy of the data.
+    let expected_start = if mark_log_start > 0 {
+        mark_log_start
+    } else {
+        1
+    };
+    let mut prev: Option<&Segment> = None;
+    for s in retained {
+        let stated = s.header_first_lsn();
+        match prev {
+            None => {
+                if stated != expected_start {
+                    return Err(DbError::corrupt_msg(format!(
+                        "WAL retained log begins at LSN {stated} in {} but {}: sections below it \
+                         are gone",
+                        seg_name(s),
+                        if mark_log_start > 0 {
+                            format!("the clean mark attests it begins at {mark_log_start}")
+                        } else {
+                            "an unmarked log must begin at LSN 1".to_string()
+                        }
+                    )));
+                }
+            }
+            Some(p) => {
+                let after = if p.last_lsn != 0 {
+                    p.last_lsn + 1
+                } else {
+                    p.header_first_lsn()
+                };
+                if stated != after {
+                    return Err(DbError::corrupt_msg(format!(
+                        "WAL segment {} states it begins at LSN {stated} but {} accounts for LSNs \
+                         up to {}: sections between them are gone",
+                        seg_name(s),
+                        seg_name(p),
+                        after - 1
+                    )));
+                }
+            }
+        }
+        // A segment must also hold what its own header promised, or its prefix
+        // was lost. The gate is `first_lsn != 0`, NOT "the segment is nonempty":
+        // the two differ exactly on a segment holding only crafted lsn==0
+        // sections, which is nonempty with first_lsn 0 and whose self-check the
+        // reference therefore SKIPS.
+        if s.first_lsn != 0 && s.first_lsn != stated {
+            return Err(DbError::corrupt_msg(format!(
+                "WAL segment {} states it begins at LSN {stated} but its first section is {}: its \
+                 leading sections are gone",
+                seg_name(s),
+                s.first_lsn
+            )));
+        }
+        prev = Some(s);
+    }
+    Ok(start)
+}
+
+fn seg_name(seg: &Segment) -> String {
+    super::wal_segments::file_name(&seg.path)
+}
+
+// ---------- R6: pass 2 ----------
+
+/// R6, one segment. Pass 1 is the sole authority on section boundaries: this
+/// walk re-reads headers it already validated and never re-derives them, so a
+/// disagreement between the two passes is impossible by construction.
+fn pass2(
+    seg: &Segment,
+    inner: &StoreDirect,
+    ids: &mut Identities,
+    replay_buf: usize,
+) -> Result<()> {
+    let file = handle(seg)?;
+    let mut input = SecIn::new(file, replay_buf);
+    let mut pos = SEG_HDR;
+    while pos < seg.valid_end {
+        let mut hdr = [0u8; SEC_HDR];
+        file.read_exact_at(&mut hdr, pos).map_err(DbError::Io)?;
+        let (tag, lsn, body_len, _, _) = parse_sec_hdr(&hdr);
+        let body_start = pos + SEC_HDR as u64;
+        // A 'K' body carries no entries and is NEVER passed to the entry
+        // decoder; 'C' is semantically identical to 'S' and gets no special
+        // handling.
+        if tag != TAG_MARK {
+            apply_section(
+                inner,
+                &mut input,
+                body_start,
+                body_start + body_len as u64,
+                lsn,
+                ids,
+            )?;
+        }
+        pos = body_start + body_len as u64;
+    }
+    Ok(())
+}
+
+/// Decodes and applies one CRC-verified section body as the §4.2 **state
+/// transition table**; a malformed entry is a writer bug or corruption, never a
+/// torn tail. `lsn` is the enclosing section's.
+///
+/// Every row states what happens to BOTH identities, because getting that wrong
+/// is how the in-memory tables desynchronize from the store:
+///
+/// ```text
+/// entry             precondition                      action        contentBase  state    skip
+/// T_RECORD content  —                                 wal_put       = lsn        = lsn    clear
+/// T_RECORD null     —                                 wal_put(null) cleared      = lsn    clear
+/// T_PREALLOC        R is not content-live             wal_prealloc  cleared      = lsn    clear
+/// T_PREALLOC        R IS content-live                 DataCorruption
+/// T_DELETE          —                                 wal_delete    cleared      cleared  clear
+/// T_APPEND          baseLsn == contentBase[R]         append        unchanged    unch.    unch.
+/// T_APPEND          contentBase[R] absent or > base   SKIP          unchanged    unch.    add R
+/// T_APPEND          contentBase[R] < baseLsn          DataCorruption
+/// ```
+///
+/// A superseded `T_RECORD` is RE-APPLIED rather than skipped, which is correct
+/// because it is idempotent and costs only recovery-time work.
+fn apply_section(
+    inner: &StoreDirect,
+    input: &mut SecIn,
+    start: u64,
+    end: u64,
+    lsn: i64,
+    ids: &mut Identities,
+) -> Result<()> {
+    input.reset(start, end);
+    // At most one entry per recid per section, for 'C' sections as well as 'S'.
+    // The classifier coalesces every append() call for a recid into one entry, so
+    // a second entry would mean the ordered-replay reasoning no longer applies to
+    // this section.
+    let mut seen: HashSet<u64> = HashSet::new();
+    while input.pos() < end {
+        let ty = input.read_byte()?;
+        match ty {
+            T_PREALLOC => {
+                let recid = entry_recid(&mut seen, input.unpack_long()?)?;
+                // wal_prealloc no-ops on ANY set slot, so applying it to a
+                // content-live record would silently leave a record that is
+                // still there while the identities describe a preallocated one.
+                // The precondition is "not content-live" rather than "void or
+                // already preallocated" to be TOTAL over doctored images: a
+                // null-content target matches neither of those and must not fall
+                // through undefined.
+                if inner.rec_state(recid)? == super::direct::STATE_LIVE {
+                    return Err(DbError::corrupt_msg(format!(
+                        "WAL PREALLOC over a content-live record, recid={recid}"
+                    )));
+                }
+                inner.wal_prealloc(recid)?;
+                ids.state_only(recid, lsn);
+            }
+            T_DELETE => {
+                let recid = entry_recid(&mut seen, input.unpack_long()?)?;
+                // Tolerant of a void target on purpose: that is the shape a
+                // skipped-append history leaves behind.
+                inner.wal_delete(recid)?;
+                ids.void(recid);
+            }
+            T_RECORD => {
+                let recid = entry_recid(&mut seen, input.unpack_long()?)?;
+                let cap = input.unpack_long()?;
+                let len_plus = input.unpack_long()?;
+                let mut data: Option<Vec<u8>> = None;
+                if len_plus != 0 {
+                    let len = len_plus - 1;
+                    if len > i32::MAX as u64 || len > input.remaining() {
+                        return Err(DbError::corrupt_msg(format!("bad WAL record length {len}")));
+                    }
+                    let mut b = vec![0u8; len as usize];
+                    input.read_fully(&mut b)?;
+                    data = Some(b);
+                }
+                if !cap_valid(cap, data.as_deref()) {
+                    return Err(DbError::corrupt_msg(format!(
+                        "bad WAL record capacity {cap}"
+                    )));
+                }
+                inner.wal_put(recid, cap as usize, data.as_deref())?;
+                match data {
+                    None => ids.state_only(recid, lsn),
+                    Some(_) => ids.content(recid, lsn),
+                }
+            }
+            T_APPEND => {
+                let recid = entry_recid(&mut seen, input.unpack_long()?)?;
+                let base_lsn = decode_base_lsn(input.unpack_long()?, lsn, recid)?;
+                let len = input.unpack_long()?;
+                if len > i32::MAX as u64 || len > input.remaining() {
+                    return Err(DbError::corrupt_msg(format!("bad WAL append length {len}")));
+                }
+                let base = ids.content_base_lsn.get(&recid).copied();
+                if let Some(b) = base {
+                    if b < base_lsn {
+                        // Unreachable in a conforming set (retirement is a prefix
+                        // in LSN order, so a base below the current one cannot be
+                        // the missing part); defence in depth over S9.
+                        return Err(DbError::corrupt_msg(format!(
+                            "WAL append cites base LSN {base_lsn} above the applied base {b}, \
+                             recid={recid}: sections are missing"
+                        )));
+                    }
+                }
+                let mut b = vec![0u8; len as usize];
+                // Consumed either way: the frame is still framed.
+                input.read_fully(&mut b)?;
+                match base {
+                    Some(base) if base == base_lsn => {
+                        if inner.append(nz(recid)?, &b)? == AppendResult::Refused {
+                            return Err(DbError::corrupt_msg(format!(
+                                "WAL append refused, recid={recid}"
+                            )));
+                        }
+                    }
+                    // The base this delta extends is gone (cleaned, or superseded
+                    // by a newer image that already contains these bytes): skip
+                    // and remember.
+                    _ => {
+                        ids.skipped_appends.insert(recid);
+                    }
+                }
+            }
+            other => {
+                return Err(DbError::corrupt_msg(format!("bad WAL entry tag {other}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The recid an entry names, checked once for both rules that apply to it
+/// before any of the entry's other fields are read.
+///
+/// - **one entry per recid per section**, `'C'` sections included. The
+///   classifier coalesces every `append()` call for a recid into one entry, so a
+///   second entry would mean the ordered-replay reasoning no longer applies.
+/// - **recid 0 is reserved** and never allocated, so no conforming writer emits
+///   it. Refusing it here is a deliberate port strictness — the reference
+///   decoder does not check, and hands 0 to the inner store — of the same class
+///   as the port's 10-byte packLong cap: it changes which MALFORMED images are
+///   refused, never which conforming ones are accepted, and the corruption
+///   fixtures record it per engine rather than assuming uniform strictness.
+fn entry_recid(seen: &mut HashSet<u64>, recid: u64) -> Result<u64> {
+    if recid == 0 {
+        return Err(DbError::corrupt("WAL entry references reserved recid 0"));
+    }
+    if !seen.insert(recid) {
+        return Err(DbError::corrupt_msg(format!(
+            "two WAL entries for recid {recid} in one section"
+        )));
+    }
+    Ok(recid)
+}
+
+/// Turns the encoded `packLong(lsn - baseLsn)` back into an absolute base LSN,
+/// BEFORE any mutation. The delta must be >= 1 — so an append can never cite a
+/// base in its own section, and `baseLsn < lsn` always — and must leave a base
+/// LSN >= 1, since LSNs start at 1. Both bounds are what make the table's
+/// comparison meaningful instead of an accidental "skip" on a garbage value.
+fn decode_base_lsn(delta: u64, lsn: i64, recid: u64) -> Result<i64> {
+    if delta < 1 || delta > (lsn - 1).max(0) as u64 {
+        return Err(DbError::corrupt_msg(format!(
+            "bad WAL append base delta {delta} in section LSN {lsn}, recid={recid}"
+        )));
+    }
+    Ok(lsn - delta as i64)
+}
+
+// ---------- the ordered algorithm ----------
+
+/// What recovery hands back to the store: where the log continues, and the
+/// identities replay rebuilt.
+pub(crate) struct Recovered {
+    pub(crate) next_lsn: i64,
+    pub(crate) identities: Identities,
+}
+
+/// The ordered recovery algorithm, R3-R7. R0-R2 (enumerate, classify, remove
+/// create-crash residue) already ran inside [`WalSegmentSet::open`].
+///
+/// 1. **R3** pass 1 — namespace only, no per-recid state: per segment the valid
+///    section prefix, any HELD verdict, LSN continuity; globally the newest
+///    `'K'`.
+/// 2. **R4** adjudicate — discard every verdict from a superseded segment, throw
+///    the rest, and check the floor/chain/self equalities over the retained set.
+/// 3. **R5** unlink the superseded segments, then fsync the directory.
+/// 4. **R6** pass 2 — apply the §4.2 table in ascending (segment, offset) order,
+///    then the skip audit.
+/// 5. **R7** finish — `nextLsn`, and IFF the active segment's valid prefix is
+///    shorter than its length: truncate, force, rotate (W7), fsync.
+///
+/// **R5 runs before R6**, so an open that refuses can do so with the namespace
+/// already pruned. That is deliberate and fixed, not incidental: "a failed open
+/// leaves the files untouched" is not a v3 invariant, and the fixture oracles
+/// assert an exact post-open file set per row instead.
+///
+/// A read-only recovery takes every decision identically and performs none of
+/// the mutations: no create, no residue delete, no unlink, no truncate, no
+/// rotate, no directory fsync. It still computes `next_lsn` and the identities.
+pub(crate) fn recover(
+    set: &mut WalSegmentSet,
+    inner: &StoreDirect,
+    replay_buf: usize,
+) -> Result<Recovered> {
+    let read_only = set.read_only();
+    if set.segments().is_empty() {
+        // N1: a fresh store. The writable open creates segment 1 (or the
+        // successor of whatever sequence numbers residue burned) with
+        // firstLsn = 1; the read-only open creates nothing and simply reports
+        // where the log would begin.
+        if !read_only {
+            set.create_segment(1)?;
+        }
+        inner.rebuild_free_recids()?;
+        return Ok(Recovered {
+            next_lsn: 1,
+            identities: Identities::default(),
+        });
+    }
+
+    // ---- R3 ----
+    let n = set.segments().len();
+    let active_idx = n - 1;
+    let mut cleaned_through = 0i64;
+    let mut mark_log_start = 0i64;
+    let mut carry = 0i64;
+    for i in 0..n {
+        let seg = &mut set.segments_mut()[i];
+        seg.ensure_open()?;
+        let scanned = scan_segment(seg, carry, i == active_idx, replay_buf, &mut mark_log_start);
+        // Released the moment this segment's scan is done, whatever the verdict;
+        // pass 2 reopens the ones it needs. This is what bounds the descriptor
+        // count to O(1) rather than O(segments) — a store is allowed to reach
+        // roughly twice the live data size in log, so a large one means thousands
+        // of segments against a default `ulimit -n` of 1024.
+        seg.release();
+        cleaned_through = cleaned_through.max(scanned?);
+        // A segment ending in an accepted lsn==0 section must NOT erase the
+        // preceding segment's anchor: `last_lsn` is still 0 there, and the carry
+        // stands. Frozen sentinel behaviour again.
+        if seg.last_lsn != 0 {
+            carry = seg.last_lsn;
+        }
+    }
+
+    // ---- R4 ----
+    let retained_from = adjudicate(set.segments(), cleaned_through, mark_log_start)?;
+
+    // R7's answer is computed over the RETAINED set, deliberately, rather than
+    // over every valid section. The two agree on every conforming image — K4 puts
+    // a mark's own segment above everything it authorizes removing, and LSNs
+    // ascend with (segment, offset) — and differ only on a doctored image where a
+    // superseded segment carries a spuriously high LSN, where the global reading
+    // would leave a gap that fails S9 on the NEXT open.
+    let mut max_valid_lsn = 0i64;
+    for s in &set.segments()[retained_from..] {
+        max_valid_lsn = max_valid_lsn.max(s.last_lsn);
+    }
+    // An all-empty retained set holds no LSN to count from, and "0 + 1" would
+    // restart the log at 1 — reissuing LSNs a mark already accounted for. The
+    // lowest segment's header says where the log begins; that is the answer, and
+    // it is why the field is in the header.
+    if max_valid_lsn == 0 {
+        max_valid_lsn = set.segments()[retained_from].header_first_lsn() - 1;
+    }
+
+    // ---- R5 ---- (no-op under read-only)
+    set.unlink_through(cleaned_through)?;
+
+    // ---- R6 ----
+    let mut ids = Identities::default();
+    let n = set.segments().len();
+    for i in 0..n {
+        if set.segments()[i].seq <= cleaned_through {
+            continue; // read-only: superseded segments are still on disk
+        }
+        let is_active = i == n - 1;
+        set.segments_mut()[i].ensure_open()?;
+        let applied = pass2(&set.segments()[i], inner, &mut ids, replay_buf);
+        if !is_active {
+            set.segments_mut()[i].release();
+        }
+        applied?;
+    }
+    // The audit runs BEFORE R7's truncate: an open that refuses here has mutated
+    // nothing further. The bytes a torn tail would lose were never a valid
+    // section, so the ordering is conformance and forensics rather than data —
+    // but a port that reordered it would fail the fixtures.
+    ids.audit()?;
+
+    // ---- R7 ----
+    let next_lsn = max_valid_lsn
+        .checked_add(1)
+        .ok_or_else(|| DbError::corrupt("WAL LSN space exhausted"))?;
+    if !read_only {
+        let active = set.active().expect("non-empty");
+        let (torn, valid_end) = (active.valid_end < active.file_len, active.valid_end);
+        if torn {
+            // W7. The truncate is not itself forced, so a crash after
+            // truncate-then-shorter-reappend can resurface pre-truncation bytes.
+            // Force, then rotate, so later appends never reuse this segment's
+            // checksum domain at all. Conditional on an ACTUAL truncation:
+            // rotating on every open would burn a sequence number per open and
+            // demote a legitimate valid-empty highest segment to non-highest (H8).
+            let active = set.active_mut().expect("non-empty");
+            active.ensure_open()?;
+            handle(active)?.set_len(valid_end)?;
+            active.file_len = valid_end;
+            // The file's SIZE is the payload here: never sync_data.
+            handle(active)?.sync_all()?;
+            active.release();
+            set.create_segment(next_lsn)?;
+        }
+    }
+    // Replay of delete-then-reuse histories leaves stale free-list entries for
+    // revived recids: rebuild the allocator's free list from the final index.
+    inner.rebuild_free_recids()?;
+    Ok(Recovered {
+        next_lsn,
+        identities: ids,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::DataOutput2;
+    use crate::store::wal_segments::build_header;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // ---------------------------------------------------------------- test kit
+    // The rust half of Java's WalTestKit, extended from A0's namespace-only
+    // version to whole segment IMAGES: the byte-level recipe for a section, a
+    // mark and an entry lives here once, so a hand-built image cannot drift from
+    // what the codec above reads — and, through `build_sec_hdr`, from what A2's
+    // writer will emit.
+
+    const SEGH: usize = SEG_HDR as usize;
+
+    fn scratch(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "mapdb5_walrec_{}_{}_{}",
+            std::process::id(),
+            tag,
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn base_in(dir: &Path) -> PathBuf {
+        dir.join("store.db")
+    }
+
+    fn seg_path(base: &Path, seq: i64) -> PathBuf {
+        let mut s = base.as_os_str().to_os_string();
+        s.push(format!(".wal.{seq:016x}"));
+        PathBuf::from(s)
+    }
+
+    /// One segment file under construction.
+    struct SegImage {
+        seq: i64,
+        header: [u8; SEGH],
+        bytes: Vec<u8>,
+        /// Offset of every section appended, in order.
+        offsets: Vec<u64>,
+    }
+
+    impl SegImage {
+        fn new(seq: i64, first_lsn: i64) -> SegImage {
+            let header = build_header(seq, first_lsn);
+            SegImage {
+                seq,
+                header,
+                bytes: header.to_vec(),
+                offsets: Vec::new(),
+            }
+        }
+
+        /// A section of any tag, sealed in its own domain at the offset it
+        /// actually lands on.
+        fn section(mut self, tag: u8, lsn: i64, body: &[u8]) -> SegImage {
+            let off = self.bytes.len() as u64;
+            let hdr = build_sec_hdr(&self.header, off, tag, lsn, body);
+            self.offsets.push(off);
+            self.bytes.extend_from_slice(&hdr);
+            self.bytes.extend_from_slice(body);
+            self
+        }
+
+        fn commit(self, lsn: i64, body: Body) -> SegImage {
+            self.section(TAG_SECTION, lsn, &body.finish())
+        }
+
+        fn image(self, lsn: i64, body: Body) -> SegImage {
+            self.section(TAG_IMAGE, lsn, &body.finish())
+        }
+
+        fn mark(self, lsn: i64, through: i64, log_start: i64) -> SegImage {
+            self.section(TAG_MARK, lsn, &build_mark_body(through, log_start))
+        }
+
+        /// Bytes appended past the last section — a torn tail, or S6's trailing
+        /// bytes below the highest name.
+        fn raw(mut self, bytes: &[u8]) -> SegImage {
+            self.bytes.extend_from_slice(bytes);
+            self
+        }
+
+        /// Truncates the image to `len` bytes: the shape a crash mid-append
+        /// leaves.
+        fn cut_to(mut self, len: usize) -> SegImage {
+            self.bytes.truncate(len);
+            self
+        }
+
+        /// Flips a bit at an absolute file offset.
+        fn damage(mut self, at: u64) -> SegImage {
+            self.bytes[at as usize] ^= 0x40;
+            self
+        }
+
+        fn off(&self, i: usize) -> u64 {
+            self.offsets[i]
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+
+        fn write(self, base: &Path) -> SegImage {
+            std::fs::write(seg_path(base, self.seq), &self.bytes).expect("write segment");
+            self
+        }
+    }
+
+    /// A section body: entries in the packLong framing, built through the port's
+    /// own `DataOutput2` so the test kit cannot encode a long differently from
+    /// the writer.
+    #[derive(Default)]
+    struct Body(DataOutput2);
+
+    impl Body {
+        fn new() -> Body {
+            Body(DataOutput2::with_capacity(64))
+        }
+
+        fn prealloc(mut self, recid: u64) -> Body {
+            self.0.write_byte(T_PREALLOC as i32);
+            self.0.pack_long(recid);
+            self
+        }
+
+        fn delete(mut self, recid: u64) -> Body {
+            self.0.write_byte(T_DELETE as i32);
+            self.0.pack_long(recid);
+            self
+        }
+
+        /// `content: None` is the null record (`len+1 == 0`, capacity 0).
+        fn record(mut self, recid: u64, content: Option<&[u8]>) -> Body {
+            self.0.write_byte(T_RECORD as i32);
+            self.0.pack_long(recid);
+            match content {
+                None => {
+                    self.0.pack_long(0);
+                    self.0.pack_long(0);
+                }
+                Some(d) => {
+                    self.0.pack_long(cap_for(d.len()));
+                    self.0.pack_long(d.len() as u64 + 1);
+                    self.0.write_all(d);
+                }
+            }
+            self
+        }
+
+        /// A record with a hand-chosen capacity, for the `capValid` rows.
+        fn record_cap(mut self, recid: u64, cap: u64, content: Option<&[u8]>) -> Body {
+            self.0.write_byte(T_RECORD as i32);
+            self.0.pack_long(recid);
+            self.0.pack_long(cap);
+            match content {
+                None => self.0.pack_long(0),
+                Some(d) => {
+                    self.0.pack_long(d.len() as u64 + 1);
+                    self.0.write_all(d);
+                }
+            }
+            self
+        }
+
+        /// `delta` is `sectionLsn - baseLsn`, exactly as the format stores it.
+        fn append(mut self, recid: u64, delta: u64, data: &[u8]) -> Body {
+            self.0.write_byte(T_APPEND as i32);
+            self.0.pack_long(recid);
+            self.0.pack_long(delta);
+            self.0.pack_long(data.len() as u64);
+            self.0.write_all(data);
+            self
+        }
+
+        fn raw(mut self, bytes: &[u8]) -> Body {
+            self.0.write_all(bytes);
+            self
+        }
+
+        fn finish(self) -> Vec<u8> {
+            self.0.buf
+        }
+    }
+
+    /// The capacity a conforming writer records for `len` content bytes.
+    fn cap_for(len: usize) -> u64 {
+        let need = 4 + len as u64;
+        need.div_ceil(16) * 16
+    }
+
+    struct Recovery {
+        set: WalSegmentSet,
+        inner: StoreDirect,
+        rec: Recovered,
+    }
+
+    fn try_recover(base: &Path, read_only: bool, replay_buf: usize) -> Result<Recovery> {
+        let mut set = WalSegmentSet::open(base, read_only)?;
+        let inner = StoreDirect::new_heap_ts(true)?;
+        let rec = recover(&mut set, &inner, replay_buf)?;
+        Ok(Recovery { set, inner, rec })
+    }
+
+    /// The ordinary path: writable, 1 MiB replay window.
+    fn open_rw(base: &Path) -> Result<Recovery> {
+        try_recover(base, false, 1 << 20)
+    }
+
+    fn open_ro(base: &Path) -> Result<Recovery> {
+        try_recover(base, true, 1 << 20)
+    }
+
+    fn corrupt_msg<T>(r: Result<T>) -> String {
+        match r {
+            Err(DbError::DataCorruption(c)) => c.to_string(),
+            Err(e) => panic!("expected DataCorruption, got {e}"),
+            Ok(_) => panic!("expected DataCorruption, got Ok"),
+        }
+    }
+
+    fn content(r: &Recovery, recid: u64) -> Option<Vec<u8>> {
+        r.inner.raw_get(recid).expect("record is live")
+    }
+
+    fn is_void(r: &Recovery, recid: u64) -> bool {
+        matches!(r.inner.raw_get(recid), Err(DbError::GetVoid(_)))
+    }
+
+    fn seqs(r: &Recovery) -> Vec<i64> {
+        r.set.segments().iter().map(|s| s.seq).collect()
+    }
+
+    fn on_disk(base: &Path) -> Vec<i64> {
+        let mut v: Vec<i64> = Vec::new();
+        for e in std::fs::read_dir(base.parent().expect("dir")).expect("read_dir") {
+            let name = e.expect("entry").file_name();
+            let name = name.to_string_lossy().into_owned();
+            if let Some(hex) = name.strip_prefix("store.db.wal.") {
+                v.push(i64::from_str_radix(hex, 16).expect("hex"));
+            }
+        }
+        v.sort_unstable();
+        v
+    }
+
+    fn file_len(base: &Path, seq: i64) -> u64 {
+        std::fs::metadata(seg_path(base, seq))
+            .expect("segment exists")
+            .len()
+    }
+
+    // ------------------------------------------------------ the CRC domain
+
+    #[test]
+    fn a_section_is_bound_to_its_segment() {
+        let dir = scratch("dom_seg");
+        let base = base_in(&dir);
+        // Two segments whose sections sit at identical offsets. Segment 2's
+        // section is byte-copied from segment 1's, which is what an operator
+        // "repairing" a log by copying a good segment over a bad one does.
+        let one = SegImage::new(1, 1).commit(1, Body::new().record(10, Some(b"one")));
+        let two = SegImage::new(2, 2).commit(2, Body::new().record(10, Some(b"one")));
+        assert_eq!(one.len(), two.len(), "same shape, so same offsets");
+        let mut forged = two.bytes.clone();
+        forged[SEGH..].copy_from_slice(&one.bytes[SEGH..]);
+        one.write(&base);
+        std::fs::write(seg_path(&base, 2), &forged).expect("write");
+
+        // The forged section fails its header CRC in segment 2's domain. Segment
+        // 2 is the highest name, so that reads as a torn tail: the section is
+        // discarded, not replayed.
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(r.set.segments()[1].valid_end, SEG_HDR);
+        assert_eq!(r.rec.next_lsn, 2, "only segment 1's section counted");
+    }
+
+    #[test]
+    fn a_section_is_bound_to_its_offset() {
+        let dir = scratch("dom_off");
+        let base = base_in(&dir);
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"b")));
+        // Move the FIRST section's bytes over the second one's: same segment,
+        // same length, different offset.
+        let (a, b) = (img.off(0) as usize, img.off(1) as usize);
+        let n = b - a;
+        let mut bytes = img.bytes.clone();
+        let first = bytes[a..b].to_vec();
+        bytes[b..b + n].copy_from_slice(&first);
+        std::fs::write(seg_path(&base, 1), &bytes).expect("write");
+
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(r.rec.next_lsn, 2, "the relocated copy is not a section");
+        assert_eq!(content(&r, 10), Some(b"a".to_vec()));
+        assert!(is_void(&r, 11));
+    }
+
+    #[test]
+    fn the_domain_covers_the_segments_stated_start() {
+        let dir = scratch("dom_first");
+        let base = base_in(&dir);
+        let img = SegImage::new(1, 1).commit(1, Body::new().record(10, Some(b"a")));
+        let mut bytes = img.bytes.clone();
+        // Restate firstLsn as 2 and RESEAL, so the header itself stays valid and
+        // the edit is only visible through the section CRCs it invalidates.
+        bytes[24..32].copy_from_slice(&2i64.to_be_bytes());
+        let crc = crc32fast::hash(&bytes[..32]) as i32;
+        bytes[32..36].copy_from_slice(&crc.to_be_bytes());
+        std::fs::write(seg_path(&base, 1), &bytes).expect("write");
+
+        // The section no longer verifies, so the segment reads as empty — and an
+        // empty segment must then satisfy the floor with its restated start,
+        // which says 2 where an unmarked log must begin at 1.
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("must begin at LSN 1"), "{msg}");
+    }
+
+    #[test]
+    fn a_body_larger_than_the_replay_window_verifies_and_replays() {
+        let dir = scratch("stream");
+        let base = base_in(&dir);
+        let big = vec![0xA5u8; 300_000];
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(&big)))
+            .write(&base);
+        // A window far smaller than the body forces refills in both the CRC pass
+        // and the entry decoder.
+        let r = try_recover(&base, false, 64).expect("opens");
+        assert_eq!(content(&r, 10), Some(big));
+    }
+
+    // ------------------------------------------------------ table S
+
+    #[test]
+    fn a_torn_tail_in_the_active_segment_truncates_forces_and_rotates() {
+        let dir = scratch("torn");
+        let base = base_in(&dir);
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"b")));
+        let keep = img.off(1) as usize + 12; // half of the second section's header
+        img.cut_to(keep).write(&base);
+
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(content(&r, 10), Some(b"a".to_vec()));
+        assert!(is_void(&r, 11));
+        assert_eq!(r.rec.next_lsn, 2);
+        // W7: truncated to the valid prefix, and a successor created so the old
+        // CRC domain is never appended to again.
+        assert_eq!(on_disk(&base), vec![1, 2]);
+        assert_eq!(file_len(&base, 1), SEG_HDR + SEC_HDR as u64 + 5);
+        assert_eq!(r.set.active().expect("active").seq, 2);
+        assert_eq!(r.set.active().expect("active").header_first_lsn(), 2);
+    }
+
+    #[test]
+    fn an_untorn_open_does_not_rotate() {
+        let dir = scratch("no_rotate");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        // Rotating on every open would burn a sequence number per open and
+        // demote a legitimately empty highest segment to non-highest (H8).
+        assert_eq!(on_disk(&base), vec![1]);
+        assert_eq!(r.rec.next_lsn, 2);
+    }
+
+    #[test]
+    fn a_damaged_header_followed_by_the_exact_next_section_is_corruption() {
+        let dir = scratch("s3_exact");
+        let base = base_in(&dir);
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"b")))
+            .commit(3, Body::new().record(12, Some(b"c")));
+        // Rot the second section's TAG. Its declared bodyLen survives, so the
+        // walk starts exactly at section 3, which carries lastLsn+2 == 3.
+        let at = img.off(1);
+        img.damage(at).write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("mid-log corruption"), "{msg}");
+        assert!(msg.contains("header damaged"), "{msg}");
+    }
+
+    #[test]
+    fn a_damaged_header_with_nothing_after_it_is_a_torn_tail() {
+        let dir = scratch("s3_tail");
+        let base = base_in(&dir);
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"b")));
+        let at = img.off(1);
+        img.damage(at).write(&base);
+        let r = open_rw(&base).expect("opens: torn tail");
+        assert_eq!(r.rec.next_lsn, 2);
+        assert!(is_void(&r, 11));
+    }
+
+    #[test]
+    fn the_lookahead_wants_exactly_the_next_lsn_after_a_damaged_header() {
+        let dir = scratch("s3_wrong_lsn");
+        let base = base_in(&dir);
+        // Sections 1, 2, then a section carrying LSN 9: valid in itself, but not
+        // the LSN that would have followed the damaged one. The reference calls
+        // that a torn tail — the untrusted anchor makes "something valid is over
+        // there" too weak a proof on its own.
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"b")))
+            .commit(9, Body::new().record(12, Some(b"c")));
+        let at = img.off(1);
+        img.damage(at).write(&base);
+        let r = open_rw(&base).expect("opens: torn tail");
+        assert_eq!(r.rec.next_lsn, 2);
+    }
+
+    #[test]
+    fn a_body_crc_mismatch_followed_by_any_future_lsn_is_corruption() {
+        let dir = scratch("s4_mid");
+        let base = base_in(&dir);
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"bbbb")))
+            .commit(3, Body::new().record(12, Some(b"c")));
+        // Rot a BODY byte: the header still seals the section's end, so the
+        // lookahead anchor is trusted and any strictly future LSN proves rot.
+        let at = img.off(1) + SEC_HDR as u64 + 2;
+        img.damage(at).write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("body CRC mismatch"), "{msg}");
+    }
+
+    #[test]
+    fn a_body_crc_mismatch_at_the_end_is_a_torn_tail() {
+        let dir = scratch("s4_tail");
+        let base = base_in(&dir);
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"bbbb")));
+        let at = img.off(1) + SEC_HDR as u64 + 2;
+        img.damage(at).write(&base);
+        let r = open_rw(&base).expect("opens: torn tail");
+        assert_eq!(r.rec.next_lsn, 2);
+        assert!(is_void(&r, 11));
+    }
+
+    #[test]
+    fn a_clean_mark_counts_as_proof_that_sections_follow() {
+        let dir = scratch("k_lookahead");
+        let base = base_in(&dir);
+        // THE flagged trap: a port whose validTag is v1's two-tag set does not
+        // see the 'K' here, reports "nothing valid follows", and silently
+        // truncates deliberate mid-log rot away as a torn tail.
+        let img = SegImage::new(2, 3)
+            .commit(3, Body::new().record(10, Some(b"a")))
+            .commit(4, Body::new().record(11, Some(b"b")))
+            .mark(5, 1, 3);
+        let at = img.off(1) + SEC_HDR as u64;
+        img.damage(at).write(&base);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(1, Some(b"x")))
+            .commit(2, Body::new().record(2, Some(b"y")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("mid-log corruption"), "{msg}");
+    }
+
+    #[test]
+    fn a_damaged_section_below_the_highest_name_is_corruption_without_a_lookahead() {
+        let dir = scratch("s3_nonfinal");
+        let base = base_in(&dir);
+        // Nothing follows the damaged section inside segment 1, so in the active
+        // segment this shape would be a legal torn tail. Below the highest name
+        // W3 rules that out: a sealed segment ends exactly at a section boundary.
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"b")));
+        let at = img.off(1);
+        img.damage(at).write(&base);
+        SegImage::new(2, 3)
+            .commit(3, Body::new().record(12, Some(b"c")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("non-final segment"), "{msg}");
+    }
+
+    #[test]
+    fn trailing_bytes_below_the_highest_name_are_corruption() {
+        let dir = scratch("s6");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .raw(&[0u8; 7])
+            .write(&base);
+        SegImage::new(2, 2)
+            .commit(2, Body::new().record(11, Some(b"b")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("trailing bytes"), "{msg}");
+    }
+
+    #[test]
+    fn trailing_bytes_in_the_active_segment_are_a_torn_tail() {
+        let dir = scratch("s6_active");
+        let base = base_in(&dir);
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .raw(&[0u8; 7])
+            .write(&base);
+        let valid = img.len() - 7;
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(r.rec.next_lsn, 2);
+        assert_eq!(file_len(&base, 1), valid as u64, "truncated to the prefix");
+        assert_eq!(on_disk(&base), vec![1, 2], "and rotated");
+    }
+
+    #[test]
+    fn a_body_running_past_the_end_is_a_torn_tail_in_the_active_segment() {
+        let dir = scratch("s5");
+        let base = base_in(&dir);
+        // A CRC-valid header whose body was never written: the crash shape a
+        // header-first writer produces.
+        let img = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"bbbbbbbbbb")));
+        let keep = img.off(1) as usize + SEC_HDR;
+        img.cut_to(keep).write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(r.rec.next_lsn, 2);
+    }
+
+    #[test]
+    fn a_repeated_lsn_is_held_even_in_the_active_segment() {
+        let dir = scratch("s2");
+        let base = base_in(&dir);
+        // CRC-valid means deliberate: a writer-defect class, refused rather than
+        // truncated away, even at the very end of the highest segment.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(1, Body::new().record(11, Some(b"b")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("does not follow"), "{msg}");
+    }
+
+    #[test]
+    fn an_lsn_gap_is_held_even_in_the_active_segment() {
+        let dir = scratch("s9");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(3, Body::new().record(11, Some(b"b")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("must be consecutive"), "{msg}");
+    }
+
+    // ------------------------------------------------------ table K
+
+    /// Every mark-body fault, and the message that names it. All of them are
+    /// HELD, so a mark in a superseded segment can still be wrong without
+    /// bricking the store — which the next test proves.
+    #[test]
+    fn every_malformed_mark_is_held() {
+        /// name, the mark to append, the phrase that must name the fault.
+        type Case = (&'static str, fn(SegImage) -> SegImage, &'static str);
+        let cases: Vec<Case> = vec![
+            (
+                "wrong body length",
+                |s: SegImage| s.section(TAG_MARK, 3, &[0u8; 8]),
+                "clean mark body is 8 bytes",
+            ),
+            (
+                "through 0",
+                |s: SegImage| s.mark(3, 0, 1),
+                "attests cleanedThroughSeq 0",
+            ),
+            (
+                "negative through",
+                |s: SegImage| s.mark(3, -4, 1),
+                "attests cleanedThroughSeq -4",
+            ),
+            (
+                "log start 0",
+                |s: SegImage| s.mark(3, 1, 0),
+                "attests logStartLsn 0",
+            ),
+            (
+                "log start above the mark's own lsn",
+                |s: SegImage| s.mark(3, 1, 4),
+                "attests logStartLsn 4",
+            ),
+            (
+                "K4: authorizes its own segment",
+                |s: SegImage| s.mark(3, 2, 1),
+                "including itself",
+            ),
+        ];
+        for (name, build, expected) in cases {
+            let dir = scratch("k_bad");
+            let base = base_in(&dir);
+            SegImage::new(1, 1)
+                .commit(1, Body::new().record(10, Some(b"a")))
+                .write(&base);
+            build(SegImage::new(2, 2).commit(2, Body::new().record(11, Some(b"b")))).write(&base);
+            let msg = corrupt_msg(open_rw(&base));
+            assert!(msg.contains(expected), "{name}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_valid_mark_unlinks_the_segments_below_it_and_fsyncs_once() {
+        let dir = scratch("k_unlink");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"gone")))
+            .write(&base);
+        SegImage::new(2, 2)
+            .commit(2, Body::new().record(11, Some(b"gone too")))
+            .write(&base);
+        // Segment 3 is self-contained: it re-states recid 10 as a 'C' image, and
+        // its mark says the log now begins at its own LSN 3.
+        SegImage::new(3, 3)
+            .image(3, Body::new().record(10, Some(b"kept")))
+            .mark(4, 2, 3)
+            .write(&base);
+
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(on_disk(&base), vec![3], "R5 removed the superseded prefix");
+        assert_eq!(seqs(&r), vec![3]);
+        assert_eq!(content(&r, 10), Some(b"kept".to_vec()));
+        assert!(is_void(&r, 11), "a superseded segment is never replayed");
+        assert_eq!(r.rec.next_lsn, 5);
+        assert_eq!(r.set.dir_fsyncs(), 1, "one fsync after the batch");
+    }
+
+    #[test]
+    fn within_one_segment_the_greatest_mark_wins_not_the_newest() {
+        let dir = scratch("k_greatest");
+        let base = base_in(&dir);
+        for seq in 1..=2 {
+            SegImage::new(seq, seq)
+                .commit(seq, Body::new().record(seq as u64, Some(b"x")))
+                .write(&base);
+        }
+        SegImage::new(3, 3)
+            .image(3, Body::new().record(9, Some(b"i")))
+            .mark(4, 2, 3) // greater
+            .mark(5, 1, 1) // newer, but lesser: does not displace it
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(on_disk(&base), vec![3]);
+        assert_eq!(r.rec.next_lsn, 6);
+    }
+
+    #[test]
+    fn an_equal_mark_does_not_displace_the_first_one() {
+        let dir = scratch("k_equal");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(1, Some(b"x")))
+            .write(&base);
+        // Two marks attesting the SAME through. The reduction is strict
+        // (`through > local`), so the FIRST one's logStartLsn stands — and here
+        // the two disagree, so the floor check is what observes which won.
+        SegImage::new(2, 2)
+            .image(2, Body::new().record(9, Some(b"i")))
+            .mark(3, 1, 2)
+            .mark(4, 1, 3)
+            .write(&base);
+        let r = open_rw(&base).expect("the first mark's logStartLsn 2 matches the header");
+        assert_eq!(on_disk(&base), vec![2]);
+        assert_eq!(r.rec.next_lsn, 5);
+    }
+
+    #[test]
+    fn the_log_start_comes_from_the_last_segment_holding_a_mark() {
+        let dir = scratch("k_last_seg");
+        let base = base_in(&dir);
+        // The reduction is per-SEGMENT-SCAN: `segThrough` restarts at 0 in every
+        // segment, so a later segment's mark sets markLogStartLsn even when its
+        // `through` merely EQUALS the global maximum. Both marks here attest
+        // through 1; they disagree about where the log starts, and only the
+        // later segment's answer (2) matches the lowest retained header. A port
+        // that re-derived the field from the global reduction would take the
+        // first mark's 1 and refuse this image.
+        SegImage::new(1, 1)
+            .image(1, Body::new().record(9, Some(b"i")))
+            .write(&base);
+        SegImage::new(2, 2).mark(2, 1, 1).write(&base);
+        SegImage::new(3, 3).mark(3, 1, 2).write(&base);
+        let r = open_rw(&base).expect("the LAST segment's mark names the log start");
+        assert_eq!(on_disk(&base), vec![2, 3]);
+        assert_eq!(seqs(&r), vec![2, 3]);
+        assert_eq!(r.rec.next_lsn, 4);
+    }
+
+    #[test]
+    fn a_hold_stops_the_segments_scan_where_it_stands() {
+        let dir = scratch("k_hold_stops");
+        let base = base_in(&dir);
+        // White-box, because this rule is invisible from outside `recover`: a
+        // mark AFTER a fault in the same segment must not be collected, and the
+        // valid prefix must end at the fault. Both facts feed decisions taken
+        // elsewhere (which segments R5 removes, where W7 truncates), so the
+        // ordering is pinned here rather than left to a fixture that cannot see
+        // it. First message wins, too.
+        let img = SegImage::new(3, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(1, Body::new().record(11, Some(b"repeat"))) // S2: held
+            .mark(2, 1, 1)
+            .write(&base);
+        let fault_at = img.off(1);
+
+        let mut set = WalSegmentSet::open(&base, false).expect("namespace opens");
+        let seg = &mut set.segments_mut()[0];
+        seg.ensure_open().expect("open");
+        let mut mark_log_start = 0i64;
+        let through = scan_segment(seg, 0, true, 1 << 20, &mut mark_log_start).expect("scan");
+        assert_eq!(through, 0, "the mark past the fault was never examined");
+        assert_eq!(mark_log_start, 0);
+        assert_eq!(seg.valid_end, fault_at);
+        assert!(seg
+            .held
+            .as_deref()
+            .expect("held")
+            .contains("does not follow"));
+    }
+
+    // ------------------------------------------------------ R4
+
+    #[test]
+    fn a_held_verdict_in_a_superseded_segment_is_discarded() {
+        let dir = scratch("r4_discard");
+        let base = base_in(&dir);
+        // Segment 1 is rotten in a way that is corruption on its own (an LSN gap
+        // in a CRC-valid section). It is below the mark, so refusing here would
+        // brick a store over bytes about to be deleted.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(7, Body::new().record(11, Some(b"b")))
+            .write(&base);
+        SegImage::new(2, 8)
+            .image(8, Body::new().record(10, Some(b"kept")))
+            .mark(9, 1, 8)
+            .write(&base);
+        let r = open_rw(&base).expect("opens: the verdict is below the mark");
+        assert_eq!(on_disk(&base), vec![2]);
+        assert_eq!(content(&r, 10), Some(b"kept".to_vec()));
+    }
+
+    #[test]
+    fn a_held_verdict_in_a_retained_segment_refuses() {
+        let dir = scratch("r4_retained");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .image(1, Body::new().record(10, Some(b"i")))
+            .mark(2, 0, 0) // malformed: held, and this segment is retained
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("cleanedThroughSeq 0"), "{msg}");
+    }
+
+    #[test]
+    fn an_unmarked_log_must_begin_at_lsn_1() {
+        let dir = scratch("r4_floor");
+        let base = base_in(&dir);
+        SegImage::new(1, 5)
+            .commit(5, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("must begin at LSN 1"), "{msg}");
+        assert!(msg.contains("sections below it are gone"), "{msg}");
+    }
+
+    #[test]
+    fn the_floor_refuses_a_retained_log_that_starts_below_the_mark() {
+        let dir = scratch("r4_floor_mark");
+        let base = base_in(&dir);
+        // The mark says the log begins at 3, but the lowest retained segment
+        // states 2: the image the mark was issued against is not there. Nothing
+        // else notices — the chain is satisfied, because segment 1's data is
+        // below the mark and no LSN is missing.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, 2)
+            .commit(2, Body::new().record(11, Some(b"b")))
+            .mark(3, 1, 3)
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("clean mark attests it begins at 3"), "{msg}");
+    }
+
+    #[test]
+    fn the_chain_refuses_a_segment_whose_sections_are_gone() {
+        let dir = scratch("r4_chain");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        // Segment 2 states it begins at 4: LSNs 2 and 3 are accounted for by
+        // nobody. A missing sequence NUMBER needs no rule — this is how the loss
+        // surfaces.
+        SegImage::new(2, 4)
+            .commit(4, Body::new().record(11, Some(b"b")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("sections between them are gone"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_segment_chains_by_its_stated_start() {
+        let dir = scratch("r4_empty");
+        let base = base_in(&dir);
+        // W7's rotate target: created, never appended to. It must chain by what
+        // it SAID it would start at, which is what separates "always empty" from
+        // "its sections vanished" (H8).
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, 2).write(&base);
+        SegImage::new(3, 2)
+            .commit(2, Body::new().record(11, Some(b"b")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(r.rec.next_lsn, 3);
+        assert_eq!(content(&r, 11), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn the_self_check_refuses_a_segment_missing_its_leading_sections() {
+        let dir = scratch("r4_self");
+        let base = base_in(&dir);
+        // Header says the segment starts at 1; its first section is 2. Under the
+        // chain alone this passes at the head of the log, so the self check is
+        // what catches it.
+        SegImage::new(1, 1)
+            .commit(2, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("its leading sections are gone"), "{msg}");
+    }
+
+    // ------------------------- the frozen lsn==0 sentinel edge (J0 pins these)
+
+    #[test]
+    fn a_leading_run_of_lsn_zero_sections_is_accepted_and_replayed() {
+        let dir = scratch("z_run");
+        let base = base_in(&dir);
+        // Both density checks live under `last_lsn != 0`, so a whole LEADING RUN
+        // of crafted lsn==0 sections is accepted — and replayed. Ports must
+        // reproduce this, not fix it.
+        SegImage::new(1, 1)
+            .commit(0, Body::new().record(10, Some(b"zero")))
+            .commit(0, Body::new().record(11, Some(b"also zero")))
+            .commit(1, Body::new().record(12, Some(b"real")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(content(&r, 10), Some(b"zero".to_vec()));
+        assert_eq!(content(&r, 11), Some(b"also zero".to_vec()));
+        assert_eq!(content(&r, 12), Some(b"real".to_vec()));
+        assert_eq!(
+            r.rec.next_lsn, 2,
+            "the zeros stayed invisible to the maximum"
+        );
+    }
+
+    #[test]
+    fn an_lsn_zero_section_after_a_real_one_is_corruption() {
+        let dir = scratch("z_after");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(0, Body::new().record(11, Some(b"b")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("does not follow"), "{msg}");
+    }
+
+    #[test]
+    fn an_lsn_zero_only_segment_chains_by_its_stated_start_and_does_not_advance_it() {
+        let dir = scratch("z_chain");
+        let base = base_in(&dir);
+        // Segment 2 holds sections but no LSN the chain can see: it is "empty"
+        // for chaining purposes, so segment 3 must state what SEGMENT 2 said it
+        // would start at — 2, not 3.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, 2)
+            .commit(0, Body::new().record(11, Some(b"z")))
+            .write(&base);
+        SegImage::new(3, 2)
+            .commit(2, Body::new().record(12, Some(b"c")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(content(&r, 11), Some(b"z".to_vec()), "and it IS replayed");
+        assert_eq!(r.rec.next_lsn, 3);
+    }
+
+    #[test]
+    fn the_self_check_is_skipped_for_an_lsn_zero_only_segment() {
+        let dir = scratch("z_self");
+        let base = base_in(&dir);
+        // first_lsn stays 0, and the gate is `first_lsn != 0` rather than "the
+        // segment is nonempty" — a port transcribing "nonempty" refuses an image
+        // the reference accepts.
+        SegImage::new(1, 1)
+            .commit(0, Body::new().record(10, Some(b"z")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(content(&r, 10), Some(b"z".to_vec()));
+        // All-empty retained set: nextLsn counts from the header, not from 0+1.
+        assert_eq!(r.rec.next_lsn, 1);
+    }
+
+    #[test]
+    fn an_lsn_zero_only_segment_does_not_erase_the_cross_segment_anchor() {
+        let dir = scratch("z_anchor");
+        let base = base_in(&dir);
+        // Segment 2 ends with an accepted lsn==0 section, so the carry stays at
+        // segment 1's last LSN. The anchor is only observable through the
+        // lookahead, so segment 3 carries a damaged header followed by exactly
+        // carry+2 == 3: corruption if the anchor survived, torn tail if not.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, 2)
+            .commit(0, Body::new().record(11, Some(b"z")))
+            .write(&base);
+        let img = SegImage::new(3, 2)
+            .commit(2, Body::new().record(12, Some(b"c")))
+            .commit(3, Body::new().record(13, Some(b"d")));
+        let at = img.off(0);
+        img.damage(at).write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("mid-log corruption"), "{msg}");
+    }
+
+    // ------------------------------------------------------ R6, the §4.2 table
+
+    #[test]
+    fn a_content_record_sets_both_identities() {
+        let dir = scratch("id_content");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(r.rec.identities.content_base_lsn.get(&10), Some(&1));
+        assert_eq!(r.rec.identities.state_lsn.get(&10), Some(&1));
+    }
+
+    #[test]
+    fn a_null_record_clears_the_content_base_but_keeps_the_state() {
+        let dir = scratch("id_null");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(10, None))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(content(&r, 10), None, "null content, not void");
+        assert_eq!(r.rec.identities.content_base_lsn.get(&10), None);
+        assert_eq!(r.rec.identities.state_lsn.get(&10), Some(&2));
+    }
+
+    #[test]
+    fn prealloc_over_a_content_live_record_refuses() {
+        let dir = scratch("id_prealloc_live");
+        let base = base_in(&dir);
+        // wal_prealloc no-ops on a set slot, so applying it here would leave a
+        // live record while the identities describe a preallocated one.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().prealloc(10))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("PREALLOC over a content-live record"), "{msg}");
+    }
+
+    #[test]
+    fn prealloc_over_a_null_record_is_allowed_and_state_only() {
+        let dir = scratch("id_prealloc_null");
+        let base = base_in(&dir);
+        // The precondition is "not content-live", stated to be TOTAL: a
+        // null-content target is neither void nor already preallocated, and a
+        // port phrasing it "void or P" diverges here.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, None))
+            .commit(2, Body::new().prealloc(10))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(r.rec.identities.content_base_lsn.get(&10), None);
+        assert_eq!(r.rec.identities.state_lsn.get(&10), Some(&2));
+    }
+
+    #[test]
+    fn delete_clears_both_identities() {
+        let dir = scratch("id_delete");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().delete(10))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert!(is_void(&r, 10));
+        assert_eq!(r.rec.identities.content_base_lsn.get(&10), None);
+        assert_eq!(r.rec.identities.state_lsn.get(&10), None);
+    }
+
+    #[test]
+    fn deleting_a_record_that_was_never_established_is_a_no_op() {
+        let dir = scratch("id_delete_void");
+        let base = base_in(&dir);
+        // The shape a cleaned log leaves: the section that created recid 10 is
+        // gone, and this delete is the only surviving mention of it. Refusing
+        // here would turn a correctly cleaned log into an unopenable store.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().delete(10).record(11, Some(b"b")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert!(is_void(&r, 10));
+        assert_eq!(content(&r, 11), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn an_append_on_its_stated_base_applies() {
+        let dir = scratch("id_append");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().append(10, 1, b"bc"))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(content(&r, 10), Some(b"abc".to_vec()));
+        // Neither identity moves: an append is not a self-contained state.
+        assert_eq!(r.rec.identities.content_base_lsn.get(&10), Some(&1));
+        assert_eq!(r.rec.identities.state_lsn.get(&10), Some(&1));
+    }
+
+    #[test]
+    fn an_append_whose_base_is_gone_is_skipped_and_then_audited() {
+        let dir = scratch("id_skip");
+        let base = base_in(&dir);
+        // The mark retires the segment holding recid 10's image, and nothing
+        // re-establishes it: the store cannot be reconstructed, so the open
+        // refuses rather than return a record missing acknowledged bytes.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, 2)
+            .image(2, Body::new().record(9, Some(b"i")))
+            .mark(3, 1, 2)
+            .commit(4, Body::new().append(10, 3, b"bc"))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("skipped 1 append"), "{msg}");
+        assert!(msg.contains("recid 10"), "{msg}");
+        // R5 ran BEFORE R6, so this refusal observes a namespace already pruned.
+        // "A failed open leaves the files untouched" is NOT a v3 invariant, and
+        // pretending otherwise is how a port ends up asserting it somewhere.
+        assert_eq!(on_disk(&base), vec![2]);
+    }
+
+    #[test]
+    fn a_skipped_append_is_discharged_by_a_later_self_contained_entry() {
+        let dir = scratch("id_skip_ok");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, 2)
+            .image(2, Body::new().record(9, Some(b"i")))
+            .mark(3, 1, 2)
+            .commit(4, Body::new().append(10, 3, b"bc"))
+            .commit(5, Body::new().record(10, Some(b"whole")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens: the skip was superseded");
+        assert_eq!(content(&r, 10), Some(b"whole".to_vec()));
+        assert_eq!(r.rec.next_lsn, 6);
+    }
+
+    #[test]
+    fn a_skipped_appends_payload_is_still_consumed() {
+        let dir = scratch("id_skip_frame");
+        let base = base_in(&dir);
+        // The entry after the skipped append must decode, which it only can if
+        // the skip consumed its payload: the frame is still framed.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, 2)
+            .image(2, Body::new().record(9, Some(b"i")))
+            .mark(3, 1, 2)
+            .commit(
+                4,
+                Body::new()
+                    .append(10, 3, b"payload-that-must-be-skipped")
+                    .record(12, Some(b"after")),
+            )
+            .commit(5, Body::new().record(10, Some(b"whole")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(content(&r, 12), Some(b"after".to_vec()));
+    }
+
+    #[test]
+    fn an_append_citing_a_base_below_the_applied_one_refuses() {
+        let dir = scratch("id_append_low");
+        let base = base_in(&dir);
+        // recid 10's applied image is LSN 1; the append at LSN 3 cites base 2.
+        // Unreachable in a conforming set — retirement is a prefix in LSN order,
+        // so a base ABOVE the applied one cannot be the missing part — and
+        // defence in depth over the density rule.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"filler")))
+            .commit(3, Body::new().append(10, 1, b"c"))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("above the applied base"), "{msg}");
+    }
+
+    #[test]
+    fn an_append_delta_outside_its_bounds_refuses() {
+        for (delta, lsn) in [(0u64, 2i64), (2, 2)] {
+            let dir = scratch("id_delta");
+            let base = base_in(&dir);
+            SegImage::new(1, 1)
+                .commit(1, Body::new().record(10, Some(b"a")))
+                .commit(lsn, Body::new().append(10, delta, b"c"))
+                .write(&base);
+            let msg = corrupt_msg(open_rw(&base));
+            assert!(
+                msg.contains("bad WAL append base delta"),
+                "delta {delta}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_superseded_record_is_reapplied() {
+        let dir = scratch("id_resupply");
+        let base = base_in(&dir);
+        // Idempotent, so replay does not try to be clever about which image
+        // "wins" — it applies them all in LSN order and the last one stands.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"first")))
+            .commit(2, Body::new().record(10, Some(b"second")))
+            .commit(3, Body::new().record(10, Some(b"third")))
+            .write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(content(&r, 10), Some(b"third".to_vec()));
+        assert_eq!(r.rec.identities.content_base_lsn.get(&10), Some(&3));
+    }
+
+    #[test]
+    fn two_entries_for_one_recid_in_one_section_refuse() {
+        let dir = scratch("id_twice");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")).record(10, Some(b"b")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("two WAL entries for recid 10"), "{msg}");
+    }
+
+    #[test]
+    fn the_one_entry_rule_covers_image_sections_too() {
+        let dir = scratch("id_twice_c");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .image(1, Body::new().record(10, Some(b"a")).delete(10))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("two WAL entries for recid 10"), "{msg}");
+    }
+
+    #[test]
+    fn an_unknown_entry_tag_refuses() {
+        let dir = scratch("id_tag");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().raw(&[9u8, 0x81]))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("bad WAL entry tag 9"), "{msg}");
+    }
+
+    #[test]
+    fn an_entry_overrunning_its_section_body_refuses() {
+        let dir = scratch("id_overrun");
+        let base = base_in(&dir);
+        // A record claiming 40 bytes of payload inside a body that holds none:
+        // CRC-valid, so it is a writer defect, not a torn tail.
+        let mut out = DataOutput2::with_capacity(16);
+        out.write_byte(T_RECORD as i32);
+        out.pack_long(10);
+        out.pack_long(48);
+        out.pack_long(41);
+        SegImage::new(1, 1)
+            .section(TAG_SECTION, 1, &out.buf)
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("bad WAL record length"), "{msg}");
+    }
+
+    #[test]
+    fn a_record_whose_capacity_never_came_from_this_writer_refuses() {
+        let dir = scratch("id_cap");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record_cap(10, 7, Some(b"a")))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("bad WAL record capacity 7"), "{msg}");
+    }
+
+    #[test]
+    fn a_reserved_recid_zero_refuses() {
+        let dir = scratch("id_recid0");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(1, Some(b"a")))
+            .commit(2, Body::new().append(0, 1, b"x"))
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("reserved recid 0"), "{msg}");
+    }
+
+    #[test]
+    fn a_mark_body_is_never_handed_to_the_entry_decoder() {
+        let dir = scratch("k_not_entries");
+        let base = base_in(&dir);
+        // A mark whose 16 bytes begin with 0x00 — not a valid entry tag. If the
+        // decoder ever saw a 'K' body the open would refuse.
+        SegImage::new(1, 1)
+            .image(1, Body::new().record(10, Some(b"i")))
+            .mark(2, 0x0000_0000_0000_0001, 1)
+            .write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        // K4 holds it (segment 1 cannot authorize removing segment 1), which is
+        // a MARK verdict, not an entry-decoder one.
+        assert!(msg.contains("including itself"), "{msg}");
+    }
+
+    // ------------------------------------------------------ R7
+
+    #[test]
+    fn next_lsn_follows_the_highest_retained_section() {
+        let dir = scratch("r7_next");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .commit(2, Body::new().record(11, Some(b"b")))
+            .write(&base);
+        SegImage::new(2, 3)
+            .commit(3, Body::new().record(12, Some(b"c")))
+            .write(&base);
+        assert_eq!(open_rw(&base).expect("opens").rec.next_lsn, 4);
+    }
+
+    #[test]
+    fn an_all_empty_retained_set_counts_from_the_header() {
+        let dir = scratch("r7_empty");
+        let base = base_in(&dir);
+        // "0 + 1" would restart the log at 1 and reissue LSNs a mark already
+        // accounted for, which is why firstLsn is in the header. Note what this
+        // test can and cannot show: the fallback is only REACHABLE in an
+        // unmarked log — K4 keeps a mark's own segment retained, and that
+        // segment is never empty — and the floor then forces the lowest header
+        // to state 1, so "count from the header" and "0 + 1" agree on every
+        // image that survives R4. The branch is kept because the reference has
+        // it, not because a fixture can separate the two readings.
+        SegImage::new(1, 1).write(&base);
+        SegImage::new(2, 1).write(&base);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(r.rec.next_lsn, 1);
+        assert_eq!(on_disk(&base), vec![1, 2], "empty is not torn: no rotate");
+    }
+
+    #[test]
+    fn a_fresh_store_creates_its_first_segment_and_starts_at_lsn_1() {
+        let dir = scratch("r7_fresh");
+        let base = base_in(&dir);
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(on_disk(&base), vec![1]);
+        assert_eq!(r.rec.next_lsn, 1);
+        assert_eq!(r.set.active().expect("active").header_first_lsn(), 1);
+    }
+
+    #[test]
+    fn a_fresh_store_beside_burnt_residue_uses_the_burnt_successor() {
+        let dir = scratch("r7_burnt");
+        let base = base_in(&dir);
+        // W6: the residue's name is burned even though the file is removed, so a
+        // stale directory entry can never alias a segment a later create reuses.
+        std::fs::write(seg_path(&base, 7), [0u8; 4]).expect("residue");
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(on_disk(&base), vec![8]);
+        assert_eq!(r.rec.next_lsn, 1);
+    }
+
+    // ------------------------------------------------------ read-only mode
+
+    #[test]
+    fn a_read_only_recovery_mutates_nothing() {
+        let dir = scratch("ro_nothing");
+        let base = base_in(&dir);
+        // Every mutation R5/R7 could make is armed here: a superseded segment to
+        // unlink, create-crash residue to delete, and a torn tail to truncate
+        // and rotate.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"gone")))
+            .write(&base);
+        let img = SegImage::new(2, 2)
+            .image(2, Body::new().record(11, Some(b"kept")))
+            .mark(3, 1, 2)
+            .commit(4, Body::new().record(12, Some(b"tail")));
+        let torn = img.off(2) as usize + 9;
+        img.cut_to(torn).write(&base);
+        std::fs::write(seg_path(&base, 3), [0u8; 4]).expect("residue");
+        let before: Vec<(i64, u64)> = on_disk(&base)
+            .into_iter()
+            .map(|s| (s, file_len(&base, s)))
+            .collect();
+
+        let r = open_ro(&base).expect("opens");
+        assert_eq!(content(&r, 11), Some(b"kept".to_vec()));
+        assert!(is_void(&r, 10), "superseded segments are not replayed");
+        assert_eq!(r.rec.next_lsn, 4);
+        let after: Vec<(i64, u64)> = on_disk(&base)
+            .into_iter()
+            .map(|s| (s, file_len(&base, s)))
+            .collect();
+        assert_eq!(before, after, "no create, unlink, truncate or rotate");
+        assert_eq!(r.set.dir_fsyncs(), 0);
+    }
+
+    #[test]
+    fn a_read_only_recovery_reaches_the_same_answers_as_a_writable_one() {
+        let dir = scratch("ro_same");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, 2)
+            .image(2, Body::new().record(10, Some(b"kept")))
+            .mark(3, 1, 2)
+            .write(&base);
+        let ro = open_ro(&base).expect("ro opens");
+        let (ro_next, ro_content) = (ro.rec.next_lsn, content(&ro, 10));
+        drop(ro);
+        let rw = open_rw(&base).expect("rw opens");
+        assert_eq!(ro_next, rw.rec.next_lsn);
+        assert_eq!(ro_content, content(&rw, 10));
+    }
+
+    #[test]
+    fn a_read_only_fresh_store_creates_no_segment() {
+        let dir = scratch("ro_fresh");
+        let base = base_in(&dir);
+        let r = open_ro(&base).expect("opens");
+        assert_eq!(on_disk(&base), Vec::<i64>::new());
+        assert_eq!(r.rec.next_lsn, 1);
+        assert!(r.set.active().is_none());
+    }
+
+    #[test]
+    fn a_read_only_recovery_refuses_the_same_images() {
+        let dir = scratch("ro_refuse");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(2, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        let msg = corrupt_msg(open_ro(&base));
+        assert!(msg.contains("its leading sections are gone"), "{msg}");
+    }
+
+    // ------------------------------------------------------ descriptors
+
+    #[test]
+    fn recovery_leaves_one_descriptor_open_whatever_the_segment_count() {
+        let dir = scratch("fds");
+        let base = base_in(&dir);
+        let n = 40;
+        for seq in 1..=n {
+            SegImage::new(seq, seq)
+                .commit(seq, Body::new().record(seq as u64, Some(b"x")))
+                .write(&base);
+        }
+        let r = open_rw(&base).expect("opens");
+        assert_eq!(seqs(&r).len(), n as usize);
+        // Both passes release as they go: nothing reads a segment after
+        // recovery, and a store is allowed to reach thousands of them.
+        assert_eq!(r.set.open_file_count(), 1, "only the active segment");
+    }
+}

@@ -883,6 +883,38 @@ impl StoreDirect {
         Ok(())
     }
 
+    /// Replay's delete: like [`Store::delete`] but a **no-op on a void or
+    /// already-deleted recid** rather than `GetVoid`.
+    ///
+    /// That tolerance is the point. A v3 log may legitimately contain a
+    /// `T_DELETE` for a recid whose creating section the cleaner already removed
+    /// — the delete is then the only surviving mention of it, and refusing to
+    /// replay it would turn a correctly cleaned log into an unopenable store.
+    /// The strict `delete` stays strict for the API surface, where a void target
+    /// really is a caller error.
+    #[allow(dead_code)]
+    pub(crate) fn wal_delete(&self, recid: u64) -> Result<()> {
+        let _c = self.mutate_enter()?;
+        let _wg = self.segs.write(recid);
+        let ivval = self.raw_index_get(recid);
+        if ivval == 0 {
+            return Ok(());
+        }
+        if !iv_parity_ok(ivval) {
+            return Err(DbError::corrupt("index slot parity broken"));
+        }
+        if iv::cap_units(ivval) == iv::CAP_DELETED {
+            return Ok(());
+        }
+        self.release_old_data(ivval)?;
+        {
+            let _s = self.structural();
+            self.free_recid_locked(recid)?;
+        }
+        self.index_set(recid, iv::compose(iv::CAP_DELETED, 0, 0));
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn rebuild_free_recids(&self) -> Result<()> {
         let _c = self.mutate_enter()?;
