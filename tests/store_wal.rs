@@ -1128,6 +1128,51 @@ fn the_config_setters_refuse_after_close() {
         s.set_space_amplification(4),
         Err(DbError::StoreClosed)
     ));
+    assert!(matches!(
+        s.set_segment_bytes(1 << 20),
+        Err(DbError::StoreClosed)
+    ));
+}
+
+#[test]
+fn set_segment_bytes_rolls_the_writer_over_at_the_new_size() {
+    // The reference's tuning knob and test hook (`StoreWAL.java:2171-2181`),
+    // and the knob the crash harness needs: with the 64 MiB default no
+    // realistic crash round ever rotates, so rotate/create, the forced `'K'`
+    // and its unlink would be exercised by nothing.
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    // Refused below the floor, and refused BEFORE the lock — same message
+    // family as the open-time option.
+    let e = s.set_segment_bytes(8).expect_err("below the floor");
+    assert!(matches!(e, DbError::WrongConfiguration(_)), "{e:?}");
+
+    let segs = |b: &std::path::Path| {
+        let mut v: Vec<String> = std::fs::read_dir(b.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".wal."))
+            .collect();
+        v.sort();
+        v
+    };
+    // The default keeps everything in one segment...
+    for _ in 0..8 {
+        s.put(&bytes(7, 20_000), &R).unwrap();
+        s.commit().unwrap();
+    }
+    assert_eq!(segs(&base).len(), 1, "64 MiB default does not roll over");
+
+    // ...and the setter takes effect on the next section past the new size.
+    s.set_segment_bytes(8192).unwrap();
+    for _ in 0..8 {
+        s.put(&bytes(9, 20_000), &R).unwrap();
+        s.commit().unwrap();
+    }
+    let after = segs(&base);
+    assert!(after.len() > 1, "rolled over: {after:?}");
+    s.close().unwrap();
 }
 
 #[test]

@@ -441,6 +441,28 @@ impl StoreWAL {
         Ok(())
     }
 
+    /// Size past which the writer seals the active segment and rolls to the
+    /// next one (D8). Tuning knob and test hook, exactly as in the reference
+    /// (`StoreWAL.java:2171-2181`): the rollover itself always happens at a
+    /// section boundary (W3), so a single section larger than this simply gets
+    /// a segment of its own.
+    ///
+    /// The same floor as the open-time option — a segment below it cannot hold
+    /// one section — and, like Java, the floor is checked BEFORE the lock, so a
+    /// bad argument is refused identically on an open and on a closed store.
+    pub fn set_segment_bytes(&self, bytes: u64) -> Result<()> {
+        if bytes < MIN_SEGMENT_BYTES {
+            return Err(DbError::wrong_config(format!(
+                "WAL segment size {bytes} is below the {MIN_SEGMENT_BYTES}-byte minimum (a \
+                 segment header plus one section header)"
+            )));
+        }
+        // See `set_min_log_bytes`: lock first, re-check under it.
+        let mut st = self.write_open()?;
+        st.segment_bytes = bytes;
+        Ok(())
+    }
+
     /// Space-amplification target (D8): clean once the log exceeds this multiple
     /// of the live data.
     pub fn set_space_amplification(&self, factor: u32) -> Result<()> {

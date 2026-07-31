@@ -5,8 +5,9 @@
 # the harness binaries against the real StoreWAL open/log-replay/recovery path;
 # it is NOT a power-cut test (the OS page cache survives SIGKILL) and a green run
 # here is no ext4/XFS durability evidence — that is ci/crash/crash-tier.sh's job.
-# Any failure is a real bug by definition: an acked-then-lost write or a corrupt
-# reopen.
+# Any failure is a real bug by definition: an acked-then-lost write, a corrupt
+# reopen, or a format v3 segment namespace the recovery left in a state no
+# sequence of create/unlink/residue-delete could have produced.
 #
 # WAL only: mapdb5's StoreDirect is non-transactional (an uncommitted in-place
 # mutation makes a reopen fail the header checksum by design), so only the WAL

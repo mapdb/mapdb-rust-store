@@ -22,8 +22,11 @@
 # and handed to crash_check, which reopens the StoreWAL and replays its log.
 #
 # What this qualifies as: real dirty-cache loss, write/sync
-# ordering, ext4/XFS journal recovery, and StoreWAL's log-replay/checkpoint
-# protocols. It does NOT model a lying volatile device cache, FUA/flush
+# ordering, ext4/XFS journal recovery, and StoreWAL's format v3 log-replay and
+# segment-namespace protocols (rotate/create, the cleaning cycle's forced 'K'
+# and unlink, create-crash residue, and the recovery successor — crash_check
+# asserts all of them and reports the ns_* coverage summarized at the end of a
+# campaign). It does NOT model a lying volatile device cache, FUA/flush
 # dishonesty, sector tearing, or PSOW violation — dm-log-writes replay at every
 # FLUSH/FUA point is the named stronger future tier.
 #
@@ -69,6 +72,7 @@ modprobe dm-mod 2>/dev/null || true
 MIN_ACK=24  # workload defaults: group=8, ready >= 3 durable groups
 mkdir -p "$WORK"
 MIDMAINT_TOTAL=0
+NS_RESIDUE=0 NS_GAPS=0 NS_UNLINKED=0 NS_SUCCESSOR=0 NS_AUTOCLEAN=0
 
 # Bound the hang-prone MAIN-PATH filesystem/image operations (port review,
 # LOW): on a wedged device/fs an expiry (124) aborts the round under `set -e` and
@@ -127,7 +131,7 @@ for round in $(seq 1 "$ROUNDS"); do
     echo "git-rev: ${GIT_REV:-unknown}"
     echo "backend: $BACKEND  fs: $FS  round: $round  seed: $SEED  cut-delay: ${DELAY}s"
     echo "store: StoreWAL (log fsync durability; inner StoreDirect heap-backed)  min-ack: $MIN_ACK"
-    echo "workload-options: (binary defaults) keys=512 batch-ops=6 group=8 value-policy=vp1 max-wal-bytes=$((64 << 20))"
+    echo "workload-options: (binary defaults) keys=512 batch-ops=6 group=8 value-policy=vp1 min-log-bytes=$((1 << 20)) segment-bytes=$((256 << 10)) space-amplification=1"
     echo "mkfs: $(mkfs.$FS -V 2>&1 | head -1)"
     echo "requested-mount-opts: (none — filesystem defaults)"
     echo "mount-effective: $(findmnt -no FSTYPE,OPTIONS "$R/mnt")"
@@ -239,6 +243,22 @@ for round in $(seq 1 "$ROUNDS"); do
   if grep -q "maint_open_at_cut=1" "$R/verdict"; then
     MIDMAINT_TOTAL=$((MIDMAINT_TOTAL + 1))
   fi
+  # Namespace coverage. The checker ASSERTS the v3 invariants every round and
+  # requires the round to have rotated and retired at all; these are the
+  # rare-window counters it cannot require of any single cut, so they are
+  # accumulated across the campaign instead.
+  # `if`, not `cmd && var=…`: under `set -e` a failing left-hand side would make
+  # the whole AND-list the round's last status and abort a perfectly good round.
+  if grep -q "ns_residue_at_cut=1" "$R/verdict"; then
+    NS_RESIDUE=$((NS_RESIDUE + 1))
+  fi
+  if grep -q "ns_created_by_recovery=1" "$R/verdict"; then
+    NS_SUCCESSOR=$((NS_SUCCESSOR + 1))
+  fi
+  nsfield() { sed -n "s/.*$1=\([0-9]*\).*/\1/p" "$R/verdict" | head -1; }
+  NS_GAPS=$((NS_GAPS + $(nsfield ns_gap_at_cut)))
+  NS_UNLINKED=$((NS_UNLINKED + $(nsfield ns_unlinked_by_recovery)))
+  NS_AUTOCLEAN=$((NS_AUTOCLEAN + $(nsfield ns_autoclean_events)))
   rm -f "$IMG" "$R/pristine.img" "$R/recover.img"
 done
 
@@ -248,3 +268,10 @@ done
 # campaign must not claim mid-maintenance coverage from this counter alone, and
 # must not claim it at all while it stays 0.
 echo "crash-tier PASSED: backend=$BACKEND fs=$FS rounds=$ROUNDS maint-open-at-cut=$MIDMAINT_TOTAL"
+# Namespace coverage across the campaign. Every round ASSERTED the v3 namespace
+# invariants and was required to have rotated and retired; what varies is which
+# rare window a cut happened to land in. A campaign reporting
+# residue-at-cut=0 has not covered the create crash, and must not claim it.
+echo "crash-tier namespace coverage: residue-at-cut=$NS_RESIDUE gaps-at-cut=$NS_GAPS" \
+     "unlinked-by-recovery=$NS_UNLINKED recovery-created-successor=$NS_SUCCESSOR" \
+     "autoclean-events=$NS_AUTOCLEAN"

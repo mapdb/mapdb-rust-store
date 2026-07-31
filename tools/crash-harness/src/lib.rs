@@ -14,19 +14,30 @@
 //! engine's crash harness; here it drives a `StoreWAL`-backed `BTreeMap`
 //! (see `src/bin/crash_workload.rs` / `crash_check.rs`).
 //!
-//! # Journal grammar (schema 1)
+//! # Journal grammar (schema 2)
 //!
 //! One record per line: `<crc32c-hex8> <payload>\n`, CRC over the payload
 //! bytes. Records, in the order a well-formed journal may contain them:
 //!
 //! ```text
-//! H 1 <run-id> <backend> <seed> <keys> <batch-ops> <group> <vp1> <max-wal-bytes>
+//! H 2 <run-id> <backend> <seed> <keys> <batch-ops> <group> <vp1> <max-wal-bytes>
+//!     <segment-bytes> <space-amplification>
 //! I <seq> <expected-txid> <batch-digest-hex8>     # write-ahead intent, synced
 //! P <seq> <observed-txid>                          # post-apply diagnostic
 //! F <highest-durable-txid>                         # durability ACK, synced
+//! N <group|precompact|postcompact> <lo> <hi> <count>  # WAL segment namespace
 //! M <begin|done> <checkpoint|compact> <ordinal>    # maintenance coverage
 //! R <ack-txid> <groups> <checkpoints> <compactions># readiness/coverage record
 //! ```
+//!
+//! The `N` record is format v3's namespace observation, taken by the workload
+//! at points where no store operation is in flight — after a group's commit
+//! barrier returned, and on both sides of an explicit compaction. It is what
+//! turns the segment set from something the crash tier merely *exercised* into
+//! something it *asserts*: the checker holds every observation to the rule that
+//! names are only ever added above and retired from below, requires the round
+//! to have actually rotated and actually retired before it may pass, and holds
+//! the post-crash image and the recovered store to the last observation.
 //!
 //! Ordering protocol: every `I` of a group is appended and
 //! `fdatasync`'d **before** any of the group's applies is enqueued; `F` is
@@ -41,11 +52,14 @@
 //! ACK/ready without its antecedents is journal corruption and fails the
 //! round — the parser never scans past a bad record.
 
+pub mod wal_namespace;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// Journal schema version.
-pub const SCHEMA: u32 = 1;
+/// Journal schema version. Bumped to 2 by the format v3 namespace oracle: the
+/// `N` record is new and the `H` record carries two more WAL knobs.
+pub const SCHEMA: u32 = 2;
 /// Readiness policy, shared by the workload (which journals `R` only at or
 /// past these thresholds) and the checker (which independently REQUIRES them
 /// from the prefix-validated `R` record).
@@ -99,7 +113,15 @@ pub struct Config {
     pub batch_ops: u32,
     /// Batches per durable group.
     pub group: u32,
+    /// D8's cleaning floor: the log is never cleaned automatically below it.
     pub max_wal_bytes: u64,
+    /// D8's rollover size. Small on purpose — at the 64 MiB default a crash
+    /// round would write its whole life into segment 1, and rotate, the forced
+    /// `'K'` and its unlink would never run at all.
+    pub segment_bytes: u64,
+    /// D8's cleaning trigger multiple: clean once the log exceeds this times
+    /// the live data.
+    pub space_amplification: u32,
 }
 
 /// Key `i` of the universe: `k<i zero-padded>` plus a deterministic filler so
@@ -292,6 +314,15 @@ pub enum Record {
     Ack {
         txid: u64,
     },
+    /// A WAL v3 segment-namespace observation: lowest and highest sequence
+    /// number on disk and how many segments there are, taken with no store
+    /// operation in flight.
+    Namespace {
+        at: NsAt,
+        lo: u64,
+        hi: u64,
+        count: u64,
+    },
     Maint {
         begin: bool,
         kind: MaintKind,
@@ -303,6 +334,29 @@ pub enum Record {
         checkpoints: u64,
         compactions: u64,
     },
+}
+
+/// Where a namespace observation was taken. The position is part of the
+/// grammar, so a `postcompact` can only mean "immediately after a completed
+/// `DB::compact` returned, inside its still-open maintenance interval".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NsAt {
+    /// After a group's commit barrier returned and its ACK was journaled.
+    Group,
+    /// Inside a compact interval, before the call.
+    PreCompact,
+    /// Inside a compact interval, after the call returned.
+    PostCompact,
+}
+
+impl NsAt {
+    fn token(self) -> &'static str {
+        match self {
+            NsAt::Group => "group",
+            NsAt::PreCompact => "precompact",
+            NsAt::PostCompact => "postcompact",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,12 +379,24 @@ impl MaintKind {
 pub fn encode_line(rec: &Record) -> Vec<u8> {
     let payload = match rec {
         Record::Header(c) => format!(
-            "H {} {} {} {} {} {} {} vp1 {}",
-            SCHEMA, c.run_id, c.backend, c.seed, c.keys, c.batch_ops, c.group, c.max_wal_bytes
+            "H {} {} {} {} {} {} {} vp1 {} {} {}",
+            SCHEMA,
+            c.run_id,
+            c.backend,
+            c.seed,
+            c.keys,
+            c.batch_ops,
+            c.group,
+            c.max_wal_bytes,
+            c.segment_bytes,
+            c.space_amplification
         ),
         Record::Intent { seq, txid, digest } => format!("I {seq} {txid} {digest:08x}"),
         Record::PostApply { seq, txid } => format!("P {seq} {txid}"),
         Record::Ack { txid } => format!("F {txid}"),
+        Record::Namespace { at, lo, hi, count } => {
+            format!("N {} {lo} {hi} {count}", at.token())
+        }
         Record::Maint {
             begin,
             kind,
@@ -397,7 +463,7 @@ fn parse_line(line: &[u8]) -> Result<Record, JournalError> {
     };
     match t.first().copied() {
         Some("H") => {
-            if t.len() != 10 || t[8] != "vp1" {
+            if t.len() != 12 || t[8] != "vp1" {
                 return Err(JournalError("journal-bad-header"));
             }
             if u(t[1])? != SCHEMA as u64 {
@@ -410,7 +476,17 @@ fn parse_line(line: &[u8]) -> Result<Record, JournalError> {
                 u32::try_from(u(s)?).map_err(|_| JournalError("journal-bad-header"))
             };
             let (keys, batch_ops, group) = (narrow(t[5])?, narrow(t[6])?, narrow(t[7])?);
-            if keys == 0 || batch_ops < 3 || group == 0 {
+            let space_amplification = narrow(t[11])?;
+            let segment_bytes = u(t[10])?;
+            // The store's own floors, enforced here too: a checksum-valid
+            // header stating a configuration the store would have refused means
+            // the journal did not come from a run this checker can reason about.
+            if keys == 0
+                || batch_ops < 3
+                || group == 0
+                || space_amplification == 0
+                || segment_bytes < 61
+            {
                 return Err(JournalError("journal-bad-header"));
             }
             Ok(Record::Header(Config {
@@ -421,6 +497,8 @@ fn parse_line(line: &[u8]) -> Result<Record, JournalError> {
                 batch_ops,
                 group,
                 max_wal_bytes: u(t[9])?,
+                segment_bytes,
+                space_amplification,
             }))
         }
         Some("I") if t.len() == 4 => Ok(Record::Intent {
@@ -433,6 +511,17 @@ fn parse_line(line: &[u8]) -> Result<Record, JournalError> {
             txid: u(t[2])?,
         }),
         Some("F") if t.len() == 2 => Ok(Record::Ack { txid: u(t[1])? }),
+        Some("N") if t.len() == 5 => Ok(Record::Namespace {
+            at: match t[1] {
+                "group" => NsAt::Group,
+                "precompact" => NsAt::PreCompact,
+                "postcompact" => NsAt::PostCompact,
+                _ => return Err(JournalError("journal-bad-namespace")),
+            },
+            lo: u(t[2])?,
+            hi: u(t[3])?,
+            count: u(t[4])?,
+        }),
         Some("M") if t.len() == 4 => Ok(Record::Maint {
             begin: match t[1] {
                 "begin" => true,
@@ -475,6 +564,8 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
     let mut saw_ready = false;
     let mut open_maint: Option<(MaintKind, u64)> = None;
     let mut next_ord = [1u64, 1u64]; // [checkpoint, compact]
+    let mut prev_ns: Option<(u64, u64)> = None; // (lo, hi)
+    let mut saw_precompact = false;
     for (i, rec) in records.iter().enumerate() {
         if i == 0 && !matches!(rec, Record::Header(_)) {
             return Err(JournalError("journal-no-header"));
@@ -504,6 +595,41 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
                 max_ack = *txid;
                 acks += 1;
             }
+            // The namespace rules the STORE must obey, enforced over the
+            // workload's own observations and independently of the store: a
+            // segment set only ever grows at the top (rotate/create, and W6
+            // never reuses a name) and shrinks at the bottom (unlinkThrough), so
+            // neither end may ever move backwards over a run. A `lo` that fell
+            // means a retired name came back; a `hi` that fell means a burnt one
+            // was reused.
+            Record::Namespace { at, lo, hi, count } => {
+                if *lo < 1 || hi < lo || *count < 1 || *count > hi - lo + 1 {
+                    return Err(JournalError("journal-namespace-shape"));
+                }
+                if let Some((plo, phi)) = prev_ns {
+                    if *lo < plo || *hi < phi {
+                        return Err(JournalError("journal-namespace-monotonic"));
+                    }
+                }
+                prev_ns = Some((*lo, *hi));
+                // Position is part of the meaning: `postcompact` must name the
+                // state a completed compaction left behind.
+                match (at, open_maint) {
+                    (NsAt::Group, None) => {}
+                    (NsAt::PreCompact, Some((MaintKind::Compact, _))) => {
+                        if saw_precompact {
+                            return Err(JournalError("journal-namespace-position"));
+                        }
+                        saw_precompact = true;
+                    }
+                    (NsAt::PostCompact, Some((MaintKind::Compact, _))) => {
+                        if !saw_precompact {
+                            return Err(JournalError("journal-namespace-position"));
+                        }
+                    }
+                    _ => return Err(JournalError("journal-namespace-position")),
+                }
+            }
             Record::Maint {
                 begin,
                 kind,
@@ -519,6 +645,7 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
                     }
                     open_maint = Some((*kind, *ordinal));
                     next_ord[slot] += 1;
+                    saw_precompact = false;
                 } else {
                     if open_maint != Some((*kind, *ordinal)) {
                         return Err(JournalError("journal-maint-order"));
@@ -566,7 +693,9 @@ mod tests {
             keys: 64,
             batch_ops: 6,
             group: 4,
-            max_wal_bytes: 64 << 20,
+            max_wal_bytes: 1 << 20,
+            segment_bytes: 256 << 10,
+            space_amplification: 2,
         }
     }
 
@@ -632,6 +761,12 @@ mod tests {
             },
             Record::PostApply { seq: 1, txid: 1 },
             Record::Ack { txid: 1 },
+            Record::Namespace {
+                at: NsAt::Group,
+                lo: 3,
+                hi: 7,
+                count: 5,
+            },
             Record::Maint {
                 begin: true,
                 kind: MaintKind::Checkpoint,
@@ -683,6 +818,82 @@ mod tests {
     }
 
     /// A fabricated coverage record is corruption: `R` must agree with the
+    /// The namespace record carries the two rules a WAL v3 segment set can
+    /// never break, and its position is part of its meaning.
+    #[test]
+    fn namespace_records_are_shaped_ordered_and_positioned() {
+        let ns = |at, lo, hi, count| Record::Namespace { at, lo, hi, count };
+        let journal = |recs: &[Record]| {
+            let mut b = Vec::new();
+            for r in recs {
+                b.extend_from_slice(&encode_line(r));
+            }
+            parse_journal(&b).map(|(r, _)| r)
+        };
+        let head = Record::Header(cfg());
+
+        // Shape: a set is never empty, `hi` is never below `lo`, and a set
+        // cannot hold more segments than its own range has names.
+        for bad in [
+            ns(NsAt::Group, 0, 4, 1),
+            ns(NsAt::Group, 5, 4, 1),
+            ns(NsAt::Group, 1, 4, 0),
+            ns(NsAt::Group, 1, 4, 5),
+        ] {
+            assert_eq!(
+                journal(&[head.clone(), bad]).unwrap_err(),
+                JournalError("journal-namespace-shape")
+            );
+        }
+
+        // Monotonicity: names are added above and retired from below, so
+        // neither end may ever move backwards. A `lo` that fell means a retired
+        // segment came back; a `hi` that fell means a burnt name was reused.
+        for bad in [ns(NsAt::Group, 2, 9, 1), ns(NsAt::Group, 4, 8, 1)] {
+            assert_eq!(
+                journal(&[head.clone(), ns(NsAt::Group, 3, 9, 3), bad]).unwrap_err(),
+                JournalError("journal-namespace-monotonic")
+            );
+        }
+        journal(&[
+            head.clone(),
+            ns(NsAt::Group, 3, 9, 3),
+            ns(NsAt::Group, 3, 9, 3),
+        ])
+        .expect("standing still is legitimate");
+
+        // Position: a compaction observation only means something inside its
+        // own interval, and `postcompact` needs its `precompact`.
+        let begin = Record::Maint {
+            begin: true,
+            kind: MaintKind::Compact,
+            ordinal: 1,
+        };
+        for bad in [
+            vec![head.clone(), ns(NsAt::PreCompact, 1, 2, 2)],
+            vec![head.clone(), begin.clone(), ns(NsAt::Group, 1, 2, 2)],
+            vec![head.clone(), begin.clone(), ns(NsAt::PostCompact, 1, 2, 2)],
+            vec![
+                head.clone(),
+                begin.clone(),
+                ns(NsAt::PreCompact, 1, 2, 2),
+                ns(NsAt::PreCompact, 1, 2, 2),
+            ],
+        ] {
+            assert_eq!(
+                journal(&bad).unwrap_err(),
+                JournalError("journal-namespace-position")
+            );
+        }
+        journal(&[
+            head,
+            begin,
+            ns(NsAt::PreCompact, 1, 2, 2),
+            ns(NsAt::PostCompact, 2, 3, 2),
+        ])
+        .expect("a well-formed compaction bracket");
+    }
+
     /// journal prefix on every field.
     #[test]
     fn ready_record_is_validated_against_the_prefix() {
