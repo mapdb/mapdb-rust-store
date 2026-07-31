@@ -167,8 +167,6 @@ struct WalState {
     segment_bytes: u64,
     min_log_bytes: u64,
     space_amplification: u32,
-    /// Streaming window for replay.
-    replay_buf: usize,
     read_only: bool,
     /// The two per-recid identities, maintained atomically with the committed
     /// apply of the entry that sets them — never before, never from staged
@@ -348,7 +346,6 @@ impl StoreWAL {
                 segment_bytes: opts.segment_bytes,
                 min_log_bytes: DEFAULT_MIN_LOG_BYTES,
                 space_amplification: DEFAULT_SPACE_AMPLIFICATION,
-                replay_buf: opts.replay_buf,
                 read_only: opts.read_only,
                 ids: identities,
                 committed_state_changes: 0,
@@ -932,7 +929,7 @@ impl WalState {
         // One segment per cycle, or as many as the width search has reached. A
         // wide cycle is not a wider PAUSE — it is still driven in budgeted ticks
         // — and it is the only way to amortise one mark over many segments.
-        let width = self.cycle_width.max(1).min(CYCLE_WIDTH_CAP).min(below);
+        let width = self.cycle_width.clamp(1, CYCLE_WIDTH_CAP).min(below);
         // SATURATED = as wide as this episode is ever allowed to go, measured
         // against the range it STARTED with. Against the remainder it would be
         // vacuous: a completed episode's final cycle always covers what is left.
@@ -2650,10 +2647,23 @@ mod tests {
         assert!(!s.is_closed(), "a refusal is not a store failure");
         assert_eq!(s.get(victim, &L).unwrap(), Some(1));
 
-        // With the fault removed the same cycle completes: the refusal rewound
-        // the cursor, so the retry re-walks the range from the bottom instead of
-        // resuming past the entry that refused and writing the mark anyway.
+        // Removing the fault is NOT enough, and that is the reference's
+        // behaviour rather than a port defect. `rewind` resets the cursor and
+        // deliberately does not reset `published` (StoreWAL.java:2546-2552), so
+        // the partial cycle a retry resumes is still past phase 1: it re-walks
+        // the range in VERIFY, finds the same record un-re-homed, and refuses
+        // again. Java reaches the identical state — its `checkpoint` also
+        // finishes the partial cycle first (StoreWAL.java:2476) — so a port
+        // that "fixed" this by re-publishing would diverge.
         s.st.write().drop_recid_from_publish = 0;
+        s.checkpoint()
+            .expect_err("a completed phase 1 is not re-run by a retry");
+
+        // The documented escape is the one the rewind comment names: a COMMIT
+        // that re-homes the recid, which makes the retirement safe for real
+        // rather than merely re-attempted. Then the same cycle completes.
+        s.update(victim, Some(&1i64), &L).unwrap();
+        s.commit().unwrap();
         s.checkpoint().unwrap();
         assert!(s.segment_seqs().len() < segs_before.len());
         assert_eq!(s.get(victim, &L).unwrap(), Some(1));
@@ -2791,7 +2801,11 @@ mod tests {
         // "bounded unit" unbounded in device reads.
         let dir = scratch("scancost");
         let base = dir.join("s.db");
-        let s = StoreWAL::open_segment_bytes(&base, 1 << 20).unwrap();
+        // The segment must hold all twenty: at 1 MiB the log rolls over after
+        // ~10 and the walk below, which only ever enters segments()[0], sees
+        // half of them — the test then measures the read cost of a walk it did
+        // not perform.
+        let s = StoreWAL::open_segment_bytes(&base, 8 << 20).unwrap();
         // Twenty big records in one segment: 20 entries, ~2 MB of payload.
         for i in 0..20u64 {
             s.put(&vec![(i & 0xff) as u8; 100_000], &RawBytes).unwrap();

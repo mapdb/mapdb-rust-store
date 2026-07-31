@@ -347,6 +347,9 @@ impl<'a> SecIn<'a> {
         self.win_start + self.win_pos as u64
     }
 
+    /// Test-only: the scan-cost invariant (a cleaner pass must SEEK over
+    /// payloads, not read them) is otherwise observable only with a stopwatch.
+    #[cfg(test)]
     pub(crate) fn reads(&self) -> u64 {
         self.reads
     }
