@@ -181,9 +181,14 @@ encoding it was ported from.
 
 They are **not** a statement that a store file interoperates. A store file is
 those codecs plus a header, an allocator layout, a WAL framing and a recovery
-protocol. The WAL half of that no longer diverges — this engine adopted the
-Java engine's segmented WAL format v3, and the cross-engine fixtures pin it —
-but the store file's own header and allocator layout are a separate question
+protocol. The WAL half of that no longer diverges by DESIGN — this engine
+adopted the Java engine's segmented WAL format v3 — but note what does and does
+not yet back that up: the format is pinned byte-for-byte against a
+Java-written segment in `wal_recover.rs`'s test kit, while the cross-engine
+FIXTURES do not pin v3 yet. Stage C is what supplies the v3 namespace bundles;
+until it lands, the four v1 WAL fixture cells are skipped and no fixture
+exercises a v3 namespace. The store file's own header and allocator layout are
+a separate question
 that those fixtures answer per case. A per-codec fidelity claim says the bytes
 of one value match; it says nothing about whether another engine can open the
 file those bytes live in. It cannot.
