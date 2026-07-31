@@ -22,22 +22,18 @@
 //! enumeration key and the *header* is the authority, which is what catches a
 //! copied or renamed segment (N5/H7).
 //!
-//! # Status: slice A0, not yet reachable from a public open
+//! # The legacy boundary (D1)
 //!
-//! This is the first slice of the v3 adoption (`todo/store-wal3/`). The public
-//! [`StoreWAL`](super::wal::StoreWAL) still speaks v1 and does not consult this
-//! module — deliberately, because a segmented namespace holding v1-domain
-//! sections is neither format and has no normative reader. The cutover to v3 is
-//! one atomic change (slice A2). Two rows are therefore NOT here yet and land
-//! with that cutover: D1's ports-only legacy boundary (a regular file at the
-//! bare base path, or a `<base>.ckpt` left by v1's rename-checkpoint, must
-//! refuse rather than be ignored) and the D4 platform gate. N6 — the v1
-//! single-file log at `<base>.wal` — is Java's own row and is implemented here,
-//! where Java has it.
+//! The ports' v1 opener took the WAL FILE path, so after the v3 cutover the same
+//! call site hands what is now a BASE. Three pre-existing artifacts therefore
+//! refuse the open rather than being ignored, and none of them is ever deleted:
+//! a regular file at `<base>.wal` (Java's own N6 row), a regular file at
+//! `<base>` itself, and a `<base>.ckpt` left by v1's rename-checkpoint — which
+//! after a v1 crash may be the only recoverable copy. Silently starting a fresh
+//! segment set beside any of them is the one outcome the format break exists to
+//! prevent.
 
-// A0 ships this layer unhooked (see above); its consumers arrive in A1/A2.
-#![allow(dead_code)]
-
+use super::wal_write::{wal_io_event, WalIo, WalOpKind};
 use crate::error::{DbError, Result};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -45,7 +41,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// magic(8) + version(4) + flags(4) + segmentSeq(8) + firstLsn(8) + headerCrc(4).
 pub(crate) const SEG_HDR: u64 = 36;
@@ -168,13 +164,6 @@ impl Segment {
         self.file.as_ref()
     }
 
-    /// `ensure_open` followed by `file`, for the call sites that want one
-    /// expression and do not need to touch the segment while reading.
-    pub(crate) fn open_file(&mut self) -> Result<&File> {
-        self.ensure_open()?;
-        Ok(self.file.as_ref().expect("just opened"))
-    }
-
     /// Closes the handle if one is held; the segment stays usable and reopens on
     /// demand. Called as soon as a recovery pass finishes with a segment, which
     /// is what bounds the descriptor count to O(1) instead of O(segments).
@@ -182,10 +171,6 @@ impl Segment {
     /// lost close never loses data.
     pub(crate) fn release(&mut self) {
         self.file = None;
-    }
-
-    pub(crate) fn holds_file(&self) -> bool {
-        self.file.is_some()
     }
 
     /// Feeds `crc` this section's **domain separator**: the 36 header bytes
@@ -266,6 +251,9 @@ pub(crate) struct WalSegmentSet {
     /// True once [`close`](Self::close) has run: the namespace mutations must
     /// not run without the lock this handle no longer holds.
     closed: bool,
+    /// The durability seam (A2). Per set rather than per process — see
+    /// [`WalIo`](super::wal_write::WalIo).
+    io: Option<Arc<dyn WalIo>>,
     /// Test-only durability observation, per set. Java exposes the same points
     /// through its event seam; a byte comparison of a SUCCESSFUL create cannot
     /// tell a missing fsync from a present one, and the no-op `unlink_through`
@@ -286,7 +274,19 @@ impl WalSegmentSet {
     /// never canonicalized and never reduced to a basename, or two opens by
     /// different paths would disagree on the namespace. This mirrors Java's
     /// `getAbsoluteFile()`.
+    #[cfg(test)]
     pub(crate) fn open(base: &Path, read_only: bool) -> Result<WalSegmentSet> {
+        Self::open_with_io(base, read_only, None)
+    }
+
+    /// [`open`](Self::open) with a durability seam installed for the whole
+    /// lifetime of the set, including the create and unlink this open itself
+    /// performs (R2's residue removal).
+    pub(crate) fn open_with_io(
+        base: &Path,
+        read_only: bool,
+        io: Option<Arc<dyn WalIo>>,
+    ) -> Result<WalSegmentSet> {
         let abs = if base.is_absolute() {
             base.to_path_buf()
         } else {
@@ -313,6 +313,7 @@ impl WalSegmentSet {
             lock: None,
             process_claim: None,
             closed: false,
+            io,
             #[cfg(test)]
             dir_fsyncs: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -321,17 +322,35 @@ impl WalSegmentSet {
         // Every early return from here drops `set`, which drops the lock handle
         // and so releases the store lock — Java's `finally { closeQuietly() }`.
         set.take_store_lock()?;
-        // N6: the v1 single-file log. There is no migration, and silently
-        // starting a fresh segment set beside it would strand every committed
-        // transaction in it — the one outcome the format break exists to
-        // prevent. Regular files only, the same discipline N4 applies: a
-        // DIRECTORY at that name is not a v1 log.
-        let v1 = with_suffix(&set.base, ".wal");
-        if is_regular_file(&v1) {
-            return Err(DbError::corrupt_msg(format!(
-                "v1 single-file WAL present at {}: no migration to v3",
-                v1.display()
-            )));
+        // D1: the legacy boundary. All three rows REFUSE, delete nothing, and
+        // fire before any v3 segment is created. Regular files only, the same
+        // discipline N4 applies: a DIRECTORY at one of these names is not a
+        // legacy artifact.
+        //
+        // N6 is Java's own row; the other two are the ports' upgrade-safety
+        // boundary and have no Java counterpart, because Java's base has never
+        // named a file. A v1 caller passed the WAL FILE path, so the same call
+        // site now passes a BASE — and N6 alone would look at `<arg>.wal`, miss
+        // the old log sitting at `<arg>`, and open a fresh empty store beside
+        // the user's only durable copy.
+        for (path, what) in [
+            (with_suffix(&set.base, ".wal"), "v1 single-file WAL"),
+            (
+                set.base.clone(),
+                "regular file at the WAL base path (the v3 opener takes a base, not a log file)",
+            ),
+            (
+                with_suffix(&set.base, ".ckpt"),
+                "v1 checkpoint temp, possibly the only recoverable copy after a v1 crash",
+            ),
+        ] {
+            if is_regular_file(&path) {
+                return Err(DbError::corrupt_msg(format!(
+                    "{what} present at {}: no migration to v3 — open it with the release that \
+                     wrote it and copy the data across, or move it aside",
+                    path.display()
+                )));
+            }
         }
         let found = set.enumerate();
         set.classify(&found)?;
@@ -625,13 +644,16 @@ impl WalSegmentSet {
         let path = self.segment_file(seq);
         let hdr = build_header(seq, first_lsn);
 
+        wal_io_event(&self.io, WalOpKind::Create, seq, 0, 0, 0)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&path)?;
         let created = (|| -> Result<()> {
+            wal_io_event(&self.io, WalOpKind::SegHeader, seq, 0, SEG_HDR, 0)?;
             file.write_all_at(&hdr, 0)?;
+            wal_io_event(&self.io, WalOpKind::ForceFull, seq, SEG_HDR, 0, 0)?;
             // The file's SIZE is part of the payload here: never sync_data.
             file.sync_all()?;
             #[cfg(test)]
@@ -697,14 +719,16 @@ impl WalSegmentSet {
         // that stops cleaning.
         self.recompute_sealed_bytes();
         for s in retiring {
-            let path = s.path.clone();
+            let (path, seq) = (s.path.clone(), s.seq);
             drop(s);
+            wal_io_event(&self.io, WalOpKind::Unlink, seq, 0, 0, 0)?;
             remove_if_exists(&path)?;
         }
         self.fsync_dir()
     }
 
     pub(crate) fn fsync_dir(&self) -> Result<()> {
+        wal_io_event(&self.io, WalOpKind::DirSync, 0, 0, 0, 0)?;
         File::open(&self.dir)?.sync_all()?;
         #[cfg(test)]
         self.dir_fsyncs
@@ -735,6 +759,12 @@ impl WalSegmentSet {
 
     // ---------- accessors ----------
 
+    /// The durability seam installed at open, for the recovery paths that
+    /// perform namespace-visible I/O of their own (R7's truncate and force).
+    pub(crate) fn wal_io(&self) -> &Option<Arc<dyn WalIo>> {
+        &self.io
+    }
+
     pub(crate) fn segments(&self) -> &[Segment] {
         &self.segments
     }
@@ -753,6 +783,7 @@ impl WalSegmentSet {
         self.segments.last_mut()
     }
 
+    #[cfg(test)]
     pub(crate) fn next_seq(&self) -> i64 {
         self.next_seq
     }
@@ -761,15 +792,11 @@ impl WalSegmentSet {
         self.read_only
     }
 
-    pub(crate) fn base(&self) -> &Path {
-        &self.base
-    }
-
     /// How many segments currently hold an open file handle. Steady state after
     /// recovery is at most one — the active segment — and that bound is the
     /// point, so it is observable rather than merely intended.
     pub(crate) fn open_file_count(&self) -> usize {
-        self.segments.iter().filter(|s| s.holds_file()).count()
+        self.segments.iter().filter(|s| s.file().is_some()).count()
     }
 
     /// Sum of the segment files' current lengths: what the log actually costs on
@@ -783,8 +810,52 @@ impl WalSegmentSet {
 
     /// The same number the slow way. Test-only, to pin `sealed_bytes` against
     /// drift.
+    #[cfg(test)]
     pub(crate) fn log_bytes_exact(&self) -> u64 {
         self.segments.iter().map(|s| s.file_len).sum()
+    }
+
+    /// **D2's lock-owning namespace cleanup**: delete every file this base owns
+    /// — the segments, by the same enumeration rule the open used, plus
+    /// `<base>.lock` — then fsync the directory once and release the lock.
+    ///
+    /// It runs WHILE THE LOCK IS STILL HELD, and that ordering is the whole
+    /// point. Close-then-delete is racy in two ways: once close releases the
+    /// lock a second opener can acquire the namespace and have its live segments
+    /// deleted underneath it, and unlinking the lock PATHNAME while another
+    /// instance may exist lets a third opener create a fresh lock inode and
+    /// "acquire" a namespace someone else is already using. The lock file goes
+    /// last, under the lock, as the owning instance's final act.
+    ///
+    /// Names that are not this base's segments are preserved: enumeration
+    /// ignores them (N4), and a delete-after-close must not sweep a directory it
+    /// was merely given a path into. Errors propagate — a best-effort delete
+    /// would report a clean removal of files that are still there.
+    pub(crate) fn delete_namespace(&mut self) -> Result<()> {
+        if self.closed {
+            return Err(DbError::StoreClosed);
+        }
+        if self.read_only {
+            return Err(DbError::ReadOnly);
+        }
+        // RE-enumerated rather than taken from `segments`: the live list holds
+        // what recovery retained, and the directory may also hold names this
+        // open legitimately left behind (a read-only-style residue kept by an
+        // earlier writer, an interior gap). All of them are this base's.
+        for seq in self.enumerate() {
+            let path = self.segment_file(seq);
+            wal_io_event(&self.io, WalOpKind::Unlink, seq, 0, 0, 0)?;
+            remove_if_exists(&path)?;
+        }
+        self.segments.clear();
+        self.sealed_bytes = 0;
+        // The lock file is unlinked while its lock is still held, so no opener
+        // can be between "created the inode" and "locked it" for THIS pathname.
+        let lock_path = with_suffix(&self.base, ".lock");
+        remove_if_exists(&lock_path)?;
+        self.fsync_dir()?;
+        self.close();
+        Ok(())
     }
 
     /// Releases every segment handle, then the store lock file, then this

@@ -32,10 +32,11 @@
 //! Committed states are therefore exactly the group boundaries, and the
 //! committed marker records which one — the facts `crash_check` relies on.
 //!
-//! Maintenance: [`DB::compact`](mapdb_rust_store::db::DB::compact) on a WAL store performs
-//! a log-compacting checkpoint (snapshot + fsync + atomic rename, then replay
-//! from the truncated log), so it is journaled as a `compact` maintenance
-//! interval and is the coverage the readiness policy requires.
+//! Maintenance: [`DB::compact`](mapdb_rust_store::db::DB::compact) on a WAL store cleans
+//! the log — under format v3 that seals the active segment and (from slice A3)
+//! retires the segments below it behind a forced `'K'` mark — so it is
+//! journaled as a `compact` maintenance interval and is the coverage the
+//! readiness policy requires.
 //!
 //! Readiness: only after the header, the run-id batch plus two later durable
 //! groups, and one completed compaction does the workload journal an `R` record
@@ -51,7 +52,7 @@ use mapdb_rust_store_crash_harness::{
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Maintenance cadence in durable groups: compact (WAL checkpoint) at group 2,
+/// Maintenance cadence in durable groups: compact (WAL log clean) at group 2,
 /// then every 6th group — early enough that the readiness threshold (>=3
 /// groups, >=1 compaction) is met by group 3, and often enough to keep exercising the
 /// log-truncation replay path over a long run.
@@ -86,11 +87,14 @@ impl Journal {
 
 fn run(cfg: Config, store_path: PathBuf, journal_path: PathBuf) -> Result<(), String> {
     let db = DB::make_wal(&store_path).map_err(|e| format!("open wal: {e:?}"))?;
-    // Bound the WAL log so the inline auto-checkpoint keeps firing under load,
-    // exercising replay-from-a-truncated-log recovery between explicit compacts.
+    // Bound the WAL log so automatic cleaning keeps firing under load (D8's
+    // trigger is `logBytes > max(minLogBytes, spaceAmplification x liveData)`),
+    // exercising segment rollover and multi-segment replay between explicit
+    // compacts. The v1 knob this replaces — `set_auto_checkpoint_bytes` — named
+    // the whole-file rewrite that format v3 does not have.
     db.store()
-        .set_auto_checkpoint_bytes(cfg.max_wal_bytes as i64)
-        .map_err(|e| format!("auto-checkpoint config: {e:?}"))?;
+        .set_min_log_bytes(cfg.max_wal_bytes)
+        .map_err(|e| format!("min-log-bytes config: {e:?}"))?;
     // Byte-array keys and values so the generated universe round-trips exactly;
     // values-outside-nodes so the large (>256 KiB) size classes become external
     // linked records rather than blowing the node size.

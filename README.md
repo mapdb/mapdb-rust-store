@@ -87,7 +87,7 @@ never published and is not part of the `mapdb-rust-store` library.
 ## What this does not claim
 
 The crash model covers dirty-page-cache loss, write and sync ordering, ext4/XFS
-journal recovery, and the WAL replay and checkpoint protocols. It does **not**
+journal recovery, and the WAL replay and cleaning protocols. It does **not**
 model a lying volatile device cache, FUA or flush dishonesty, sector tearing, or
 a filesystem that violates powersafe overwrite.
 

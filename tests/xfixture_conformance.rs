@@ -341,10 +341,38 @@ fn xfixture_conformance() {
         baselines.insert((fr.fixture.clone(), fr.rel.clone()), base);
     }
 
+    // The `wal-v1-*` accept cells RETIRE at this engine's WAL v3 cutover: the
+    // port refuses format v1 outright (there is no migration, by design), and
+    // its opener no longer takes a WAL FILE path at all, so the cell cannot even
+    // be expressed. D6 retires these IDs family-wide at Stage C, when the
+    // manifest gains the `wal3-namespace` bundle kind and the java/zig
+    // generators stop emitting v1 rows; until then the rows stay in the shared
+    // manifest for the engines that still speak v1, and this engine skips them.
+    //
+    // The list is EXACT and asserted below: a new accept row addressed to rust
+    // must not be silently dropped by a prefix match.
+    const RETIRED_V1_ACCEPTS: [&str; 4] = [
+        "wal-v1-rust-tail",
+        "wal-v1-rust-ckpt",
+        "wal-v1-zig-tail",
+        "wal-v1-zig-ckpt",
+    ];
+    let mut retired = Vec::new();
+
     // run every expect row addressed to this engine.
     let mut ran = 0usize;
     for (i, ex) in m.expects.iter().enumerate() {
         if ex.engine != "rust" {
+            continue;
+        }
+        if ex.verdict == "accept" && ex.opener == "wal" {
+            assert!(
+                RETIRED_V1_ACCEPTS.contains(&ex.fixture.as_str()),
+                "cell {i}: accept-wal fixture {} is not one of the four v1 cells retired at the \
+                 v3 cutover — a new WAL accept row needs a v3 (base-path) cell, not a skip",
+                ex.fixture
+            );
+            retired.push(ex.fixture.clone());
             continue;
         }
         ran += 1;
@@ -398,9 +426,11 @@ fn xfixture_conformance() {
                 }
             },
             ("reject", "wal") => {
-                // openArg is the literal WAL file path within the cell dir
-                // (`StoreWAL::open` takes the WAL FILE path itself; the
-                // manifest carries e.g. `x.wal`, matching placeAs).
+                // The v3 opener takes a BASE path. Every reject row's openArg
+                // names a regular file the cell placed there, so each of these
+                // now refuses through D1's bare-base row rather than through a
+                // v1 header check — the same verdict for the same image, which
+                // is what the cell asserts.
                 let wal_file = cell.join(&ex.open_arg);
                 match StoreWAL::open(&wal_file) {
                     Err(DbError::DataCorruption(_)) => {}
@@ -429,5 +459,12 @@ fn xfixture_conformance() {
         std::fs::remove_dir_all(&cell).unwrap();
     }
     assert!(ran > 0, "manifest contains no expect rows for engine=rust");
+    retired.sort();
+    let mut expected: Vec<String> = RETIRED_V1_ACCEPTS.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        retired, expected,
+        "every retired v1 accept cell must still be present in the shared manifest: if one is          gone, Stage C has begun and this skip list must go with it"
+    );
     let _ = std::fs::remove_dir_all(&session);
 }

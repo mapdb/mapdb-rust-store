@@ -1,9 +1,15 @@
-//! StoreWAL-specific tests (spec 02 §7, spec 05): commit durability across
-//! reopen (log replay), multi-section replay, delete/append replay, rollback,
-//! torn-tail truncation vs mid-log corruption (D4), checkpoint compaction,
-//! crash-during-checkpoint temp recovery, auto-checkpoint, and streaming-replay
-//! refill edges. The inner StoreDirect is heap-backed, so *all* durability is
-//! carried by the log file — reopen rebuilds inner purely from replay.
+//! `StoreWAL` (format v3) black-box tests: commit durability across reopen,
+//! multi-section and multi-segment replay, delete/append replay, rollback,
+//! torn-tail truncation vs mid-log corruption, segment rollover, the D1 legacy
+//! boundary, the store lock, delete-on-close, and streaming-replay refill edges.
+//!
+//! The inner `StoreDirect` is heap-backed, so *all* durability is carried by the
+//! log — a reopen rebuilds the record map purely from replay.
+//!
+//! Byte-level format tests (the H/S/K/R decision tables, hand-built images,
+//! doctored headers) live with the modules that own them, in `wal_segments.rs`
+//! and `wal_recover.rs`; the writer's obligations and its fault injection live
+//! in `wal.rs`. What is here is what a user can reach through the public API.
 
 use mapdb_rust_store::error::{DbError, Result};
 use mapdb_rust_store::io::{DataInput2, DataOutput2};
@@ -52,74 +58,114 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Unique temp WAL path; removes any stale log + ckpt temp so each test starts clean.
+/// A fresh scratch DIRECTORY plus the base path inside it. v3 stores own a
+/// namespace, so every test gets a directory of its own rather than a filename.
 fn tmp() -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, AtomOrd::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!("mapdb5_wal_it_{}_{}.wal", std::process::id(), n));
-    let _ = std::fs::remove_file(&p);
-    let mut c = p.clone().into_os_string();
-    c.push(".ckpt");
-    let _ = std::fs::remove_file(PathBuf::from(c));
-    p
+    let dir = std::env::temp_dir().join(format!("mapdb5_wal_it_{}_{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir.join("store.db")
 }
 
-fn ckpt_of(p: &Path) -> PathBuf {
-    let mut c = p.to_path_buf().into_os_string();
-    c.push(".ckpt");
-    PathBuf::from(c)
+/// The segment files of `base`, ascending by sequence number.
+fn segments(base: &Path) -> Vec<PathBuf> {
+    let prefix = format!("{}.wal.", base.file_name().unwrap().to_str().unwrap());
+    let mut v: Vec<PathBuf> = std::fs::read_dir(base.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_str().unwrap().to_string();
+            (name.starts_with(&prefix) && name.len() == prefix.len() + 16).then_some(p)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn log_len(base: &Path) -> u64 {
+    segments(base)
+        .iter()
+        .map(|p| std::fs::metadata(p).unwrap().len())
+        .sum()
+}
+
+/// The one segment a single-segment store has.
+fn only_segment(base: &Path) -> PathBuf {
+    let s = segments(base);
+    assert_eq!(s.len(), 1, "expected exactly one segment, got {s:?}");
+    s.into_iter().next().unwrap()
 }
 
 fn is_corrupt(r: Result<StoreWAL>) -> bool {
     matches!(r, Err(DbError::DataCorruption(_)))
 }
 
-#[test]
-fn old_framed_magic_is_rejected_without_rewrite() {
-    let p = tmp();
-    {
-        let s = StoreWAL::open(&p).unwrap();
-        s.close().unwrap();
-    }
-    let f = OpenOptions::new().write(true).open(&p).unwrap();
-    f.write_all_at(b"MDB5.WAL", 0).unwrap();
-    drop(f);
-    let before = std::fs::read(&p).unwrap();
+/// Everything the store owns, as (name, bytes) — for "a refused open changed
+/// nothing" assertions.
+fn dir_image(base: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(base.parent().unwrap())
+        .unwrap()
+        .map(|e| {
+            let p = e.unwrap().path();
+            (
+                p.file_name().unwrap().to_str().unwrap().to_string(),
+                std::fs::read(&p).unwrap_or_default(),
+            )
+        })
+        // The lock file is not part of the store's data and a refused open
+        // legitimately creates it: §3.1's lock is taken BEFORE anything is
+        // inspected, which is what stops two openers inspecting at once.
+        .filter(|(name, _)| !name.ends_with(".lock"))
+        .collect();
+    v.sort();
+    v
+}
 
-    assert!(is_corrupt(StoreWAL::open(&p)));
-    assert_eq!(std::fs::read(&p).unwrap(), before);
+// ---------------------------------------------------------------------------
+// D1: the legacy boundary. Three pre-existing artifacts refuse the open, none
+// of them is deleted. The v1 opener took the WAL FILE path, so the same call
+// site now passes what v3 reads as a BASE — a fresh empty store opened beside
+// the user's only durable copy is the outcome these rows exist to prevent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_v1_single_file_log_refuses_the_open_and_is_not_touched() {
+    for (suffix, what) in [(".wal", "v1 log"), ("", "bare base"), (".ckpt", "v1 temp")] {
+        let base = tmp();
+        let mut p = base.clone().into_os_string();
+        p.push(suffix);
+        let victim = PathBuf::from(p);
+        // A real v1 header: magic, version 1, flags 0.
+        let mut v1 = b"MDBS.WAL".to_vec();
+        v1.extend_from_slice(&1i32.to_be_bytes());
+        v1.extend_from_slice(&0i32.to_be_bytes());
+        std::fs::write(&victim, &v1).unwrap();
+
+        let before = dir_image(&base);
+        assert!(
+            is_corrupt(StoreWAL::open(&base)),
+            "{what}: a v1 artifact must refuse the open"
+        );
+        assert_eq!(dir_image(&base), before, "{what}: nothing may be deleted");
+        assert!(
+            segments(&base).is_empty(),
+            "{what}: no v3 segment may be created beside it"
+        );
+    }
 }
 
 #[test]
-fn valid_legacy_headerless_wal_is_migrated() {
-    let p = tmp();
-    // PREALLOC recid 1, followed by the legacy COMMIT seal and the CRC32 of
-    // the operation bytes. A real legacy stream therefore begins with opcode
-    // 1, not an ASCII magic byte.
-    let ops = [1u8, 0x81];
-    let mut legacy = ops.to_vec();
-    legacy.push(8);
-    legacy.extend_from_slice(&(crc32fast::hash(&ops) as i32).to_be_bytes());
-    std::fs::write(&p, legacy).unwrap();
-
-    let s = StoreWAL::open(&p).unwrap();
-    s.verify().unwrap();
+fn a_directory_at_a_legacy_name_is_not_a_legacy_artifact() {
+    // Regular files only — the same discipline the namespace applies to segment
+    // names. A directory called `store.db.ckpt` is somebody else's.
+    let base = tmp();
+    let mut p = base.clone().into_os_string();
+    p.push(".ckpt");
+    std::fs::create_dir(PathBuf::from(p)).unwrap();
+    let s = StoreWAL::open(&base).unwrap();
     s.close().unwrap();
-    assert_eq!(&std::fs::read(&p).unwrap()[..8], b"MDBS.WAL");
-}
-
-#[test]
-fn one_and_two_byte_legacy_tails_are_safe() {
-    for tail in [&[1u8][..], &[1u8, 0x81][..]] {
-        let p = tmp();
-        std::fs::write(&p, tail).unwrap();
-
-        let s = StoreWAL::open(&p).unwrap();
-        s.verify().unwrap();
-        s.close().unwrap();
-        assert_eq!(&std::fs::read(&p).unwrap()[..8], b"MDBS.WAL");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -127,389 +173,448 @@ fn one_and_two_byte_legacy_tails_are_safe() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_fresh_store_creates_one_segment_at_sequence_one() {
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.segment_seqs(), vec![1]);
+    assert_eq!(s.next_lsn(), 1);
+    // 36-byte header, no sections.
+    assert_eq!(log_len(&base), 36);
+    assert!(
+        s.open_segment_files() <= 1,
+        "at most the active segment holds a descriptor"
+    );
+    s.close().unwrap();
+    assert!(only_segment(&base).exists());
+}
+
+#[test]
 fn committed_state_survives_reopen() {
-    let p = tmp();
-    let (r1, r2);
+    let base = tmp();
+    let (a, b, c);
     {
-        let s = StoreWAL::open(&p).unwrap();
-        r1 = s.put(&11i64, &L).unwrap();
-        r2 = s.put(&22i64, &L).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
+        a = s.put(&42i64, &L).unwrap();
+        b = s.put(&bytes(1, 300), &R).unwrap();
+        c = s.preallocate().unwrap();
         s.commit().unwrap();
         s.close().unwrap();
     }
-    let s = StoreWAL::open(&p).unwrap();
-    assert_eq!(s.get(r1, &L).unwrap(), Some(11));
-    assert_eq!(s.get(r2, &L).unwrap(), Some(22));
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(a, &L).unwrap(), Some(42));
+    assert_eq!(s.get(b, &R).unwrap(), Some(bytes(1, 300)));
+    assert_eq!(s.get(c, &L).unwrap(), None, "preallocated, still null");
     s.verify().unwrap();
 }
 
 #[test]
 fn uncommitted_state_is_lost_on_reopen() {
-    let p = tmp();
-    let r;
+    let base = tmp();
+    let a;
     {
-        let s = StoreWAL::open(&p).unwrap();
-        r = s.put(&99i64, &L).unwrap();
-        // NO commit.
+        let s = StoreWAL::open(&base).unwrap();
+        a = s.put(&1i64, &L).unwrap();
+        s.commit().unwrap();
+        s.update(a, Some(&2i64), &L).unwrap(); // never committed
         s.close().unwrap();
     }
-    let s = StoreWAL::open(&p).unwrap();
-    // recid was never durably allocated: reads Void (never-allocated).
-    assert!(matches!(s.get(r, &L), Err(DbError::GetVoid(_))));
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(a, &L).unwrap(), Some(1));
 }
 
 #[test]
 fn multi_section_replay_and_last_write_wins() {
-    let p = tmp();
-    let r;
+    let base = tmp();
+    let a;
     {
-        let s = StoreWAL::open(&p).unwrap();
-        r = s.put(&1i64, &L).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
+        a = s.put(&1i64, &L).unwrap();
         s.commit().unwrap();
-        s.update(r, Some(&2i64), &L).unwrap();
-        s.commit().unwrap();
-        s.update(r, Some(&3i64), &L).unwrap();
-        s.commit().unwrap();
+        for v in 2..=20i64 {
+            s.update(a, Some(&v), &L).unwrap();
+            s.commit().unwrap();
+        }
+        assert_eq!(s.next_lsn(), 21, "one LSN per committed transaction");
         s.close().unwrap();
     }
-    let s = StoreWAL::open(&p).unwrap();
-    assert_eq!(
-        s.get(r, &L).unwrap(),
-        Some(3),
-        "last committed section wins"
-    );
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(a, &L).unwrap(), Some(20));
+    assert_eq!(s.next_lsn(), 21, "recovery resumes at the same LSN");
+    s.verify().unwrap();
 }
 
 #[test]
 fn delete_and_append_replay() {
-    let p = tmp();
-    let (rkeep, rdel, rapp);
+    let base = tmp();
+    let (a, b);
     {
-        let s = StoreWAL::open(&p).unwrap();
-        rkeep = s.put(&7i64, &L).unwrap();
-        rdel = s.put(&8i64, &L).unwrap();
-        rapp = s.put(&bytes(1, 10), &R).unwrap();
-        s.update_with_headroom(rapp, &bytes(1, 10), &R, 64).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
+        a = s.put(&bytes(3, 40), &R).unwrap();
+        b = s.put(&7i64, &L).unwrap();
         s.commit().unwrap();
-        // second tx: delete one, append to another.
-        s.delete(rdel).unwrap();
-        s.append(rapp, &[100, 101, 102]).unwrap();
+        // an append against a committed base: logged as a delta stamped with
+        // the LSN of the section that established the content.
+        s.update_with_headroom(a, &bytes(3, 40), &R, 64).unwrap();
+        s.commit().unwrap();
+        s.append(a, &[9u8; 8]).unwrap();
+        s.delete(b).unwrap();
         s.commit().unwrap();
         s.close().unwrap();
     }
-    let s = StoreWAL::open(&p).unwrap();
-    assert_eq!(s.get(rkeep, &L).unwrap(), Some(7));
-    assert!(matches!(s.get(rdel, &L), Err(DbError::GetVoid(_))));
-    let mut want = bytes(1, 10);
-    want.extend_from_slice(&[100, 101, 102]);
-    assert_eq!(s.get(rapp, &R).unwrap(), Some(want));
+    let s = StoreWAL::open(&base).unwrap();
+    let mut want = bytes(3, 40);
+    want.extend_from_slice(&[9u8; 8]);
+    assert_eq!(s.get(a, &R).unwrap(), Some(want));
+    assert!(matches!(s.get(b, &L), Err(DbError::GetVoid(_))));
+    s.verify().unwrap();
+}
+
+#[test]
+fn an_append_replays_across_a_segment_boundary() {
+    // The delta cites its base image by LSN, and the base is now in a segment
+    // the delta is not in. Recovery must still find it.
+    let base = tmp();
+    let a;
+    {
+        let s = StoreWAL::open_segment_bytes(&base, 128).unwrap();
+        a = s.put(&bytes(5, 60), &R).unwrap();
+        s.commit().unwrap();
+        s.update_with_headroom(a, &bytes(5, 60), &R, 128).unwrap();
+        s.commit().unwrap();
+        for i in 0..8 {
+            s.append(a, &[i as u8; 4]).unwrap();
+            s.commit().unwrap();
+        }
+        assert!(
+            s.segment_seqs().len() > 1,
+            "the workload must have rolled over"
+        );
+        s.close().unwrap();
+    }
+    let s = StoreWAL::open(&base).unwrap();
+    let mut want = bytes(5, 60);
+    for i in 0..8 {
+        want.extend_from_slice(&[i as u8; 4]);
+    }
+    assert_eq!(s.get(a, &R).unwrap(), Some(want));
     s.verify().unwrap();
 }
 
 #[test]
 fn linked_oversize_record_replays() {
-    let p = tmp();
-    let big = bytes(42, 200_000); // forces an oversize/linked record
-    let r;
+    use mapdb_rust_store::store::index_val::MAX_CAPACITY;
+    let base = tmp();
+    let big = bytes(9, MAX_CAPACITY + 5000); // past the plain-record ceiling
+    let a;
     {
-        let s = StoreWAL::open(&p).unwrap();
-        r = s.put(&big, &R).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
+        a = s.put(&big, &R).unwrap();
         s.commit().unwrap();
         s.close().unwrap();
     }
-    let s = StoreWAL::open(&p).unwrap();
-    assert_eq!(s.get(r, &R).unwrap(), Some(big));
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(a, &R).unwrap(), Some(big));
     s.verify().unwrap();
 }
-
-// ---------------------------------------------------------------------------
-// Rollback discards staged, keeps committed.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn rollback_discards_staged_keeps_committed() {
-    let p = tmp();
-    let s = StoreWAL::open(&p).unwrap();
-    let r = s.put(&5i64, &L).unwrap();
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    let a = s.put(&1i64, &L).unwrap();
     s.commit().unwrap();
-    // stage an update + a fresh put, then roll back.
-    s.update(r, Some(&500i64), &L).unwrap();
-    let rtmp = s.put(&123i64, &L).unwrap();
+    let b = s.put(&2i64, &L).unwrap();
+    s.update(a, Some(&99i64), &L).unwrap();
     s.rollback().unwrap();
-    assert_eq!(s.get(r, &L).unwrap(), Some(5), "committed value restored");
-    assert!(
-        matches!(s.get(rtmp, &L), Err(DbError::GetVoid(_))),
-        "rolled-back prealloc is freed"
-    );
+    assert_eq!(s.get(a, &L).unwrap(), Some(1));
+    assert!(matches!(s.get(b, &L), Err(DbError::GetVoid(_))));
+    // A rollback writes nothing, so no LSN was consumed.
+    assert_eq!(s.next_lsn(), 2);
     s.verify().unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// Torn tail (availability): a truncated final section is dropped; earlier
-// committed sections survive. D4.
+// Rollover: the threshold is checked at a section boundary and only when the
+// active segment is nonempty, so one section may exceed it and an oversize
+// section gets a segment to itself.
 // ---------------------------------------------------------------------------
 
-fn file_len(p: &PathBuf) -> u64 {
-    std::fs::metadata(p).unwrap().len()
+#[test]
+fn the_log_rolls_over_at_the_segment_threshold() {
+    let base = tmp();
+    let mut recids = Vec::new();
+    let s = StoreWAL::open_segment_bytes(&base, 200).unwrap();
+    for i in 0..30i64 {
+        recids.push(s.put(&i, &L).unwrap());
+        s.commit().unwrap();
+    }
+    let seqs = s.segment_seqs();
+    assert!(seqs.len() > 3, "expected several segments, got {seqs:?}");
+    assert_eq!(
+        seqs,
+        (1..=seqs.len() as i64).collect::<Vec<_>>(),
+        "sequence numbers are consecutive when nothing is retired"
+    );
+    assert!(
+        s.open_segment_files() <= 1,
+        "rollover must release the sealed segment's descriptor"
+    );
+    s.close().unwrap();
+
+    let s = StoreWAL::open(&base).unwrap();
+    for (i, r) in recids.iter().enumerate() {
+        assert_eq!(s.get(*r, &L).unwrap(), Some(i as i64));
+    }
+    s.verify().unwrap();
 }
 
 #[test]
+fn a_section_larger_than_a_segment_gets_a_segment_of_its_own() {
+    let base = tmp();
+    let s = StoreWAL::open_segment_bytes(&base, 61).unwrap(); // the minimum
+    let big = s.put(&bytes(11, 4000), &R).unwrap();
+    s.commit().unwrap();
+    // The first segment was empty, so it took the oversize section; the next
+    // commit rolls because the threshold is now exceeded.
+    let after_first = s.segment_seqs();
+    assert_eq!(
+        after_first,
+        vec![1],
+        "an empty segment is never rolled past"
+    );
+    let small = s.put(&1i64, &L).unwrap();
+    s.commit().unwrap();
+    assert_eq!(s.segment_seqs(), vec![1, 2]);
+    s.close().unwrap();
+
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(big, &R).unwrap(), Some(bytes(11, 4000)));
+    assert_eq!(s.get(small, &L).unwrap(), Some(1));
+    s.verify().unwrap();
+}
+
+#[test]
+fn a_segment_size_below_the_minimum_is_refused() {
+    let base = tmp();
+    assert!(matches!(
+        StoreWAL::open_segment_bytes(&base, 60),
+        Err(DbError::WrongConfiguration(_))
+    ));
+    assert!(segments(&base).is_empty(), "a refused open creates nothing");
+}
+
+// ---------------------------------------------------------------------------
+// Torn tail vs mid-log corruption. A damaged section at the end of the ACTIVE
+// segment is a crash image: truncate and carry on. One followed by a valid
+// section is bit rot: refuse.
+// ---------------------------------------------------------------------------
+
+#[test]
 fn torn_tail_body_is_truncated_not_fatal() {
-    let p = tmp();
+    let base = tmp();
     let (r1, len_after_first);
     {
-        let s = StoreWAL::open(&p).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
         r1 = s.put(&1000i64, &L).unwrap();
         s.commit().unwrap();
-        len_after_first = file_len(&p);
-        // a second commit whose section we will tear.
+        len_after_first = log_len(&base);
         s.put(&2000i64, &L).unwrap();
         s.commit().unwrap();
         s.close().unwrap();
     }
-    // Chop the file one byte into the second section's body → torn tail.
-    let f = OpenOptions::new().write(true).open(&p).unwrap();
-    f.set_len(len_after_first + 1).unwrap();
-    drop(f);
+    // Chop one byte into the second section's body → torn tail.
+    let seg = only_segment(&base);
+    OpenOptions::new()
+        .write(true)
+        .open(&seg)
+        .unwrap()
+        .set_len(len_after_first + 1)
+        .unwrap();
 
-    let s = StoreWAL::open(&p).unwrap();
+    let s = StoreWAL::open(&base).unwrap();
     assert_eq!(s.get(r1, &L).unwrap(), Some(1000), "first commit survives");
+    // W7: the truncated segment is sealed and a successor is rotated in, so no
+    // later append ever reuses the torn segment's checksum domain.
+    assert_eq!(s.segment_seqs(), vec![1, 2]);
+    assert!(
+        s.open_segment_files() <= 1,
+        "W7 must not leave the truncated predecessor's descriptor behind"
+    );
     s.verify().unwrap();
-    // A subsequent commit reuses the truncated tail region and reopens cleanly.
     let r3 = s.put(&3000i64, &L).unwrap();
     s.commit().unwrap();
     s.close().unwrap();
-    let s = StoreWAL::open(&p).unwrap();
+
+    let s = StoreWAL::open(&base).unwrap();
     assert_eq!(s.get(r1, &L).unwrap(), Some(1000));
     assert_eq!(s.get(r3, &L).unwrap(), Some(3000));
+    assert_eq!(s.segment_seqs(), vec![1, 2], "a clean open rotates nothing");
+    s.verify().unwrap();
 }
 
 #[test]
 fn torn_tail_within_section_header_is_truncated() {
-    let p = tmp();
+    let base = tmp();
     let (r1, len_after_first);
     {
-        let s = StoreWAL::open(&p).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
         r1 = s.put(&11i64, &L).unwrap();
         s.commit().unwrap();
-        len_after_first = file_len(&p);
+        len_after_first = log_len(&base);
         s.put(&22i64, &L).unwrap();
         s.commit().unwrap();
         s.close().unwrap();
     }
-    // Chop inside the second section's 25-byte header (only 5 header bytes present).
-    let f = OpenOptions::new().write(true).open(&p).unwrap();
-    f.set_len(len_after_first + 5).unwrap();
-    drop(f);
-    let s = StoreWAL::open(&p).unwrap();
+    // Chop inside the second section's 25-byte header (5 header bytes present).
+    OpenOptions::new()
+        .write(true)
+        .open(only_segment(&base))
+        .unwrap()
+        .set_len(len_after_first + 5)
+        .unwrap();
+    let s = StoreWAL::open(&base).unwrap();
     assert_eq!(s.get(r1, &L).unwrap(), Some(11));
     s.verify().unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// Mid-log corruption (integrity): a damaged section FOLLOWED by a valid one is
-// not a torn tail — reopen must refuse. D4.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn mid_log_body_corruption_is_fatal() {
-    let p = tmp();
-    let first_body_off;
+    let base = tmp();
     {
-        let s = StoreWAL::open(&p).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
         s.put(&1i64, &L).unwrap();
         s.commit().unwrap();
-        // body of the first section starts right after file header + section header.
-        first_body_off = 16 + 25;
         s.put(&2i64, &L).unwrap();
         s.commit().unwrap(); // a valid section AFTER the one we corrupt
         s.close().unwrap();
     }
-    // Flip a byte in the FIRST section's body; the valid second section remains.
-    let f = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+    // Flip a byte in the FIRST section's body (segment header 36 + section
+    // header 25); the valid second section remains.
+    let seg = only_segment(&base);
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&seg)
+        .unwrap();
     let mut b = [0u8; 1];
-    f.read_exact_at(&mut b, first_body_off).unwrap();
+    f.read_exact_at(&mut b, 36 + 25).unwrap();
     b[0] ^= 0xFF;
-    f.write_all_at(&b, first_body_off).unwrap();
+    f.write_all_at(&b, 36 + 25).unwrap();
     f.sync_all().unwrap();
     drop(f);
 
     assert!(
-        is_corrupt(StoreWAL::open(&p)),
-        "corrupt section followed by a valid one must refuse (not torn tail)"
+        is_corrupt(StoreWAL::open(&base)),
+        "a corrupt section followed by a valid one must refuse (not a torn tail)"
     );
 }
 
 #[test]
 fn mid_log_header_corruption_is_fatal() {
-    let p = tmp();
+    let base = tmp();
     {
-        let s = StoreWAL::open(&p).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
         s.put(&1i64, &L).unwrap();
         s.commit().unwrap();
         s.put(&2i64, &L).unwrap();
         s.commit().unwrap();
         s.close().unwrap();
     }
-    // Corrupt the FIRST section's tag byte (offset 16); its declared bodyLen still
-    // points at the valid, correctly-LSN'd second section → mid-log corruption.
-    let f = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+    // Corrupt the FIRST section's tag byte; its declared bodyLen still points at
+    // the valid, exactly-next-LSN second section → mid-log corruption.
+    let seg = only_segment(&base);
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&seg)
+        .unwrap();
     let mut b = [0u8; 1];
-    f.read_exact_at(&mut b, 16).unwrap();
+    f.read_exact_at(&mut b, 36).unwrap();
     b[0] ^= 0x55;
-    f.write_all_at(&b, 16).unwrap();
+    f.write_all_at(&b, 36).unwrap();
     f.sync_all().unwrap();
     drop(f);
-    assert!(is_corrupt(StoreWAL::open(&p)));
+    assert!(is_corrupt(StoreWAL::open(&base)));
 }
 
 #[test]
-fn unsupported_version_is_rejected() {
-    let p = tmp();
+fn a_damaged_segment_header_refuses_below_the_highest_name() {
+    let base = tmp();
     {
-        let s = StoreWAL::open(&p).unwrap();
-        s.put(&1i64, &L).unwrap();
-        s.commit().unwrap();
+        let s = StoreWAL::open_segment_bytes(&base, 100).unwrap();
+        for i in 0..10i64 {
+            s.put(&i, &L).unwrap();
+            s.commit().unwrap();
+        }
+        assert!(s.segment_seqs().len() > 2);
         s.close().unwrap();
     }
-    // Bump the version word (offset 8..12) to an unknown value.
-    let f = OpenOptions::new().write(true).open(&p).unwrap();
-    f.write_all_at(&99i32.to_be_bytes(), 8).unwrap();
+    // Bump the version word of the FIRST segment: a CRC-valid header carrying
+    // wrong content is corruption wherever it appears, and the reseal is what
+    // makes it a semantic fault rather than a torn create.
+    let seg = &segments(&base)[0];
+    let mut hdr = std::fs::read(seg).unwrap();
+    hdr[8..12].copy_from_slice(&99i32.to_be_bytes());
+    let crc = crc32fast::hash(&hdr[..32]) as i32;
+    hdr[32..36].copy_from_slice(&crc.to_be_bytes());
+    let f = OpenOptions::new().write(true).open(seg).unwrap();
+    f.write_all_at(&hdr[..36], 0).unwrap();
     f.sync_all().unwrap();
     drop(f);
-    assert!(is_corrupt(StoreWAL::open(&p)));
-}
-
-#[test]
-fn nonzero_v1_header_flags_are_rejected_without_rewrite() {
-    let p = tmp();
-    {
-        let s = StoreWAL::open(&p).unwrap();
-        s.put(&1i64, &L).unwrap();
-        s.commit().unwrap();
-        s.close().unwrap();
-    }
-    // Set the flags word (offset 12..16) nonzero; magic and version stay v1.
-    // The open must fail with an EXPLICIT DataCorruption (not fall through to
-    // the framed-MDB guard or legacy replay) and leave the file byte-unchanged.
-    let f = OpenOptions::new().write(true).open(&p).unwrap();
-    f.write_all_at(&1i32.to_be_bytes(), 12).unwrap();
-    f.sync_all().unwrap();
-    drop(f);
-    let before = std::fs::read(&p).unwrap();
-    assert!(
-        is_corrupt(StoreWAL::open(&p)),
-        "nonzero v1 header flags must be rejected as DataCorruption"
-    );
-    assert_eq!(
-        std::fs::read(&p).unwrap(),
-        before,
-        "failed open must leave the file byte-unchanged"
-    );
+    assert!(is_corrupt(StoreWAL::open(&base)));
 }
 
 // ---------------------------------------------------------------------------
-// Checkpoint: compacts the log to one snapshot section, preserving state.
+// The store lock: one writer at a time, across processes and inside this one.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn checkpoint_compacts_log_and_preserves_state() {
-    let p = tmp();
-    let mut recids = Vec::new();
-    let s = StoreWAL::open(&p).unwrap();
-    for i in 0..50i64 {
-        let r = s.put(&i, &L).unwrap();
-        s.commit().unwrap();
-        recids.push(r);
-    }
-    let before = file_len(&p);
-    s.checkpoint().unwrap();
-    let after = file_len(&p);
-    assert!(after < before, "checkpoint compacts {before} -> {after}");
-    assert!(!ckpt_of(&p).exists(), "temp promoted away by rename");
-    // state preserved live, and across reopen from the snapshot section.
-    for (i, r) in recids.iter().enumerate() {
-        assert_eq!(s.get(*r, &L).unwrap(), Some(i as i64));
-    }
-    s.verify().unwrap();
-    s.close().unwrap();
-    let s = StoreWAL::open(&p).unwrap();
-    for (i, r) in recids.iter().enumerate() {
-        assert_eq!(s.get(*r, &L).unwrap(), Some(i as i64));
-    }
-    s.verify().unwrap();
-    // still writable after a checkpoint.
-    let r = s.put(&777i64, &L).unwrap();
+fn a_second_open_of_the_same_store_is_refused() {
+    let base = tmp();
+    let first = StoreWAL::open(&base).unwrap();
+    assert!(matches!(StoreWAL::open(&base), Err(DbError::Locked(_))));
+    first.close().unwrap();
+    // Released on close: the namespace is available again.
+    let second = StoreWAL::open(&base).unwrap();
+    second.close().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// checkpoint(): slice A2 implements the roll half. The re-emission cycle, the
+// 'K' mark and the unlink arrive in A3.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn checkpoint_rolls_the_active_segment_and_preserves_state() {
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    let a = s.put(&5i64, &L).unwrap();
     s.commit().unwrap();
-    assert_eq!(s.get(r, &L).unwrap(), Some(777));
-}
-
-#[test]
-fn crash_during_checkpoint_recovers_from_temp() {
-    // A checkpoint's temp file, fully fsynced but not yet renamed, must win on
-    // reopen when the log is absent (rename is the commit point).
-    let p = tmp();
-    let r;
-    {
-        let s = StoreWAL::open(&p).unwrap();
-        r = s.put(&314i64, &L).unwrap();
-        s.commit().unwrap();
-        s.checkpoint().unwrap(); // log is now itself a valid ckpt-format snapshot
-        s.close().unwrap();
-    }
-    // Simulate the crash: copy the (snapshot) log to <file>.ckpt, delete the log.
-    std::fs::copy(&p, ckpt_of(&p)).unwrap();
-    std::fs::remove_file(&p).unwrap();
-    assert!(!p.exists() && ckpt_of(&p).exists());
-
-    let s = StoreWAL::open(&p).unwrap();
-    assert_eq!(s.get(r, &L).unwrap(), Some(314), "recovered from ckpt temp");
-    assert!(p.exists(), "temp promoted to log");
-    assert!(!ckpt_of(&p).exists(), "temp consumed");
-    s.verify().unwrap();
-}
-
-#[test]
-fn auto_checkpoint_bounds_log_growth() {
-    let p = tmp();
-    let s = StoreWAL::open(&p).unwrap();
-    s.set_auto_checkpoint_bytes(4096).unwrap(); // tiny threshold → frequent compaction
-    let mut recids = Vec::new();
-    for i in 0..200i64 {
-        let r = s.put(&i, &L).unwrap();
-        s.commit().unwrap();
-        recids.push(r);
-    }
-    // With auto-checkpoint active the log stays far below the naive linear size.
-    let sz = file_len(&p);
-    assert!(
-        sz < 200 * 64,
-        "auto-checkpoint should bound log size, got {sz}"
-    );
-    for (i, r) in recids.iter().enumerate() {
-        assert_eq!(s.get(*r, &L).unwrap(), Some(i as i64));
-    }
-    s.verify().unwrap();
+    assert_eq!(s.segment_seqs(), vec![1]);
+    s.checkpoint().unwrap();
+    assert_eq!(s.segment_seqs(), vec![1, 2], "the active segment is sealed");
+    // An empty active segment is never rolled: a second checkpoint is a no-op.
+    s.checkpoint().unwrap();
+    assert_eq!(s.segment_seqs(), vec![1, 2]);
+    assert_eq!(s.get(a, &L).unwrap(), Some(5));
     s.close().unwrap();
-    let s = StoreWAL::open(&p).unwrap();
-    for (i, r) in recids.iter().enumerate() {
-        assert_eq!(s.get(*r, &L).unwrap(), Some(i as i64));
-    }
+
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(a, &L).unwrap(), Some(5));
+    let b = s.put(&6i64, &L).unwrap();
+    s.commit().unwrap();
+    assert_eq!(s.get(b, &L).unwrap(), Some(6));
+    s.verify().unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// Streaming replay: a tiny replay window forces refill edges mid-record.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// After close(), every write op (durable OR staged-only) returns StoreClosed —
-// close publishes `closed` under the write lock and write ops recheck it there.
+// Lifecycle.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn write_ops_after_close_return_store_closed() {
-    let p = tmp();
-    let s = StoreWAL::open(&p).unwrap();
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
     let r = s.put(&1i64, &L).unwrap();
     s.commit().unwrap();
     s.close().unwrap();
@@ -524,24 +629,53 @@ fn write_ops_after_close_return_store_closed() {
     assert!(matches!(s.checkpoint(), Err(DbError::StoreClosed)));
 }
 
+#[test]
+fn double_close_is_ok() {
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    let _r = s.put(&7i64, &L).unwrap();
+    s.commit().unwrap();
+    s.close().unwrap();
+    s.close().unwrap();
+    assert!(s.is_closed());
+}
+
+#[test]
+fn delete_on_close_removes_the_whole_namespace() {
+    let base = tmp();
+    let unrelated = base.parent().unwrap().join("not-ours.txt");
+    std::fs::write(&unrelated, b"keep me").unwrap();
+    let s = StoreWAL::open_segment_bytes(&base, 100).unwrap();
+    s.set_delete_on_close(true);
+    for i in 0..10i64 {
+        s.put(&i, &L).unwrap();
+        s.commit().unwrap();
+    }
+    assert!(s.segment_seqs().len() > 2);
+    s.close().unwrap();
+
+    assert!(segments(&base).is_empty(), "every segment is deleted");
+    let mut lock = base.clone().into_os_string();
+    lock.push(".lock");
+    assert!(!PathBuf::from(lock).exists(), "the lock file goes last");
+    assert!(unrelated.exists(), "unrelated names are preserved");
+}
+
 // ---------------------------------------------------------------------------
-// Headroom that would push a plain record past MAX_CAPACITY must be rejected:
-// otherwise commit would emit an invalid cap=0 T_RECORD for
-// non-oversize content — a WAL neither Rust nor Java can reopen.
+// Records and framing.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn headroom_past_max_capacity_is_rejected_and_log_stays_reopenable() {
     use mapdb_rust_store::store::index_val::MAX_CAPACITY;
-    let p = tmp();
-    let s = StoreWAL::open(&p).unwrap();
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
     let small = bytes(1, 10); // fits a plain record
     let r = s.put(&small, &R).unwrap();
     s.commit().unwrap();
     // content fits, but content+headroom rounds past MAX_CAPACITY → RecordTooLarge.
-    let huge = MAX_CAPACITY; // headroom alone already exceeds the ceiling
     assert!(matches!(
-        s.update_with_headroom(r, &small, &R, huge),
+        s.update_with_headroom(r, &small, &R, MAX_CAPACITY),
         Err(DbError::RecordTooLarge)
     ));
     // usize::MAX headroom must also be rejected (checked arithmetic, no wrap).
@@ -553,17 +687,62 @@ fn headroom_past_max_capacity_is_rejected_and_log_stays_reopenable() {
     s.update(r, Some(&bytes(2, 20)), &R).unwrap();
     s.commit().unwrap();
     s.close().unwrap();
-    let s = StoreWAL::open(&p).unwrap();
+    let s = StoreWAL::open(&base).unwrap();
     assert_eq!(s.get(r, &R).unwrap(), Some(bytes(2, 20)));
     s.verify().unwrap();
 }
 
 #[test]
+fn an_append_that_overflows_the_headroom_clamps_rather_than_going_linked() {
+    // Headroom is a hint; the record is the promise. Appends can push a staged
+    // base to the plain maximum, and the requested headroom then overflows it.
+    // The capacity clamps to the ceiling — falling to "capacity 0, store it
+    // linked" would emit a T_RECORD the decoder rejects as a garbage capacity,
+    // i.e. a log that cannot be reopened.
+    use mapdb_rust_store::store::index_val::MAX_CAPACITY;
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    let content = bytes(4, MAX_CAPACITY - 4096);
+    let r = s.put(&content, &R).unwrap();
+    // A staged base reports unlimited capacity, so this is accepted.
+    let tail = bytes(5, 4000);
+    s.append(r, &tail).unwrap();
+    s.commit().unwrap();
+    let mut want = content.clone();
+    want.extend_from_slice(&tail);
+    assert_eq!(s.get(r, &R).unwrap(), Some(want.clone()));
+    s.close().unwrap();
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(r, &R).unwrap(), Some(want));
+    s.verify().unwrap();
+}
+
+#[test]
+fn a_refused_append_stages_nothing() {
+    // REFUSED is a no-op, so it must leave no staged entry behind: an empty one
+    // used to be classified as a T_PREALLOC at commit, which burns an LSN and
+    // names a content-live record — exactly what replay rejects.
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    let r = s.put(&bytes(6, 100), &R).unwrap();
+    s.commit().unwrap();
+    let lsn_before = s.next_lsn();
+    let refused = s.append(r, &bytes(7, 5000)).unwrap();
+    assert_eq!(refused, mapdb_rust_store::store::AppendResult::Refused);
+    s.commit().unwrap();
+    assert_eq!(s.next_lsn(), lsn_before, "a refused append commits nothing");
+    s.close().unwrap();
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(r, &R).unwrap(), Some(bytes(6, 100)));
+    s.verify().unwrap();
+}
+
+#[test]
 fn streaming_replay_with_tiny_window() {
-    let p = tmp();
+    let base = tmp();
     let mut recids = Vec::new();
     {
-        let s = StoreWAL::open_with(&p, true, 8).unwrap();
+        let s = StoreWAL::open_with(&base, true, 8).unwrap();
         for i in 0..30u64 {
             let v = bytes(i, 40 + (i as usize % 17));
             let r = s.put(&v, &R).unwrap();
@@ -573,26 +752,34 @@ fn streaming_replay_with_tiny_window() {
         s.close().unwrap();
     }
     // reopen with an 8-byte replay window: records span many refills.
-    let s = StoreWAL::open_with(&p, true, 8).unwrap();
+    let s = StoreWAL::open_with(&base, true, 8).unwrap();
     for (r, v) in &recids {
         assert_eq!(s.get(*r, &R).unwrap(), Some(v.clone()));
     }
     s.verify().unwrap();
 }
 
-/// Regression: close() is idempotent — a clean
-/// second close returns Ok. The companion poisoned-double-close path (second
-/// close must RETRY the directory fsync instead of reporting Ok while the
-/// checkpoint rename is still unconfirmed) needs directory-fsync fault
-/// injection, which this environment cannot do; it is guarded by the
-/// poison-aware early return in `StoreWAL::close`.
 #[test]
-fn double_close_is_ok() {
-    let p = tmp();
-    let s = StoreWAL::open(&p).unwrap();
-    let _r = s.put(&7i64, &L).unwrap();
-    s.commit().unwrap();
-    s.close().unwrap();
-    s.close().unwrap();
-    assert!(s.is_closed());
+fn a_body_larger_than_the_writers_buffer_is_streamed_whole() {
+    // The writer coalesces small framing through a 64 KiB buffer and writes
+    // large payloads where they lie; a body that crosses both paths must round
+    // trip byte-exactly.
+    let base = tmp();
+    let mut recids = Vec::new();
+    {
+        let s = StoreWAL::open(&base).unwrap();
+        for i in 0..4u64 {
+            recids.push((s.put(&bytes(i, 100_000), &R).unwrap(), bytes(i, 100_000)));
+        }
+        for i in 0..40u64 {
+            recids.push((s.put(&bytes(100 + i, 37), &R).unwrap(), bytes(100 + i, 37)));
+        }
+        s.commit().unwrap(); // ONE section, ~400 KiB, both paths exercised
+        s.close().unwrap();
+    }
+    let s = StoreWAL::open(&base).unwrap();
+    for (r, v) in &recids {
+        assert_eq!(s.get(*r, &R).unwrap(), Some(v.clone()));
+    }
+    s.verify().unwrap();
 }

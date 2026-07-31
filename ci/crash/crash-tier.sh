@@ -143,7 +143,7 @@ for round in $(seq 1 "$ROUNDS"); do
     echo "queue-fua: $(cat "/sys/block/$LOOPBASE/queue/fua" 2>/dev/null || echo n/a)"
   } | tee "$R/environment"
 
-  "$WORKLOAD" --backend "$BACKEND" --store "$R/mnt/store.wal" \
+  "$WORKLOAD" --backend "$BACKEND" --store "$R/mnt/store.db" \
     --journal "$R/journal" --run-id "tier-$BACKEND-$FS-$round-${GITHUB_RUN_ID:-local}-$$-$(date +%s%N)" \
     --seed "$SEED" 2>"$R/workload.err" &
   WPID=$!
@@ -217,7 +217,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # Bounded: a recovery deadlock fails the round
   # (124 = timeout) instead of hanging the job for hours. Both pipe legs are
   # checked — a tee failure must not fabricate a passing round.
-  timeout -k 15 300 "$CHECKER" --backend "$BACKEND" --store "$R/mnt/store.wal" \
+  timeout -k 15 300 "$CHECKER" --backend "$BACKEND" --store "$R/mnt/store.db" \
     --journal "$R/journal" --min-ack "$MIN_ACK" | tee "$R/verdict"
   # PIPESTATUS must be captured in ONE command — the first assignment is itself a
   # command and resets it.

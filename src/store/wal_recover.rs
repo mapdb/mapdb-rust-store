@@ -43,22 +43,17 @@
 //! inferring intent from LSN density or section tags. That is the whole reason
 //! v3 exists.
 //!
-//! # Status: slice A1, not yet reachable from a public open
+//! # What is NOT here
 //!
-//! Like A0, this is built and tested but unhooked: the public
-//! [`StoreWAL`](super::wal::StoreWAL) still speaks v1 and never calls
-//! [`recover`]. The v3 *writer*, the cutover and the cleaner are A2/A3. What
-//! this module deliberately does NOT contain, so the boundary is legible: no
-//! section writer (A2), no `'K'` emitter or cleaning cycle (A3), and no public
-//! read-only surface (D7 — the internal read-only mode here is real and tested,
-//! and it is all of read-only that this workstream ships).
-
-// A1 ships this layer unhooked (see above); its consumers arrive in A2.
-#![allow(dead_code)]
+//! The section WRITER lives in [`wal_write`](super::wal_write) and the cleaning
+//! cycle that emits `'K'` in [`wal`](super::wal); this module reads. There is no
+//! public read-only surface either (D7 — the internal read-only mode here is
+//! real and tested, and it is all of read-only that this workstream ships).
 
 use super::direct::StoreDirect;
 use super::index_val as iv;
 use super::wal_segments::{crc_domain_of, Segment, WalSegmentSet, SEG_HDR};
+use super::wal_write::{wal_io_event, WalOpKind};
 use super::{AppendResult, Recid, StoreDelta};
 use crate::error::{DbError, Result};
 use std::collections::{HashMap, HashSet};
@@ -128,9 +123,39 @@ pub(crate) fn parse_sec_hdr(hdr: &[u8; SEC_HDR]) -> (u8, i64, i64, i32, i32) {
     )
 }
 
-/// The 25 header bytes for a section, both CRCs computed in the section's own
-/// domain. The writer (A2) and the tests build sections through this one
-/// function, so there is exactly one encoding of a section header in the port.
+/// The 25 header bytes for a section whose body has already been MEASURED — a
+/// length and a body CRC, not the bytes themselves.
+///
+/// This is the shape the streaming writer needs (`wal_write.rs`): its pass 1
+/// produces exactly these two numbers and never materializes the body, so a
+/// signature taking `&[u8]` cannot serve it. Split out here rather than
+/// duplicated there, so the port keeps ONE encoding of a section header — both
+/// A1 reviews found the un-split version and named the same failure mode, a
+/// writer and a test kit that drift into two.
+pub(crate) fn seal_sec_hdr(
+    seg_header: &[u8; SEG_HDR as usize],
+    offset: u64,
+    tag: u8,
+    lsn: i64,
+    body_len: u64,
+    body_crc: i32,
+) -> [u8; SEC_HDR] {
+    let mut hdr = [0u8; SEC_HDR];
+    hdr[0] = tag;
+    hdr[1..9].copy_from_slice(&lsn.to_be_bytes());
+    hdr[9..17].copy_from_slice(&(body_len as i64).to_be_bytes());
+    let mut h = crc32fast::Hasher::new();
+    crc_domain_of(&mut h, seg_header, offset);
+    h.update(&hdr[..SEC_HDR_CRC_LEN]);
+    hdr[17..21].copy_from_slice(&(h.finalize() as i32).to_be_bytes());
+    hdr[21..25].copy_from_slice(&body_crc.to_be_bytes());
+    hdr
+}
+
+/// [`seal_sec_hdr`] for a caller that HOLDS the body: the byte-level test kit.
+/// The production writer never materializes a body, so it always seals from a
+/// measured length and CRC instead.
+#[cfg(test)]
 pub(crate) fn build_sec_hdr(
     seg_header: &[u8; SEG_HDR as usize],
     offset: u64,
@@ -138,22 +163,21 @@ pub(crate) fn build_sec_hdr(
     lsn: i64,
     body: &[u8],
 ) -> [u8; SEC_HDR] {
-    let mut hdr = [0u8; SEC_HDR];
-    hdr[0] = tag;
-    hdr[1..9].copy_from_slice(&lsn.to_be_bytes());
-    hdr[9..17].copy_from_slice(&(body.len() as i64).to_be_bytes());
-    let mut h = crc32fast::Hasher::new();
-    crc_domain_of(&mut h, seg_header, offset);
-    h.update(&hdr[..SEC_HDR_CRC_LEN]);
-    hdr[17..21].copy_from_slice(&(h.finalize() as i32).to_be_bytes());
     let mut b = crc32fast::Hasher::new();
     crc_domain_of(&mut b, seg_header, offset);
     b.update(body);
-    hdr[21..25].copy_from_slice(&(b.finalize() as i32).to_be_bytes());
-    hdr
+    seal_sec_hdr(
+        seg_header,
+        offset,
+        tag,
+        lsn,
+        body.len() as u64,
+        b.finalize() as i32,
+    )
 }
 
-/// The 16-byte `'K'` body.
+/// The 16-byte `'K'` body. Written by the cleaner (A3) and by the test kit.
+#[allow(dead_code)] // consumed by A3's cleaner; A2 and A3 land together
 pub(crate) fn build_mark_body(cleaned_through_seq: i64, log_start_lsn: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&cleaned_through_seq.to_be_bytes());
@@ -240,11 +264,10 @@ fn body_crc(
 /// reads whole bodies regresses every large transaction into an allocation of
 /// its full size.
 ///
-/// Separate from v1's `WalIn` in [`wal`](super::wal) on purpose, and not a
-/// candidate for sharing: that one folds an incremental CRC into every read to
-/// serve the *legacy* trailing-seal format, work v3 never needs because a v3
-/// section's CRCs are verified in pass 1 before a single entry is decoded
-/// ("garbage never allocates"). v1's copy is deleted at the A2 cutover.
+/// It folds no CRC into its reads, and does not need to: a v3 section's CRCs are
+/// verified in pass 1, before a single entry is decoded ("garbage never
+/// allocates"). The v1 reader this replaced computed one incrementally, because
+/// its legacy trailing-seal format could only be checked at the end.
 struct SecIn<'a> {
     file: &'a File,
     /// End of the section being decoded.
@@ -1254,11 +1277,19 @@ pub(crate) fn recover(
             // checksum domain at all. Conditional on an ACTUAL truncation:
             // rotating on every open would burn a sequence number per open and
             // demote a legitimate valid-empty highest segment to non-highest (H8).
+            // The force ORDERING here — truncate, then a size-persisting force,
+            // then rotate — is a claim about operations that leave no trace in
+            // the resulting bytes, and A1 could not test it because the port had
+            // no I/O seam at all. A2 built one, so it is observable now.
+            let io = set.wal_io().clone();
             let active = set.active_mut().expect("non-empty");
             active.ensure_open()?;
+            let seq = active.seq;
+            wal_io_event(&io, WalOpKind::Truncate, seq, valid_end, 0, 0)?;
             handle(active).set_len(valid_end)?;
             active.file_len = valid_end;
             // The file's SIZE is the payload here: never sync_data.
+            wal_io_event(&io, WalOpKind::ForceFull, seq, valid_end, 0, 0)?;
             handle(active).sync_all()?;
             // A RECORDED divergence, and the port's is the better behaviour.
             // The reference never releases the truncated predecessor
