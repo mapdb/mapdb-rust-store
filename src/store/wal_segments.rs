@@ -333,18 +333,33 @@ impl WalSegmentSet {
         // site now passes a BASE — and N6 alone would look at `<arg>.wal`, miss
         // the old log sitting at `<arg>`, and open a fresh empty store beside
         // the user's only durable copy.
-        for (path, what) in [
-            (with_suffix(&set.base, ".wal"), "v1 single-file WAL"),
+        for (path, what, any_kind) in [
+            (with_suffix(&set.base, ".wal"), "v1 single-file WAL", false),
             (
                 set.base.clone(),
                 "regular file at the WAL base path (the v3 opener takes a base, not a log file)",
+                false,
             ),
+            // `.ckpt` refuses on EXISTENCE, whatever the entry is — the one row
+            // of the three that is not a regular-file test. D1 makes it the
+            // sentinel precisely because it may be the only recoverable copy
+            // after a v1 crash, and "there is something at that name and I
+            // cannot tell what" is not a reason to create a fresh store beside
+            // it. The other two rows stay regular-file: a directory at
+            // `<base>` or `<base>.wal` is not a legacy log, and refusing there
+            // would make ordinary directory layouts unopenable.
             (
                 with_suffix(&set.base, ".ckpt"),
                 "v1 checkpoint temp, possibly the only recoverable copy after a v1 crash",
+                true,
             ),
         ] {
-            if is_regular_file(&path) {
+            let present = if any_kind {
+                std::fs::symlink_metadata(&path).is_ok()
+            } else {
+                is_regular_file(&path)
+            };
+            if present {
                 return Err(DbError::corrupt_msg(format!(
                     "{what} present at {}: no migration to v3 — open it with the release that \
                      wrote it and copy the data across, or move it aside",
@@ -526,9 +541,17 @@ impl WalSegmentSet {
             };
             // `file_type()` from a directory entry does not follow symlinks, so
             // a symlink to a valid segment is not a segment.
+            //
+            // The FAILURE here is not "not a segment": this name has already
+            // matched the exact segment grammar, so it is one of ours and we
+            // simply could not tell what it is. Open may guess (Java's
+            // `Files.isRegularFile` guesses the same way), but D2's delete may
+            // not — guessing "not a file" there leaves a segment on disk under
+            // an owned name while the caller is told the namespace is gone.
             match entry.file_type() {
                 Ok(ft) if ft.is_file() => {}
-                _ => continue,
+                Ok(_) => continue,
+                Err(e) => return Err(DbError::Io(e)),
             }
             found.push(seq);
         }

@@ -158,14 +158,43 @@ fn a_v1_single_file_log_refuses_the_open_and_is_not_touched() {
 
 #[test]
 fn a_directory_at_a_legacy_name_is_not_a_legacy_artifact() {
-    // Regular files only — the same discipline the namespace applies to segment
-    // names. A directory called `store.db.ckpt` is somebody else's.
-    let base = tmp();
-    let mut p = base.clone().into_os_string();
-    p.push(".ckpt");
-    std::fs::create_dir(PathBuf::from(p)).unwrap();
-    let s = StoreWAL::open(&base).unwrap();
-    s.close().unwrap();
+    // Regular files only for the two rows that ARE regular-file rows: a
+    // directory at the base or at `<base>.wal` is somebody else's, and refusing
+    // there would make ordinary layouts unopenable.
+    for suffix in ["", ".wal"] {
+        let base = tmp();
+        let mut p = base.clone().into_os_string();
+        p.push(suffix);
+        std::fs::create_dir(PathBuf::from(p)).unwrap();
+        let s = StoreWAL::open(&base).unwrap();
+        s.close().unwrap();
+    }
+}
+
+#[test]
+fn anything_at_all_at_the_ckpt_name_refuses() {
+    // D1 makes `.ckpt` an EXISTENCE sentinel, not a regular-file one, and the
+    // distinction is deliberate: that file may be the only recoverable copy
+    // after a v1 crash, so "there is something at that name and I cannot tell
+    // what it is" is not a licence to create a fresh store beside it. This test
+    // used to assert the opposite.
+    for make in ["file", "dir", "symlink"] {
+        let base = tmp();
+        let mut p = base.clone().into_os_string();
+        p.push(".ckpt");
+        let p = PathBuf::from(p);
+        match make {
+            "file" => std::fs::write(&p, b"old checkpoint").unwrap(),
+            "dir" => std::fs::create_dir(&p).unwrap(),
+            _ => std::os::unix::fs::symlink("/nonexistent", &p).unwrap(),
+        }
+        match StoreWAL::open(&base) {
+            Err(DbError::DataCorruption(m)) => {
+                assert!(m.to_string().contains("v1 checkpoint temp"), "{make}: {m}")
+            }
+            other => panic!("{make}: expected a refusal, got {:?}", other.map(|_| "Ok")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1013,98 @@ fn a_zero_length_append_on_an_already_staged_record_keeps_the_staging() {
     let s = StoreWAL::open(&base).unwrap();
     assert_eq!(s.get(r, &R).unwrap(), Some(want));
     s.verify().unwrap();
+}
+
+fn running_as_root() -> bool {
+    // The permission-dependent tests below prove nothing as root, which ignores
+    // the mode bits they turn on.
+    unsafe { libc_geteuid() == 0 }
+}
+
+extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
+}
+
+#[test]
+fn a_cleaner_read_failure_fails_the_store_closed() {
+    // Automatic cleaning runs INSIDE commit, after the section is forced,
+    // applied and the transaction cleared. An I/O error there must fail closed:
+    // returning it with the handle open means the store's I/O is broken, it
+    // says so once, and then keeps accepting writes. Only the SEMANTIC refusals
+    // (W10, identity disagreement) rewind and keep the handle.
+    if running_as_root() {
+        return;
+    }
+    let base = tmp();
+    // Small segments so the log actually rolls: 40 tiny commits fit inside one
+    // 4 KiB segment and would leave nothing to retire.
+    let s = StoreWAL::open_segment_bytes(&base, 128).unwrap();
+    for i in 0..40i64 {
+        s.put(&i, &L).unwrap();
+        s.commit().unwrap();
+    }
+    let seqs = s.segment_seqs();
+    assert!(seqs.len() > 2, "need a retiring range: {seqs:?}");
+    // Make the lowest retiring segment unreadable, so the cleaner's scan fails
+    // when it reopens it on demand.
+    let mut p = base.clone().into_os_string();
+    p.push(format!(".wal.{:016x}", seqs[0]));
+    let victim = PathBuf::from(p);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let e = s
+        .checkpoint()
+        .expect_err("the scan cannot read a retiring segment");
+    assert!(
+        matches!(e, DbError::Io(_)),
+        "an I/O error, not a refusal: {e:?}"
+    );
+    assert!(
+        s.is_closed(),
+        "an I/O error in the cleaner fails the store CLOSED"
+    );
+    assert!(matches!(s.commit(), Err(DbError::StoreClosed)));
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn delete_on_close_refuses_when_it_cannot_read_the_namespace() {
+    // D2 requires propagation. A delete that cannot enumerate must NOT report a
+    // clean removal — it would have unlinked the lock, cleared its list and
+    // fsynced, while segments are still on disk.
+    //
+    // This covers the `read_dir` half. The other half — a `file_type()` failure
+    // on a name that already matched the segment grammar — is fixed and argued
+    // from the source but NOT covered here: on Linux the entry type comes back
+    // from `d_type` in the directory read itself, so it answers correctly even
+    // with search permission removed, and there is no portable way to make it
+    // fail. Verified by probe rather than assumed.
+    if running_as_root() {
+        return;
+    }
+    let dir = tmp();
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("s.db");
+    let s = StoreWAL::open(&base).unwrap();
+    s.put(&7i64, &L).unwrap();
+    s.commit().unwrap();
+    s.set_delete_on_close(true);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let e = s
+        .close()
+        .expect_err("an unreadable namespace must not delete silently");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(e, DbError::Io(_)), "{e:?}");
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".wal."))
+        .collect();
+    assert!(!left.is_empty(), "the segments really are still there");
 }
 
 #[test]

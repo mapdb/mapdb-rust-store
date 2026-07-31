@@ -390,6 +390,25 @@ impl StoreWAL {
     /// publishes `closed` under this same lock, so every write path that goes
     /// through here is linearized with close — no staged mutation (or durable
     /// append) can slip in after `close()` completed.
+    /// Take the read guard and re-check `closed` while holding it.
+    ///
+    /// The read twin of [`write_open`](Self::write_open), and it is not
+    /// cosmetic: `close` publishes `closed` under the WRITE lock and tears the
+    /// state down there, so a check taken before acquiring the read lock can be
+    /// overtaken. The result is observably wrong rather than merely untidy — a
+    /// `get` of a record staged with `base_set` answers from the staged base
+    /// without touching the (now closed) inner store and would return a value
+    /// from a closed handle, and `capacity_remaining` on that record would
+    /// answer `usize::MAX`. Java takes the read lock first and checks under it
+    /// (`StoreWAL.java:1359-1386`).
+    fn read_open(&self) -> Result<parking_lot::RwLockReadGuard<'_, Box<WalState>>> {
+        let st = self.st.read();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(DbError::StoreClosed);
+        }
+        Ok(st)
+    }
+
     fn write_open(&self) -> Result<parking_lot::RwLockWriteGuard<'_, Box<WalState>>> {
         let st = self.st.write();
         if self.closed.load(Ordering::Acquire) {
@@ -403,8 +422,7 @@ impl StoreWAL {
 
     /// Bytes the log currently costs on the device.
     pub fn log_bytes(&self) -> Result<u64> {
-        self.check_closed()?;
-        Ok(self.st.read().segs.log_bytes())
+        Ok(self.read_open()?.segs.log_bytes())
     }
 
     /// Floor under the cleaning trigger (D8): a log smaller than this is never
@@ -1833,8 +1851,7 @@ impl Store for StoreWAL {
     }
 
     fn get<R: Record>(&self, recid: Recid, ser: &(impl Serializer<R> + Sync)) -> Result<Option<R>> {
-        self.check_closed()?;
-        let st = self.st.read();
+        let st = self.read_open()?;
         match st.staged.get(&recid.get()) {
             None => st.inner.get(recid, ser),
             Some(s) => {
@@ -1853,8 +1870,7 @@ impl Store for StoreWAL {
     }
 
     fn read(&self, recid: Recid, action: &mut dyn RecordRead) -> Result<i64> {
-        self.check_closed()?;
-        let st = self.st.read();
+        let st = self.read_open()?;
         match st.staged.get(&recid.get()) {
             None => st.inner.read(recid, action),
             Some(s) => {
@@ -1980,13 +1996,11 @@ impl Store for StoreWAL {
     }
 
     fn verify(&self) -> Result<()> {
-        self.check_closed()?;
-        self.st.read().inner.verify()
+        self.read_open()?.inner.verify()
     }
 
     fn get_all_recids(&self) -> Result<Vec<Recid>> {
-        self.check_closed()?;
-        let st = self.st.read();
+        let st = self.read_open()?;
         let mut set: std::collections::BTreeSet<u64> = st
             .inner
             .get_all_recids()?
@@ -2112,8 +2126,7 @@ impl StoreDelta for StoreWAL {
     }
 
     fn capacity_remaining(&self, recid: Recid) -> Result<usize> {
-        self.check_closed()?;
-        let st = self.st.read();
+        let st = self.read_open()?;
         match st.staged.get(&recid.get()) {
             None => st.inner.capacity_remaining(recid),
             Some(s) => {
