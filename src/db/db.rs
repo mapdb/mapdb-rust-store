@@ -349,10 +349,10 @@ where
         // reopen would otherwise build a second lock domain over the same header.
         Self::wake_and_clear_cache(&mut admin);
         // Reload the catalog from the reverted store and revalidate it.
-        let reloaded = match self.store.get(nz(RECID_CATALOG)?, &CATALOG_SER)? {
-            Some(cat) => cat,
-            None => NameCatalog::new(),
-        };
+        let reloaded = self
+            .store
+            .get(nz(RECID_CATALOG)?, &CATALOG_SER)?
+            .unwrap_or_default();
         validate_catalog(&reloaded)?;
         admin.catalog = reloaded;
         Ok(())

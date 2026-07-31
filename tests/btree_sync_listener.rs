@@ -17,7 +17,9 @@ use mapdb_rust_store::btree::BTreeMap;
 use mapdb_rust_store::ser::long::LongFormat;
 use mapdb_rust_store::ser::string_group::StringGroupFormat;
 use mapdb_rust_store::store::{Store, StoreOnHeap};
-use mapdb_rust_store::{DbError, MapModificationListener, Result, SynchronousMapModificationListener};
+use mapdb_rust_store::{
+    DbError, MapModificationListener, Result, SynchronousMapModificationListener,
+};
 
 type Map = BTreeMap<StoreOnHeap, LongFormat, StringGroupFormat>;
 

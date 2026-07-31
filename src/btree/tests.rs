@@ -286,7 +286,7 @@ fn corrupt_directory_zero_child() {
 #[test]
 fn corrupt_empty_non_rightmost_dir() {
     let mut out = DataOutput2::new();
-    out.pack_int(0 << 4 | DIR); // non-right, 0 keys → 0 children
+    out.pack_int(DIR); // non-right, 0 keys → 0 children
     out.pack_long(5);
     assert!(is_corrupt(deser(&out.into_vec())));
 }

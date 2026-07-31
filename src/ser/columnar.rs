@@ -220,6 +220,7 @@ impl ColumnarValueFormat {
         row: usize,
         key: &[Value],
     ) -> Result<Ordering> {
+        #[allow(clippy::needless_range_loop)]
         for c in 0..self.schema.len() {
             input.seek(self.cell_offset(start, size, c, row)?)?;
             let cell = read_cell(input, self.schema[c])?;
@@ -554,8 +555,8 @@ pub struct RowSerializer {
 impl Serializer<Vec<Value>> for RowSerializer {
     fn serialize(&self, out: &mut DataOutput2, value: &Vec<Value>) {
         assert_eq!(value.len(), self.schema.len(), "row arity != schema arity");
-        for c in 0..self.schema.len() {
-            write_cell(out, self.schema[c], &value[c]);
+        for (sch, cell) in self.schema.iter().zip(value) {
+            write_cell(out, *sch, cell);
         }
     }
 

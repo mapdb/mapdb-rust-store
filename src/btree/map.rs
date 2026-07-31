@@ -1334,6 +1334,7 @@ where
     /// captured, the lock released, propagation COMPLETED, and only then is the
     /// listener error returned. A structural propagation error is primary; the
     /// listener error is secondary (dropped).
+    #[allow(clippy::too_many_arguments)]
     fn split_leaf_and_propagate(
         &self,
         mut guard: NodeGuard<'_>,

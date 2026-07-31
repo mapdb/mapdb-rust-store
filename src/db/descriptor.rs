@@ -209,8 +209,7 @@ pub fn is_valid_ser_descriptor(s: &str) -> bool {
                 // Java `CompressionSerializer` (Deflater) only accepts -1..=9;
                 // any other level makes the registry return null → catalog
                 // corruption, so it is NOT a valid descriptor (R8).
-                l.parse::<i32>()
-                    .map_or(false, |lvl| (-1..=9).contains(&lvl))
+                l.parse::<i32>().is_ok_and(|lvl| (-1..=9).contains(&lvl))
                     && b64url_decode(b64)
                         .map(|n| is_valid_ser_descriptor(&n))
                         .unwrap_or(false)
@@ -243,7 +242,7 @@ const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 /// RFC 4648 URL-safe base64 without padding, over UTF-8 (Java
 /// `Base64.getUrlEncoder().withoutPadding()`).
 pub fn b64url_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;

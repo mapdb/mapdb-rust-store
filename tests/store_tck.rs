@@ -65,7 +65,11 @@ struct ReadProbe {
     value: Option<i64>,
 }
 impl RecordRead for ReadProbe {
-    fn on_bytes(&mut self, input: &mut SliceInput<'_>, _size: usize) -> mapdb_rust_store::error::Result<i64> {
+    fn on_bytes(
+        &mut self,
+        input: &mut SliceInput<'_>,
+        _size: usize,
+    ) -> mapdb_rust_store::error::Result<i64> {
         let v = input.read_i64()?;
         self.value = Some(v);
         Ok(v)

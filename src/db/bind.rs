@@ -186,7 +186,7 @@ where
     }
     fn sec_remove_if_value(&self, k: &Kd, v: &Vd) -> Result<()> {
         let mut m = self.0.lock();
-        if m.get(k).map_or(false, |ex| ex == v) {
+        if m.get(k) == Some(v) {
             m.remove(k);
         }
         Ok(())

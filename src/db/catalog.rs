@@ -69,7 +69,7 @@ fn read_bounded_string(input: &mut dyn DataInput2, end: usize) -> Result<String>
         .try_into()
         .map_err(|_| DbError::corrupt("catalog string length overflow"))?;
     // The bytes must not cross the record end.
-    if input.pos().checked_add(len).map_or(true, |p| p > end) {
+    if input.pos().checked_add(len).is_none_or(|p| p > end) {
         return Err(DbError::corrupt("catalog string crosses record end"));
     }
     let mut b = Vec::new();
@@ -315,7 +315,7 @@ mod tests {
     fn rejects_overlong_packed_count() {
         // header + 11 continuation bytes (high bit clear) with no terminator.
         let mut bytes = vec![0x4D, 0x44, 0x42, 0x43, 0x00, 0x00, 0x00, 0x01, 0x00];
-        bytes.extend(std::iter::repeat(0x00).take(11));
+        bytes.extend(std::iter::repeat_n(0x00, 11));
         assert!(matches!(decode(&bytes), Err(DbError::DataCorruption(_))));
     }
 
@@ -325,7 +325,7 @@ mod tests {
         // on the terminal 10th position path. Build 9 zero-continuation + terminal.
         let mut bytes = vec![0x4D, 0x44, 0x42, 0x43, 0x00, 0x00, 0x00, 0x01, 0x00];
         // 0x7F * 9 continuation then a terminal byte -> way over 64 bits.
-        bytes.extend(std::iter::repeat(0x7F).take(9));
+        bytes.extend(std::iter::repeat_n(0x7F, 9));
         bytes.push(0xFF); // terminal, high bit set, value bits set
         assert!(matches!(decode(&bytes), Err(DbError::DataCorruption(_))));
     }
@@ -334,7 +334,7 @@ mod tests {
     fn rejects_unterminated_string_length() {
         // count 1, then an unterminated packed key length (high bit never set).
         let mut bytes = vec![0x4D, 0x44, 0x42, 0x43, 0x00, 0x00, 0x00, 0x01, 0x00, 0x81];
-        bytes.extend(std::iter::repeat(0x00).take(11));
+        bytes.extend(std::iter::repeat_n(0x00, 11));
         assert!(matches!(decode(&bytes), Err(DbError::DataCorruption(_))));
     }
 
@@ -355,7 +355,7 @@ mod tests {
         // as overflow (R2).
         let mut bytes = vec![0x4D, 0x44, 0x42, 0x43, 0x00, 0x00, 0x00, 0x01, 0x00];
         bytes.push(0x02);
-        bytes.extend(std::iter::repeat(0x00).take(8));
+        bytes.extend(std::iter::repeat_n(0x00, 8));
         bytes.push(0x80);
         assert!(matches!(decode(&bytes), Err(DbError::DataCorruption(_))));
     }

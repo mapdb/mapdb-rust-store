@@ -147,6 +147,7 @@ impl Volume {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(path)?;
         Ok(Volume {
             slices: ArcSwap::from_pointee(Vec::new()),

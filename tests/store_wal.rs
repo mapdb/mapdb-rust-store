@@ -13,7 +13,7 @@ use mapdb_rust_store::store::{Store, StoreDelta, StoreTx, StoreWAL};
 use std::cmp::Ordering;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
 
 const L: LongSer = LongSer;
@@ -65,8 +65,8 @@ fn tmp() -> PathBuf {
     p
 }
 
-fn ckpt_of(p: &PathBuf) -> PathBuf {
-    let mut c = p.clone().into_os_string();
+fn ckpt_of(p: &Path) -> PathBuf {
+    let mut c = p.to_path_buf().into_os_string();
     c.push(".ckpt");
     PathBuf::from(c)
 }

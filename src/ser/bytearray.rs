@@ -41,7 +41,7 @@ fn elem_off(base: usize, idx: usize, width: usize) -> Result<usize> {
 /// `ceil(count / K)` restart count, overflow-free (untrusted `count`).
 #[inline]
 fn n_restarts(count: usize) -> usize {
-    count / RESTART_INTERVAL + (count % RESTART_INTERVAL != 0) as usize
+    count / RESTART_INTERVAL + !count.is_multiple_of(RESTART_INTERVAL) as usize
 }
 
 /// Unsigned binary search over a materialized group (`Arrays.compareUnsigned`).
@@ -453,7 +453,7 @@ impl GroupFormat for ByteArrayPrefixFormat {
 
     fn serialize(&self, out: &mut DataOutput2, g: &Vec<Vec<u8>>) {
         let n = g.len();
-        let n_rest = (n + RESTART_INTERVAL - 1) / RESTART_INTERVAL;
+        let n_rest = n.div_ceil(RESTART_INTERVAL);
         let mut rest_off = vec![0i32; n_rest];
         let mut blob = DataOutput2::with_capacity((n * 8).max(16));
         let mut prev: &[u8] = &[];

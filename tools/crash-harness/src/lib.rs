@@ -107,7 +107,7 @@ pub struct Config {
 pub fn key_bytes(i: u32) -> Vec<u8> {
     let mut k = format!("k{i:05}").into_bytes();
     let filler = (i as usize * 7) % 24;
-    k.extend(std::iter::repeat(b'x').take(filler));
+    k.extend(std::iter::repeat_n(b'x', filler));
     k
 }
 
@@ -140,7 +140,7 @@ pub fn value_bytes(seed: u64, v: ValueId) -> Vec<u8> {
 const SIZE_CLASSES: [u32; 6] = [64, 1000, 8 * 1024, 8 * 1024 + 1, 40_000, 100_000];
 
 fn value_len(rng: &mut SplitMix64, seq: u64, op_idx: u32) -> u32 {
-    if seq % 8 == 0 && op_idx == 0 {
+    if seq.is_multiple_of(8) && op_idx == 0 {
         262_144 + (rng.next_u64() % 786_432) as u32 // 256 KiB ..< 1 MiB
     } else {
         SIZE_CLASSES[((seq as usize).wrapping_mul(31) + op_idx as usize) % SIZE_CLASSES.len()]

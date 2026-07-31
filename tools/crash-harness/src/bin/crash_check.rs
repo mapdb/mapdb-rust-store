@@ -33,13 +33,15 @@
 //! at the witness cutoff — NOT proof the cut landed inside compaction (the
 //! process may die before the `M done` sync).
 
-use mapdb_rust_store_crash_harness::{self as ch, Config, Model, Record, COMMITTED_SEQ_KEY, RUN_ID_KEY};
 use mapdb_rust_store::db::DB;
 use mapdb_rust_store::ser::bytearray::ByteArrayFormat;
 use mapdb_rust_store::store::{Store, StoreWAL};
+use mapdb_rust_store_crash_harness::{
+    self as ch, Config, Model, Record, COMMITTED_SEQ_KEY, RUN_ID_KEY,
+};
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct Fail {
     reason: &'static str,
@@ -104,13 +106,13 @@ fn validate_group_protocol(records: &[Record], group: u64) -> Result<(), Fail> {
             }
             // Maintenance runs between acknowledged groups — never with a group
             // in flight (the workload acks a group before generating the next).
-            Record::Maint { .. } => {
-                if max_intent != max_ack {
-                    return Err(fail(
-                        "group-maint-order",
-                        format!("maintenance with an in-flight group (intent {max_intent} > ack {max_ack})"),
-                    ));
-                }
+            Record::Maint { .. } if max_intent != max_ack => {
+                return Err(fail(
+                    "group-maint-order",
+                    format!(
+                        "maintenance with an in-flight group (intent {max_intent} > ack {max_ack})"
+                    ),
+                ));
             }
             _ => {}
         }
@@ -213,7 +215,7 @@ fn expected_bytes(model: &Model, cfg: &Config, g: u64) -> BTreeMap<Vec<u8>, Vec<
 
 fn check(
     backend: &str,
-    store: &PathBuf,
+    store: &Path,
     journal: &PathBuf,
     min_ack: u64,
 ) -> Result<(JournalView, u64, u64), Fail> {

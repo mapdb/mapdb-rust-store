@@ -42,18 +42,18 @@
 //! and create the `<journal>.ready` sentinel the harness scripts wait for. A cut
 //! before readiness fails the round rather than passing vacuously.
 
+use mapdb_rust_store::db::DB;
+use mapdb_rust_store::ser::bytearray::ByteArrayFormat;
 use mapdb_rust_store_crash_harness::{
     self as ch, Config, GenOp, MaintKind, Model, Record, COMMITTED_SEQ_KEY, RUN_ID_KEY,
 };
-use mapdb_rust_store::db::DB;
-use mapdb_rust_store::ser::bytearray::ByteArrayFormat;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Maintenance cadence in durable groups: compact (WAL checkpoint) at group 2,
-/// then every 6th group — early enough that the readiness threshold (>=3 groups,
-/// >=1 compaction) is met by group 3, and often enough to keep exercising the
+/// then every 6th group — early enough that the readiness threshold (>=3
+/// groups, >=1 compaction) is met by group 3, and often enough to keep exercising the
 /// log-truncation replay path over a long run.
 const COMPACT_EVERY: u64 = 6;
 

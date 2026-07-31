@@ -211,10 +211,13 @@ fn counter_concurrent_insert_then_remove_to_empty() {
 
 type Event = (i64, Option<i64>, Option<i64>);
 
+#[allow(clippy::type_complexity)]
 fn record_listener(
     sink: Arc<Mutex<Vec<Event>>>,
 ) -> Arc<
-    FnListener<impl Fn(&i64, Option<&i64>, Option<&i64>, bool) -> mapdb_rust_store::Result<()> + Send + Sync>,
+    FnListener<
+        impl Fn(&i64, Option<&i64>, Option<&i64>, bool) -> mapdb_rust_store::Result<()> + Send + Sync,
+    >,
 > {
     Arc::new(FnListener(
         move |k: &i64, o: Option<&i64>, n: Option<&i64>, _t: bool| {

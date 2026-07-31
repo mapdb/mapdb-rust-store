@@ -382,7 +382,7 @@ impl StoreDirect {
 
     /// structural_lock held. `cap_bytes` 16-aligned within [16, MAX_CAPACITY].
     fn allocate_data_locked(&self, cap_bytes: usize, recursive: bool) -> Result<u64> {
-        debug_assert!(cap_bytes & 15 == 0 && cap_bytes >= 16 && cap_bytes <= iv::MAX_CAPACITY);
+        debug_assert!(cap_bytes & 15 == 0 && (16..=iv::MAX_CAPACITY).contains(&cap_bytes));
         if !recursive {
             let v = self.long_stack_take(master_link_offset(cap_bytes as u64 / 16))?;
             if v != 0 {
@@ -517,7 +517,7 @@ impl StoreDirect {
         self.check_stack_chunk_off(chunk_offset)?;
         let hdr = parity::p4get(self.vol.get_u64(chunk_offset))?;
         let chunk_size = hdr >> 48;
-        if chunk_size < 16 || chunk_size > LONG_STACK_MAX_SIZE || chunk_size & 15 != 0 {
+        if !(16..=LONG_STACK_MAX_SIZE).contains(&chunk_size) || chunk_size & 15 != 0 {
             return Err(DbError::corrupt("bad long stack chunk size"));
         }
         self.vol.check_range(chunk_offset, chunk_size)?;
@@ -693,7 +693,7 @@ impl StoreDirect {
             }
             cap_units = next >> 48;
             off = next & iv::MOFFSET;
-            if cap_units < 1 || cap_units > MAX_CAP_UNITS || off < PAGE_SIZE {
+            if !(1..=MAX_CAP_UNITS).contains(&cap_units) || off < PAGE_SIZE {
                 return Err(DbError::corrupt("bad linked chunk pointer"));
             }
         }
@@ -1355,14 +1355,14 @@ fn iv_parity_ok(ivval: u64) -> bool {
 /// `file_tail` known to be page-aligned and >= PAGE_SIZE.
 fn data_tail_geometry_ok(data_tail: u64, file_tail: u64) -> bool {
     data_tail == 0
-        || (data_tail % 16 == 0
-            && data_tail % PAGE_SIZE != 0
+        || (data_tail.is_multiple_of(16)
+            && !data_tail.is_multiple_of(PAGE_SIZE)
             && data_tail >= PAGE_SIZE
             && data_tail < file_tail)
 }
 
 fn master_link_offset(cap_units: u64) -> u64 {
-    debug_assert!(cap_units >= 1 && cap_units <= MAX_CAP_UNITS);
+    debug_assert!((1..=MAX_CAP_UNITS).contains(&cap_units));
     O_FREE_DATA_STACKS + 8 * (cap_units - 1)
 }
 
@@ -1584,7 +1584,7 @@ impl Store for StoreDirect {
             Err(e) => {
                 self.poisoned.store(true, Ordering::Release);
                 self.closed.store(true, Ordering::Release);
-                let _ = self.vol.put_i32(O_HEAD_CHECKSUM, !self.head_checksum());
+                self.vol.put_i32(O_HEAD_CHECKSUM, !self.head_checksum());
                 let _ = self.vol.sync();
                 Err(e)
             }

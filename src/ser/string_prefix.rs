@@ -44,7 +44,7 @@ fn elem_off(base: usize, idx: usize, width: usize) -> Result<usize> {
 /// `ceil(count / K)` restart count, overflow-free (untrusted `count`).
 #[inline]
 fn n_restarts(count: usize) -> usize {
-    count / RESTART_INTERVAL + (count % RESTART_INTERVAL != 0) as usize
+    count / RESTART_INTERVAL + !count.is_multiple_of(RESTART_INTERVAL) as usize
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -194,7 +194,7 @@ impl GroupFormat for StringPrefixFormat {
 
     fn serialize(&self, out: &mut DataOutput2, g: &Vec<String>) {
         let n = g.len();
-        let nrest = (n + RESTART_INTERVAL - 1) / RESTART_INTERVAL;
+        let nrest = n.div_ceil(RESTART_INTERVAL);
         let mut rest_off = vec![0i32; nrest];
         let mut blob = DataOutput2::with_capacity((n * 8).max(16));
         for i in 0..n {

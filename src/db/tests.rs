@@ -929,6 +929,7 @@ fn plain_tree_map_reopens_without_counter() {
 #[test]
 fn modification_listener_captures_insert_update_remove() {
     let db = DBMaker::memory_db().make().unwrap();
+    #[allow(clippy::type_complexity)]
     let events: Arc<Mutex<Vec<(i64, Option<String>, Option<String>)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let ev = events.clone();

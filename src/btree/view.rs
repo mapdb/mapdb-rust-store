@@ -44,6 +44,7 @@ pub trait OrderedMapAdapter {
     fn replace_if(&self, k: &Self::Key, ov: &Self::Val, nv: Self::Val) -> Result<bool>;
 
     /// Ascending entries within `[lo,hi]` honoring inclusivity; `None` = open.
+    #[allow(clippy::type_complexity)]
     fn entry_iter_range<'a>(
         &'a self,
         lo: Option<Self::Key>,
@@ -53,6 +54,7 @@ pub trait OrderedMapAdapter {
     ) -> Result<Box<dyn Iterator<Item = Result<(Self::Key, Self::Val)>> + 'a>>;
 
     /// Descending entries within `[lo,hi]`; weakly consistent, same as ascending.
+    #[allow(clippy::type_complexity)]
     fn descending_entry_iter_range<'a>(
         &'a self,
         lo: Option<Self::Key>,

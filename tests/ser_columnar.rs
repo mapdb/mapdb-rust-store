@@ -264,7 +264,7 @@ fn column_cursor_reads_only_its_column() {
         .map(|i| {
             vec![
                 Value::Long(1000 + i as i64),
-                Value::Int(-(i as i32)),
+                Value::Int(-i),
                 Value::Short((i * 7) as i16),
             ]
         })

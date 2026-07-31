@@ -114,10 +114,8 @@ pub fn compare_utf8(
                     return Err(DbError::corrupt("corrupt utf8 overlong or surrogate"));
                 }
             }
-            3 => {
-                if !(0x10000..=0x10FFFF).contains(&cp) {
-                    return Err(DbError::corrupt("corrupt utf8 overlong or out-of-range"));
-                }
+            3 if !(0x10000..=0x10FFFF).contains(&cp) => {
+                return Err(DbError::corrupt("corrupt utf8 overlong or out-of-range"));
             }
             _ => {}
         }

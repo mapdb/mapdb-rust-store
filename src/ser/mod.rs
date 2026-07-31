@@ -173,6 +173,7 @@ pub trait GroupFormat {
     fn set(&self, g: &Self::Group, pos: usize, value: Self::Elem) -> Self::Group;
     fn delete(&self, g: &Self::Group, pos: usize) -> Self::Group;
     fn copy_range(&self, g: &Self::Group, from: usize, to: usize) -> Self::Group;
+    #[allow(clippy::wrong_self_convention)]
     fn from_slice(&self, values: &[Self::Elem]) -> Self::Group;
 
     // ---- wire ----
