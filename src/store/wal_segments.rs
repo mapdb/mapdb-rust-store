@@ -39,10 +39,13 @@
 #![allow(dead_code)]
 
 use crate::error::{DbError, Result};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// magic(8) + version(4) + flags(4) + segmentSeq(8) + firstLsn(8) + headerCrc(4).
 pub(crate) const SEG_HDR: u64 = 36;
@@ -138,8 +141,16 @@ impl Segment {
         }
     }
 
-    /// The file handle, opening it if this segment does not currently hold one.
-    pub(crate) fn file(&mut self) -> Result<&File> {
+    /// Opens this segment's file if it does not already hold one. Idempotent.
+    ///
+    /// Deliberately split from [`file`](Self::file): a single
+    /// `file(&mut self) -> Result<&File>` keeps an EXCLUSIVE borrow of the
+    /// segment alive for as long as the caller holds the handle, so it cannot
+    /// read a section and then feed [`crc_domain`](Self::crc_domain) or update
+    /// `valid_end`/`last_lsn` from the same segment — which is precisely what a
+    /// recovery pass does, per section, for every section. `ensure_open` ends
+    /// its borrow at the semicolon and `file` then borrows shared.
+    pub(crate) fn ensure_open(&mut self) -> Result<()> {
         if self.file.is_none() {
             let f = if self.read_only {
                 OpenOptions::new().read(true).open(&self.path)?
@@ -148,6 +159,19 @@ impl Segment {
             };
             self.file = Some(f);
         }
+        Ok(())
+    }
+
+    /// The handle, or `None` when [`ensure_open`](Self::ensure_open) has not run
+    /// since the last [`release`](Self::release).
+    pub(crate) fn file(&self) -> Option<&File> {
+        self.file.as_ref()
+    }
+
+    /// `ensure_open` followed by `file`, for the call sites that want one
+    /// expression and do not need to touch the segment while reading.
+    pub(crate) fn open_file(&mut self) -> Result<&File> {
+        self.ensure_open()?;
         Ok(self.file.as_ref().expect("just opened"))
     }
 
@@ -214,7 +238,12 @@ enum HeaderVerdict {
 pub(crate) struct WalSegmentSet {
     base: PathBuf,
     dir: PathBuf,
-    prefix: String,
+    /// `<base file name>.wal.` as **native bytes**. Never a `String`: a Unix
+    /// path is a byte string, and requiring UTF-8 here would make a perfectly
+    /// legal namespace unopenable in this port alone (Java derives the prefix
+    /// from `File.getName()` with no such requirement, and defines acceptance by
+    /// an ASCII suffix and file type — `WalSegmentSet.java:199-207, 279-311`).
+    prefix: OsString,
     read_only: bool,
     /// Ascending by sequence number.
     segments: Vec<Segment>,
@@ -229,9 +258,23 @@ pub(crate) struct WalSegmentSet {
     /// sections at the minimum segment size.
     sealed_bytes: u64,
     /// The store lock. Held for as long as this handle is open — dropping the
-    /// `File` closes the descriptor, which releases the `flock`. `None` only in
-    /// the read-only-medium case (see [`take_store_lock`](Self::take_store_lock)).
+    /// `File` closes the descriptor, which releases the OFD lock taken on it.
+    /// `None` only in the read-only-medium case
+    /// (see [`take_store_lock`](Self::take_store_lock)).
     lock: Option<File>,
+    /// The in-process half of the same lock; released after `lock`.
+    process_claim: Option<ProcessClaim>,
+    /// True once [`close`](Self::close) has run: the namespace mutations must
+    /// not run without the lock this handle no longer holds.
+    closed: bool,
+    /// Test-only durability observation, per set. Java exposes the same points
+    /// through its event seam; a byte comparison of a SUCCESSFUL create cannot
+    /// tell a missing fsync from a present one, and the no-op `unlink_through`
+    /// must be shown not to fsync at all.
+    #[cfg(test)]
+    dir_fsyncs: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    segment_syncs: std::sync::atomic::AtomicU64,
 }
 
 impl WalSegmentSet {
@@ -254,10 +297,11 @@ impl WalSegmentSet {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let name = abs.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        let name = abs.file_name().ok_or_else(|| {
             DbError::wrong_config(format!("WAL base path has no file name: {}", abs.display()))
         })?;
-        let prefix = format!("{name}.wal.");
+        let mut prefix = name.to_os_string();
+        prefix.push(".wal.");
 
         let mut set = WalSegmentSet {
             base: abs,
@@ -268,6 +312,12 @@ impl WalSegmentSet {
             next_seq: FIRST_SEQ,
             sealed_bytes: 0,
             lock: None,
+            process_claim: None,
+            closed: false,
+            #[cfg(test)]
+            dir_fsyncs: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            segment_syncs: std::sync::atomic::AtomicU64::new(0),
         };
         // Every early return from here drops `set`, which drops the lock handle
         // and so releases the store lock — Java's `finally { closeQuietly() }`.
@@ -293,12 +343,35 @@ impl WalSegmentSet {
     /// Recovery unlinks, truncates and rotates, and two concurrent opens would
     /// also pick the same next sequence number. v1 took no lock; this is new.
     ///
-    /// The primitive is `flock`, not POSIX record locks: record locks are owned
-    /// by the *process*, so a second open in the same process would silently
-    /// succeed by upgrading the first one's lock, while Java refuses that case
-    /// (`OverlappingFileLockException`). `flock` is owned by the open file
-    /// description, so two handles in one process exclude each other exactly as
-    /// two processes do — the behaviour Java's refusal describes.
+    /// The lock has **two halves**, because Java's has two halves and neither
+    /// one alone reproduces it:
+    ///
+    /// 1. An **OFD record lock** (`fcntl(F_OFD_SETLK)`) on `<base>.lock`.
+    ///    Not `flock`: BSD locks and POSIX record locks are independent lock
+    ///    classes on Linux, so a `flock` here would not exclude — at all — a
+    ///    Java process holding the same store through `FileChannel.tryLock`,
+    ///    which is a record lock (`WalSegmentSet.java:267-274`). Uniformity
+    ///    across implementations is the ruling this port exists to serve, and a
+    ///    lock that only excludes its own language is not one. Measured against
+    ///    a live JVM holder rather than assumed: `flock` acquires straight
+    ///    through Java's lock, `F_OFD_SETLK` is refused by it and acquires as
+    ///    soon as Java releases. OFD (rather than plain `F_SETLK`) because
+    ///    ownership is the open file description, not the process: a second open
+    ///    in one process is refused instead of silently upgrading the first
+    ///    one's lock, and closing any other descriptor on the file cannot drop
+    ///    this lock.
+    /// 2. A **process-local claim** keyed by the lock file's `(device, inode)`.
+    ///    Java holds its locks in a JVM-wide table and refuses ANY overlapping
+    ///    second lock in the same JVM — `OverlappingFileLockException` does not
+    ///    consider lock MODE, so even two read-only opens of one store are
+    ///    refused (verified against the JVM, not merely read off the javadoc).
+    ///    No kernel lock can express that: two OFD read locks are compatible by
+    ///    construction, which is the entire point of a read lock. So the port
+    ///    keeps the table Java keeps.
+    ///
+    /// The two halves are released in the reverse order they are taken (the
+    /// file, then the claim), so no window exists in which this process has
+    /// forgotten the store while the kernel still holds its lock.
     fn take_store_lock(&mut self) -> Result<()> {
         let lock_path = with_suffix(&self.base, ".lock");
         let handle = if self.read_only {
@@ -327,9 +400,15 @@ impl WalSegmentSet {
                         // is not a fallback to lockless at all.
                         File::open(&lock_path)?
                     } else if !is_writable_dir(&self.dir) {
-                        // Positively a read-only medium: no writer can create
-                        // the lock file or a segment, so there is nothing to be
-                        // excluded by and nothing to exclude.
+                        // Java's read-only-medium branch, and Java's exact
+                        // heuristic: `access(W_OK)` answers for THIS process's
+                        // credentials. It is evidence that no writer can create
+                        // the lock file, not proof — another uid, or root, still
+                        // can. The behaviour is frozen by the reference (see
+                        // `WalSegmentSet.java:248-255`, whose comment claims
+                        // more than the check delivers); tightening it to a real
+                        // `ST_RDONLY` mount test would change the set of stores
+                        // that open, so it is an owner decision, not a port one.
                         return Ok(());
                     } else {
                         return Err(DbError::Locked(format!(
@@ -348,14 +427,26 @@ impl WalSegmentSet {
                 .truncate(false)
                 .open(&lock_path)?
         };
-        if !try_flock(&handle, !self.read_only)? {
+        // Identity of the LOCK FILE, not of the path used to reach it: two opens
+        // naming the same store through different paths (a symlinked directory,
+        // a bind mount, `./db` vs `db`) must collide, and Java's lock table is
+        // likewise keyed by file identity rather than by pathname.
+        let md = handle.metadata()?;
+        // Dropped on every error path below, which is what releases the claim.
+        let claim = ProcessClaim::take((md.dev(), md.ino())).ok_or_else(|| {
+            DbError::Locked(format!(
+                "WAL store {} is already open in this process",
+                self.base.display()
+            ))
+        })?;
+        if !try_ofd_lock(&handle, !self.read_only)? {
             return Err(DbError::Locked(format!(
-                "WAL store {} is already open{}",
-                self.base.display(),
-                if self.read_only { " for writing" } else { "" }
+                "WAL store {} is locked by another process",
+                self.base.display()
             )));
         }
         self.lock = Some(handle);
+        self.process_claim = Some(claim);
         Ok(())
     }
 
@@ -378,12 +469,10 @@ impl WalSegmentSet {
             Err(_) => return found,
         };
         for entry in entries.flatten() {
+            // Matched as BYTES: a name is not required to be UTF-8 to be a
+            // segment, and neither is the base path it hangs off.
             let name = entry.file_name();
-            let name = match name.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-            let hex = match name.strip_prefix(&self.prefix) {
+            let hex = match name.as_bytes().strip_prefix(self.prefix.as_bytes()) {
                 Some(h) => h,
                 None => continue,
             };
@@ -394,11 +483,13 @@ impl WalSegmentSet {
             // even on a case-insensitive filesystem; a value >= 2^63 (negative
             // as i64) is not a segment.
             if !hex
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                .iter()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
             {
                 continue;
             }
+            // Sixteen ASCII hex digits: UTF-8 by construction.
+            let hex = std::str::from_utf8(hex).expect("ascii hex");
             let seq = match u64::from_str_radix(hex, 16) {
                 Ok(v) if v <= i64::MAX as u64 => v as i64,
                 _ => continue,
@@ -416,7 +507,9 @@ impl WalSegmentSet {
     }
 
     pub(crate) fn segment_file(&self, seq: i64) -> PathBuf {
-        self.dir.join(format!("{}{:016x}", self.prefix, seq))
+        let mut name = self.prefix.clone();
+        name.push(format!("{seq:016x}"));
+        self.dir.join(name)
     }
 
     // ---------- R1/R2: classify, remove residue ----------
@@ -433,9 +526,11 @@ impl WalSegmentSet {
     /// creation completed once.
     fn classify(&mut self, found: &[i64]) -> Result<()> {
         let max_observed = found.iter().copied().max().unwrap_or(0);
-        self.next_seq = max_observed
-            .checked_add(1)
-            .ok_or_else(|| DbError::corrupt_msg("WAL segment sequence overflow"))?;
+        // A namespace that has run out of sequence numbers is exhausted, not
+        // damaged: every byte on disk is intact and readable, there is simply no
+        // name left to create. `StoreFull` is the capacity ceiling; Java throws
+        // a plain `DBException` here (`WalSegmentSet.java:329-334`).
+        self.next_seq = max_observed.checked_add(1).ok_or(DbError::StoreFull)?;
 
         let highest = found.last().copied();
         let mut residue: Vec<i64> = Vec::new();
@@ -506,18 +601,28 @@ impl WalSegmentSet {
     /// it; without the size-persisting force the header itself can be lost.
     /// Returns the new active segment, appended to the set.
     pub(crate) fn create_segment(&mut self, first_lsn: i64) -> Result<&mut Segment> {
+        if self.closed {
+            return Err(DbError::StoreClosed);
+        }
+        // Java throws a plain `DBException` for all three of these; the port
+        // picks the nearest non-corruption variants, because NOTHING on disk is
+        // damaged in any of them and a caller that treats the store as corrupt
+        // would be reacting to its own bug. (`WalSegmentSet.java:435-441`.)
         if self.read_only {
             return Err(DbError::ReadOnly);
         }
         if first_lsn <= 0 {
-            return Err(DbError::corrupt_msg(format!(
+            return Err(DbError::wrong_config(format!(
                 "segment firstLsn must be positive: {first_lsn}"
             )));
         }
         let seq = self.next_seq;
-        self.next_seq = seq
-            .checked_add(1)
-            .ok_or_else(|| DbError::corrupt_msg("WAL segment sequence overflow"))?;
+        // The name is burned here, BEFORE any I/O (W6) — a failed create must
+        // never hand its sequence number to the next one. On overflow Java wraps
+        // `nextSeq` negative and only then throws, leaving a store that would
+        // answer the next create with a negative name; the checked assignment
+        // leaves the counter where it was, so the refusal simply repeats.
+        self.next_seq = seq.checked_add(1).ok_or(DbError::StoreFull)?;
         let path = self.segment_file(seq);
         let hdr = build_header(seq, first_lsn);
 
@@ -530,6 +635,9 @@ impl WalSegmentSet {
             file.write_all_at(&hdr, 0)?;
             // The file's SIZE is part of the payload here: never sync_data.
             file.sync_all()?;
+            #[cfg(test)]
+            self.segment_syncs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.fsync_dir()
         })();
         if let Err(e) = created {
@@ -560,6 +668,9 @@ impl WalSegmentSet {
     /// removals persist before the fsync, so an interior gap is a legitimate
     /// crash image (N3/K9).
     pub(crate) fn unlink_through(&mut self, through_seq: i64) -> Result<()> {
+        if self.closed {
+            return Err(DbError::StoreClosed);
+        }
         if self.read_only || through_seq <= 0 {
             return Ok(());
         }
@@ -596,7 +707,24 @@ impl WalSegmentSet {
 
     pub(crate) fn fsync_dir(&self) -> Result<()> {
         File::open(&self.dir)?.sync_all()?;
+        #[cfg(test)]
+        self.dir_fsyncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Directory fsyncs performed by this set so far.
+    #[cfg(test)]
+    pub(crate) fn dir_fsyncs(&self) -> u64 {
+        self.dir_fsyncs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Full segment-file syncs (`sync_all`, never `sync_data`) performed by
+    /// this set so far.
+    #[cfg(test)]
+    pub(crate) fn segment_syncs(&self) -> u64 {
+        self.segment_syncs
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn recompute_sealed_bytes(&mut self) {
@@ -660,12 +788,20 @@ impl WalSegmentSet {
         self.segments.iter().map(|s| s.file_len).sum()
     }
 
-    /// Releases every segment handle and then the store lock, in that order.
-    /// `Drop` does the same; this exists for the call sites that must observe
-    /// the release point (D2's lock-owning namespace cleanup, slice A2).
+    /// Releases every segment handle, then the store lock file, then this
+    /// process's claim on the namespace — in that order. `Drop` does the same;
+    /// this exists for the call sites that must observe the release point (D2's
+    /// lock-owning namespace cleanup, slice A2).
+    ///
+    /// The set stays alive but is **closed**: the namespace mutations refuse
+    /// from here on, because they would otherwise run without the lock that
+    /// makes them safe. D2's cleanup must therefore delete while the set is
+    /// still open and call this last.
     pub(crate) fn close(&mut self) {
         self.segments.clear();
         self.lock = None;
+        self.process_claim = None;
+        self.closed = true;
     }
 }
 
@@ -749,11 +885,13 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The file name for a DIAGNOSTIC. Lossy on purpose: a non-UTF-8 name must
+/// still appear in the message that names it, and a message is never a key.
 fn file_name(path: &Path) -> String {
     path.file_name()
-        .and_then(|n| n.to_str())
         .unwrap_or_default()
-        .to_string()
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Regular file, symlinks NOT followed — the N4/N6 discipline.
@@ -771,37 +909,102 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-/// `flock(LOCK_EX|LOCK_NB)` / `flock(LOCK_SH|LOCK_NB)`. `Ok(false)` means the
-/// lock is held by someone else; a real error propagates.
-fn try_flock(file: &File, exclusive: bool) -> Result<bool> {
-    let op = if exclusive {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_SH
-    } | libc::LOCK_NB;
-    // SAFETY: `fd` is a live descriptor owned by `file` for the duration of the
-    // call, and `flock` touches no memory.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(e) if e == libc::EWOULDBLOCK || e == libc::EAGAIN || e == libc::EINTR => Ok(false),
-        _ => Err(DbError::Io(err)),
+/// The `(device, inode)` of every store lock this process currently holds —
+/// the port's copy of the JVM-wide lock table Java's `tryLock` consults (see
+/// [`take_store_lock`](WalSegmentSet::take_store_lock) for why a kernel lock
+/// cannot stand in for it).
+static OPEN_STORES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Membership in [`OPEN_STORES`], released on drop — including on an unwind,
+/// which is one thing Java's table cannot promise about a partially-constructed
+/// `WalSegmentSet`.
+struct ProcessClaim {
+    key: (u64, u64),
+}
+
+impl ProcessClaim {
+    /// `None` when this process already holds that store, whatever the mode of
+    /// either open.
+    fn take(key: (u64, u64)) -> Option<ProcessClaim> {
+        // A poisoned mutex here would mean a panic inside these few lines; the
+        // table's invariant does not depend on the panicking thread, so recover
+        // rather than turn every later open into a panic.
+        let mut held = OPEN_STORES.lock().unwrap_or_else(|e| e.into_inner());
+        if held.contains(&key) {
+            return None;
+        }
+        held.push(key);
+        Some(ProcessClaim { key })
     }
 }
 
-/// `access(dir, W_OK)` — effective writability, which `std` cannot express
-/// (`Permissions::readonly` reports the owner mode bit, not whether THIS process
-/// may create a file). Only used to establish the positive "read-only medium"
-/// proof of the read-only lock path.
+impl Drop for ProcessClaim {
+    fn drop(&mut self) {
+        let mut held = OPEN_STORES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = held.iter().position(|k| *k == self.key) {
+            held.swap_remove(i);
+        }
+    }
+}
+
+/// A non-blocking whole-file OFD record lock, `F_WRLCK` or `F_RDLCK`.
+/// `Ok(false)` means another owner holds a conflicting lock; a real error
+/// propagates.
+fn try_ofd_lock(file: &File, exclusive: bool) -> Result<bool> {
+    // SAFETY: `flock` is a plain C struct of integers; an all-zero value is a
+    // valid one, and every field this call reads is set below.
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = if exclusive {
+        libc::F_WRLCK
+    } else {
+        libc::F_RDLCK
+    } as libc::c_short;
+    fl.l_whence = libc::SEEK_SET as libc::c_short;
+    fl.l_start = 0;
+    // 0 means "to end of file, however the file grows" — Java's
+    // `tryLock(0, Long.MAX_VALUE, shared)` covers the same whole-file range.
+    fl.l_len = 0;
+    loop {
+        // SAFETY: `fd` is a live descriptor owned by `file` for the duration of
+        // the call, and `fl` is a fully-initialised `flock` that outlives it.
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &fl) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // The documented "another owner holds it" answers. (EAGAIN and
+            // EWOULDBLOCK are the same value on Linux; both are named because
+            // POSIX permits either.)
+            Some(e) if e == libc::EACCES || e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
+                return Ok(false)
+            }
+            // An interrupted syscall says NOTHING about another owner. Reporting
+            // it as contention would refuse an open that a signal happened to
+            // land on; retry, which is what a non-blocking acquisition can
+            // always safely do.
+            Some(e) if e == libc::EINTR => continue,
+            _ => return Err(DbError::Io(err)),
+        }
+    }
+}
+
+/// `access(dir, W_OK)` — the same probe Java's `Files.isWritable` makes on
+/// Unix, and `std` cannot express it (`Permissions::readonly` reports the owner
+/// mode bit, not whether a file may be created here).
+///
+/// Note what it does NOT prove: it answers for this process's real credentials
+/// only, so a `false` is evidence of a read-only medium rather than proof that
+/// no writer can appear. See the caller.
 fn is_writable_dir(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let mut bytes = dir.as_os_str().as_bytes().to_vec();
-    bytes.push(0);
-    // SAFETY: `bytes` is NUL-terminated and outlives the call.
-    unsafe { libc::access(bytes.as_ptr() as *const libc::c_char, libc::W_OK) == 0 }
+    // An interior NUL cannot name a real directory, and truncating at it would
+    // silently probe a DIFFERENT path. Answer "writable", the conservative side:
+    // it leads to the fail-closed refusal rather than to a lockless open.
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: `c` is NUL-terminated and outlives the call.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
 }
 
 #[cfg(test)]
@@ -847,6 +1050,28 @@ mod tests {
         build_header(seq, first_lsn).to_vec()
     }
 
+    /// Every shape of table H's torn-create class, for a segment named `seq`:
+    /// H1 empty, H2 short, H3 CRC mismatch, H4 CRC-valid wrong magic. Shared by
+    /// the highest-name (residue) and below-the-highest (corruption) tests so
+    /// the two cannot drift apart on which shapes they cover.
+    fn torn_shapes(seq: i64) -> Vec<(String, Vec<u8>)> {
+        vec![
+            ("h1".to_string(), Vec::new()),
+            ("h2".to_string(), vec![0u8; 16]),
+            ("h3".to_string(), {
+                let mut h = header_image(seq, 1);
+                h[24] ^= 0x01; // firstLsn edited without resealing
+                h
+            }),
+            ("h4".to_string(), {
+                let mut h = header_image(seq, 1);
+                h[0] = b'X';
+                reseal(&mut h);
+                h
+            }),
+        ]
+    }
+
     /// Recomputes `headerCrc` in place, so a doctored header stays CRC-valid
     /// and reaches the semantic rows H5-H7/H9 instead of H3.
     fn reseal(hdr: &mut [u8]) {
@@ -856,6 +1081,18 @@ mod tests {
 
     fn seq_list(set: &WalSegmentSet) -> Vec<i64> {
         set.segments().iter().map(|s| s.seq).collect()
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// The permission-dependent rungs of the lock ladder prove nothing when the
+    /// test runs as root, which ignores the mode bits they turn on.
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        unsafe { libc::geteuid() == 0 }
     }
 
     fn is_corrupt<T>(r: Result<T>) -> bool {
@@ -949,6 +1186,15 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"unrelated").unwrap();
         std::fs::create_dir(dir.join("store.db.wal.0000000000000009")).unwrap();
 
+        // A SYMLINK at an exact segment name, pointing at a valid segment: the
+        // name matches, the file type does not. `DirEntry::file_type` answers
+        // for the link itself, which is the whole reason it is used.
+        std::os::unix::fs::symlink(
+            seg_path(&base, 1),
+            dir.join("store.db.wal.0000000000000003"),
+        )
+        .unwrap();
+
         let set = WalSegmentSet::open(&base, false).expect("open");
         assert_eq!(
             vec![1, 0x2a],
@@ -957,6 +1203,38 @@ mod tests {
         );
         // W6: nextSeq is one above the highest NAME, not the count.
         assert_eq!(0x2b, set.next_seq());
+        assert!(
+            dir.join("store.db.wal.0000000000000003").exists(),
+            "an ignored entry is ignored, not removed"
+        );
+    }
+
+    /// W6 has no successor to burn: the refusal is explicit, not a wrap into a
+    /// negative name. Java pins the same case
+    /// (`a_sequence_number_at_the_maximum_is_refused_rather_than_wrapping`).
+    #[test]
+    fn a_sequence_number_at_the_maximum_is_refused_rather_than_wrapping() {
+        let dir = scratch("w6-max");
+        let base = base_in(&dir);
+        write_segment(&base, i64::MAX, &header_image(i64::MAX, 1));
+        assert!(matches!(
+            WalSegmentSet::open(&base, false),
+            Err(DbError::StoreFull)
+        ));
+    }
+
+    /// A base path is a byte string, not text: a namespace under a name that is
+    /// not valid UTF-8 is still a namespace.
+    #[test]
+    fn a_base_path_that_is_not_utf8_still_enumerates() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = scratch("nonutf8");
+        let base = dir.join(OsString::from_vec(vec![b'd', b'b', 0xff]));
+        write_segment(&base, 1, &header_image(1, 1));
+        write_segment(&base, 2, &header_image(2, 1));
+        let set = WalSegmentSet::open(&base, false).expect("open");
+        assert_eq!(vec![1, 2], seq_list(&set));
+        assert_eq!(3, set.next_seq());
     }
 
     /// R1. Sequence 0 is reserved for "no clean mark" and is never a segment —
@@ -983,6 +1261,33 @@ mod tests {
         assert!(v1.exists(), "the refusal must not delete the evidence");
     }
 
+    /// N6's accepting side, which is the half a "does `<base>.wal` exist?"
+    /// implementation gets wrong: only a REGULAR file is a v1 log. A directory
+    /// at that name is not one, and neither is a symlink — the same NOFOLLOW
+    /// discipline N4 applies to segment names.
+    #[test]
+    fn only_a_regular_file_at_the_v1_name_refuses_the_open() {
+        let dir = scratch("n6-nonfile");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &header_image(1, 1));
+        let v1 = with_suffix(&base, ".wal");
+
+        std::fs::create_dir(&v1).unwrap();
+        let set = WalSegmentSet::open(&base, false).expect("a directory is not a v1 log");
+        assert_eq!(vec![1], seq_list(&set));
+        drop(set);
+        std::fs::remove_dir(&v1).unwrap();
+
+        std::os::unix::fs::symlink(seg_path(&base, 1), &v1).unwrap();
+        let set = WalSegmentSet::open(&base, false).expect("a symlink is not a v1 log");
+        assert_eq!(vec![1], seq_list(&set));
+        drop(set);
+        assert!(
+            std::fs::symlink_metadata(&v1).is_ok(),
+            "neither is removed by an open that accepted it"
+        );
+    }
+
     // ---------------------------------------------------------------- H: header table
 
     /// H1-H4 on the highest name are create-crash residue: a writable open
@@ -990,27 +1295,13 @@ mod tests {
     /// segment cannot reuse it.
     #[test]
     fn torn_create_residue_on_the_highest_name_is_removed() {
-        for (tag, bytes) in [
-            ("h1", Vec::new()),
-            ("h2", vec![0u8; 16]),
-            ("h3", {
-                let mut h = header_image(2, 1);
-                h[24] ^= 0x01; // firstLsn edited without resealing
-                h
-            }),
-            ("h4", {
-                let mut h = header_image(2, 1);
-                h[0] = b'X';
-                reseal(&mut h);
-                h
-            }),
-        ] {
-            let dir = scratch(tag);
+        for (tag, bytes) in torn_shapes(2) {
+            let dir = scratch(&tag);
             let base = base_in(&dir);
             write_segment(&base, 1, &header_image(1, 1));
             write_segment(&base, 2, &bytes);
 
-            let set = WalSegmentSet::open(&base, false).expect(tag);
+            let set = WalSegmentSet::open(&base, false).expect(&tag);
             assert_eq!(vec![1], seq_list(&set), "{tag}: residue is not in the set");
             assert!(!seg_path(&base, 2).exists(), "{tag}: residue is unlinked");
             assert_eq!(3, set.next_seq(), "{tag}: W6 burnt the residue's number");
@@ -1018,15 +1309,51 @@ mod tests {
     }
 
     /// The same shapes anywhere below the highest name are corruption: a
-    /// segment exists above them, so their create completed once.
+    /// segment exists above them, so their create completed once. Every shape is
+    /// tried, because the highest-only forgiveness is a property of the
+    /// POSITION, and an implementation that special-cased one shape rather than
+    /// the position would survive a single-shape test.
     #[test]
     fn torn_create_shapes_below_the_highest_name_are_corruption() {
-        let dir = scratch("h-low");
+        for (tag, bytes) in torn_shapes(1) {
+            let dir = scratch(&format!("h-low-{tag}"));
+            let base = base_in(&dir);
+            write_segment(&base, 1, &bytes);
+            write_segment(&base, 2, &header_image(2, 1));
+            let msg = corrupt_msg(WalSegmentSet::open(&base, false));
+            assert!(msg.contains("not the highest segment"), "{tag}: {msg}");
+            assert!(
+                seg_path(&base, 1).exists(),
+                "{tag}: corruption deletes nothing"
+            );
+        }
+    }
+
+    /// The header is validated CRC FIRST, semantics second, and the order is
+    /// load-bearing: an unsealed edit to a semantic field is a torn create (the
+    /// bytes never became a header), while the SAME edit resealed is corruption.
+    /// One image differing only in whether the CRC was recomputed.
+    #[test]
+    fn an_unsealed_semantic_edit_is_torn_and_the_resealed_one_is_corruption() {
+        let edit = |h: &mut Vec<u8>| h[8..12].copy_from_slice(&2i32.to_be_bytes());
+
+        let dir = scratch("h-order-torn");
         let base = base_in(&dir);
-        write_segment(&base, 1, &[0u8; 16]);
-        write_segment(&base, 2, &header_image(2, 1));
+        let mut h = header_image(1, 1);
+        edit(&mut h); // NOT resealed: headerCrc no longer matches
+        write_segment(&base, 1, &h);
+        let set = WalSegmentSet::open(&base, false).expect("torn create on the highest name");
+        assert!(set.segments().is_empty());
+        assert!(!seg_path(&base, 1).exists(), "residue is unlinked");
+
+        let dir = scratch("h-order-sealed");
+        let base = base_in(&dir);
+        let mut h = header_image(1, 1);
+        edit(&mut h);
+        reseal(&mut h);
+        write_segment(&base, 1, &h);
         let msg = corrupt_msg(WalSegmentSet::open(&base, false));
-        assert!(msg.contains("not the highest segment"), "{msg}");
+        assert!(msg.contains("unsupported WAL format version 2"), "{msg}");
         assert!(seg_path(&base, 1).exists(), "corruption deletes nothing");
     }
 
@@ -1037,7 +1364,7 @@ mod tests {
     fn resealed_semantic_faults_are_corruption_even_on_the_highest_name() {
         // (tag, the edit that makes the header semantically wrong, expected message)
         type Case = (&'static str, fn(&mut Vec<u8>), &'static str);
-        let cases: [Case; 4] = [
+        let cases: [Case; 5] = [
             (
                 "h5",
                 |h| h[8..12].copy_from_slice(&2i32.to_be_bytes()),
@@ -1054,8 +1381,14 @@ mod tests {
                 "does not match its name",
             ),
             (
-                "h9",
+                "h9-zero",
                 |h| h[24..32].copy_from_slice(&0i64.to_be_bytes()),
+                "is not a valid LSN",
+            ),
+            // A NEGATIVE start, which an `== 0` check would wave through.
+            (
+                "h9-negative",
+                |h| h[24..32].copy_from_slice(&(-1i64).to_be_bytes()),
                 "is not a valid LSN",
             ),
         ];
@@ -1097,14 +1430,42 @@ mod tests {
     /// open to remove.
     #[test]
     fn a_read_only_open_excludes_residue_but_keeps_it() {
-        let dir = scratch("ro-residue");
+        for (tag, bytes) in torn_shapes(2) {
+            let dir = scratch(&format!("ro-residue-{tag}"));
+            let base = base_in(&dir);
+            write_segment(&base, 1, &header_image(1, 1));
+            write_segment(&base, 2, &bytes);
+            let set = WalSegmentSet::open(&base, true).expect(&tag);
+            assert_eq!(vec![1], seq_list(&set), "{tag}");
+            assert!(
+                seg_path(&base, 2).exists(),
+                "{tag}: read-only mutates nothing"
+            );
+            assert_eq!(3, set.next_seq(), "{tag}: W6 still burns the name");
+        }
+    }
+
+    /// The corrupt verdicts are read-only's too: a read-only open is not a
+    /// lenient one, it merely declines to repair.
+    #[test]
+    fn a_read_only_open_reaches_the_same_corrupt_verdicts() {
+        let dir = scratch("ro-corrupt");
         let base = base_in(&dir);
-        write_segment(&base, 1, &header_image(1, 1));
-        write_segment(&base, 2, &[0u8; 16]);
-        let set = WalSegmentSet::open(&base, true).expect("open");
-        assert_eq!(vec![1], seq_list(&set));
-        assert!(seg_path(&base, 2).exists(), "read-only mutates nothing");
-        assert_eq!(3, set.next_seq());
+        let mut h = header_image(1, 1);
+        h[24..32].copy_from_slice(&0i64.to_be_bytes());
+        reseal(&mut h);
+        write_segment(&base, 1, &h);
+        assert!(is_corrupt(WalSegmentSet::open(&base, true)));
+        assert!(seg_path(&base, 1).exists());
+
+        // ...and the below-the-highest torn shape, which read-only must not
+        // forgive merely because it cannot delete it.
+        let dir = scratch("ro-corrupt-low");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &[0u8; 16]);
+        write_segment(&base, 2, &header_image(2, 1));
+        assert!(is_corrupt(WalSegmentSet::open(&base, true)));
+        assert!(seg_path(&base, 1).exists());
     }
 
     // ---------------------------------------------------------------- W2/W5/W6
@@ -1172,6 +1533,152 @@ mod tests {
         assert_eq!(vec![3, 4], seq_list(&set));
     }
 
+    /// A mark can name a sequence that no file ever carried (gaps are legal), and
+    /// it retires everything at or below it — not "up to the next name".
+    #[test]
+    fn unlink_through_a_gap_retires_everything_below_it() {
+        let dir = scratch("w5-gap");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &header_image(1, 1));
+        write_segment(&base, 3, &header_image(3, 1));
+        let mut set = WalSegmentSet::open(&base, false).expect("open");
+        set.unlink_through(2).expect("unlink");
+        assert_eq!(vec![3], seq_list(&set));
+        assert!(!seg_path(&base, 1).exists());
+        assert!(seg_path(&base, 3).exists());
+    }
+
+    /// W5 with NOTHING to do performs no directory fsync — the shape a recovered
+    /// mark takes when an earlier attempt already removed every file it
+    /// authorizes. A "fsync anyway, it is harmless" implementation pays for it on
+    /// every open of every cleaned store.
+    #[test]
+    fn unlink_through_below_the_lowest_name_does_not_fsync() {
+        let dir = scratch("w5-nofsync");
+        let base = base_in(&dir);
+        write_segment(&base, 5, &header_image(5, 1));
+        let mut set = WalSegmentSet::open(&base, false).expect("open");
+        let before = set.dir_fsyncs();
+        set.unlink_through(4).expect("no match");
+        assert_eq!(before, set.dir_fsyncs(), "no match, no fsync");
+        set.unlink_through(5).expect("match");
+        assert_eq!(before + 1, set.dir_fsyncs(), "one fsync after the batch");
+    }
+
+    /// `sealed_bytes` is every segment BUT the growing one, so segments of
+    /// unequal length are needed to tell it from any other subset — with equal
+    /// lengths, "all but the highest" and "all but the lowest" agree.
+    #[test]
+    fn the_log_size_accounts_for_segments_of_unequal_length() {
+        let dir = scratch("bytes");
+        let base = base_in(&dir);
+        // Valid headers with trailing bytes: at A0 a segment's tail is not yet
+        // parsed, so the file length is whatever it is.
+        for (seq, extra) in [(1i64, 0usize), (2, 100), (3, 7)] {
+            let mut img = header_image(seq, 1);
+            img.extend(std::iter::repeat_n(0xab, extra));
+            write_segment(&base, seq, &img);
+        }
+        let mut set = WalSegmentSet::open(&base, false).expect("open");
+        assert_eq!(3 * SEG_HDR + 107, set.log_bytes());
+        assert_eq!(set.log_bytes_exact(), set.log_bytes());
+        set.unlink_through(1).expect("unlink");
+        assert_eq!(2 * SEG_HDR + 107, set.log_bytes());
+        assert_eq!(set.log_bytes_exact(), set.log_bytes());
+        set.unlink_through(3).expect("unlink the rest");
+        assert_eq!(0, set.log_bytes());
+        assert_eq!(0, set.log_bytes_exact());
+    }
+
+    /// W2's durability points are not observable in the resulting bytes: a
+    /// create that skipped both syncs writes the same 36 bytes. Count them.
+    #[test]
+    fn a_create_forces_the_segment_and_then_the_directory() {
+        let dir = scratch("w2-fsync");
+        let base = base_in(&dir);
+        let mut set = WalSegmentSet::open(&base, false).expect("open");
+        assert_eq!(0, set.segment_syncs());
+        let dir_before = set.dir_fsyncs();
+        set.create_segment(1).expect("create");
+        assert_eq!(
+            1,
+            set.segment_syncs(),
+            "the segment is forced WITH its size"
+        );
+        assert_eq!(
+            dir_before + 1,
+            set.dir_fsyncs(),
+            "and the directory entry after it"
+        );
+    }
+
+    /// A fresh namespace hands the caller an empty set and the first name; N1's
+    /// create is the caller's to make (`StoreWAL`, slice A2).
+    #[test]
+    fn a_fresh_namespace_starts_empty_at_sequence_one() {
+        let dir = scratch("n1");
+        let base = base_in(&dir);
+        let mut set = WalSegmentSet::open(&base, false).expect("open");
+        assert!(set.segments().is_empty());
+        assert_eq!(FIRST_SEQ, set.next_seq());
+        assert_eq!(0, set.log_bytes());
+        let seg = set.create_segment(1).expect("create");
+        assert_eq!(FIRST_SEQ, seg.seq);
+        assert_eq!(1, seg.header_first_lsn());
+    }
+
+    /// A create needs a real LSN; both refusals are caller errors, not damage.
+    #[test]
+    fn a_segment_cannot_start_at_a_non_positive_lsn() {
+        let dir = scratch("w2-lsn");
+        let base = base_in(&dir);
+        let mut set = WalSegmentSet::open(&base, false).expect("open");
+        for bad in [0i64, -1, i64::MIN] {
+            assert!(
+                matches!(set.create_segment(bad), Err(DbError::WrongConfiguration(_))),
+                "firstLsn {bad} must be refused"
+            );
+        }
+        assert_eq!(FIRST_SEQ, set.next_seq(), "a refused create burns no name");
+    }
+
+    // ---------------------------------------------------------------- descriptors
+
+    /// The descriptor discipline A1's two-pass scanner depends on: classification
+    /// retains no handle, a pass opens one on demand and gives it back, and the
+    /// handle honours the set's read-only mode.
+    #[test]
+    fn segments_open_and_release_their_handles_on_demand() {
+        if running_as_root() {
+            return; // root can open a 0444 file read-write
+        }
+        let dir = scratch("fds");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &header_image(1, 1));
+        write_segment(&base, 2, &header_image(2, 1));
+        set_mode(&seg_path(&base, 1), 0o444);
+
+        let mut set = WalSegmentSet::open(&base, true).expect("open");
+        assert_eq!(0, set.open_file_count(), "classification retains nothing");
+
+        let seg = &mut set.segments_mut()[0];
+        assert!(seg.file().is_none());
+        // A read-only set opens read-only, which is the only way this succeeds.
+        seg.ensure_open().expect("open the handle");
+        assert!(seg.file().is_some());
+        seg.ensure_open().expect("idempotent");
+        assert_eq!(1, set.open_file_count());
+
+        set.segments_mut()[0].release();
+        assert_eq!(0, set.open_file_count());
+        assert!(set.segments()[0].file().is_none());
+        // Reopens after a release, as a second recovery pass does.
+        set.segments_mut()[0].ensure_open().expect("reopen");
+        assert_eq!(1, set.open_file_count());
+        drop(set);
+        set_mode(&seg_path(&base, 1), 0o644);
+    }
+
     /// A read-only set never unlinks and never creates.
     #[test]
     fn a_read_only_set_refuses_to_mutate_the_namespace() {
@@ -1208,26 +1715,125 @@ mod tests {
         WalSegmentSet::open(&base, false).expect("after release");
     }
 
-    /// Shared readers coexist; a writer is excluded while one is live, and a
-    /// reader is excluded while the writer is.
+    /// A second open in THIS process is refused whatever the two modes are —
+    /// including read-only against read-only, which no kernel lock refuses and
+    /// which the process claim exists to catch.
+    ///
+    /// This is Java's rule, not an invention: `tryLock` consults a JVM-wide
+    /// table that does not consider lock mode, so a second `StoreWAL` on one
+    /// store raises `OverlappingFileLockException` even when both opens are
+    /// read-only (`WalSegmentSet.java:267-274`). Verified directly against the
+    /// JVM — two `tryLock(0, MAX, true)` calls on separate channels of one file
+    /// refuse the second — rather than inferred from the javadoc.
     #[test]
-    fn read_only_opens_share_and_exclude_a_writer() {
-        let dir = scratch("lock-ro");
+    fn a_second_open_in_this_process_is_refused_whatever_the_modes() {
+        for (tag, first_ro, second_ro) in [
+            ("rw-rw", false, false),
+            ("rw-ro", false, true),
+            ("ro-rw", true, false),
+            ("ro-ro", true, true),
+        ] {
+            let dir = scratch(tag);
+            let base = base_in(&dir);
+            let first = WalSegmentSet::open(&base, first_ro).expect(tag);
+            assert!(
+                matches!(
+                    WalSegmentSet::open(&base, second_ro),
+                    Err(DbError::Locked(_))
+                ),
+                "{tag}: the second open must be refused"
+            );
+            drop(first);
+            WalSegmentSet::open(&base, second_ro).expect("after release");
+        }
+    }
+
+    /// The claim is keyed by the lock file's identity, not by the pathname, so
+    /// two spellings of one store still collide.
+    #[test]
+    fn the_same_store_reached_by_two_paths_is_one_store() {
+        let dir = scratch("lock-path");
         let base = base_in(&dir);
-        let r1 = WalSegmentSet::open(&base, true).expect("first reader");
-        let r2 = WalSegmentSet::open(&base, true).expect("second reader");
+        let first = WalSegmentSet::open(&base, false).expect("first");
+        let same = dir.join(".").join("store.db");
+        assert!(matches!(
+            WalSegmentSet::open(&same, false),
+            Err(DbError::Locked(_))
+        ));
+        drop(first);
+    }
+
+    /// A refused open must not disturb the holder: the classic self-unlock
+    /// hazard of POSIX record locks is that the loser's failed attempt (or its
+    /// close of the same file) drops the winner's lock. A third open proves the
+    /// first is still held.
+    #[test]
+    fn a_refused_open_does_not_release_the_holders_lock() {
+        let dir = scratch("lock-selfunlock");
+        let base = base_in(&dir);
+        let first = WalSegmentSet::open(&base, false).expect("first");
         assert!(matches!(
             WalSegmentSet::open(&base, false),
             Err(DbError::Locked(_))
         ));
-        drop(r1);
-        drop(r2);
-        let w = WalSegmentSet::open(&base, false).expect("writer after readers");
-        assert!(matches!(
-            WalSegmentSet::open(&base, true),
-            Err(DbError::Locked(_))
-        ));
-        drop(w);
+        assert!(
+            matches!(WalSegmentSet::open(&base, false), Err(DbError::Locked(_))),
+            "the first open still holds the store"
+        );
+        drop(first);
+        WalSegmentSet::open(&base, false).expect("after release");
+    }
+
+    /// `close()` releases the namespace — both halves — without waiting for the
+    /// value to be dropped, which is the release point D2's cleanup observes.
+    #[test]
+    fn close_releases_the_lock_and_the_claim() {
+        let dir = scratch("lock-close");
+        let base = base_in(&dir);
+        let mut first = WalSegmentSet::open(&base, false).expect("first");
+        first.close();
+        let second = WalSegmentSet::open(&base, false).expect("after close");
+        drop(second);
+        drop(first);
+    }
+
+    /// The KERNEL half, exercised directly because the process claim refuses
+    /// every in-process pair before the kernel ever sees it. OFD locks are owned
+    /// by the open file description: two read locks share, a write lock is
+    /// excluded by a read lock, and closing one description does not release
+    /// another's lock (the defect that makes plain `F_SETLK` unusable here).
+    #[test]
+    fn ofd_locks_are_owned_by_the_open_file_description() {
+        let dir = scratch("ofd");
+        let path = dir.join("l");
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+        };
+        let a = open();
+        let b = open();
+        assert!(try_ofd_lock(&a, false).unwrap(), "first read lock");
+        assert!(try_ofd_lock(&b, false).unwrap(), "read locks share");
+        let w = open();
+        assert!(!try_ofd_lock(&w, true).unwrap(), "a writer is excluded");
+        drop(b);
+        assert!(
+            !try_ofd_lock(&w, true).unwrap(),
+            "closing another description must not release a's lock"
+        );
+        drop(a);
+        assert!(
+            try_ofd_lock(&w, true).unwrap(),
+            "released by the last owner"
+        );
+        // ...and an exclusive lock excludes a reader in the other direction.
+        let r = open();
+        assert!(!try_ofd_lock(&r, false).unwrap());
     }
 
     /// A read-only open CREATES the lock file when the directory allows it —
@@ -1242,5 +1848,82 @@ mod tests {
         let set = WalSegmentSet::open(&base, true).expect("open");
         assert!(lock.exists());
         drop(set);
+    }
+
+    /// Rung 2 of the read-only ladder: the read-write create fails, but the lock
+    /// file is THERE, so a shared lock is still attainable on a read-only
+    /// handle. This is not a fallback to lockless at all.
+    #[test]
+    fn a_read_only_open_falls_back_to_a_read_only_lock_handle() {
+        if running_as_root() {
+            return; // root ignores the mode bits this rung turns on
+        }
+        let dir = scratch("lock-rung2");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &header_image(1, 1));
+        let lock = with_suffix(&base, ".lock");
+        std::fs::write(&lock, b"").unwrap();
+        set_mode(&lock, 0o444);
+        let set = WalSegmentSet::open(&base, true).expect("read-only handle rung");
+        assert_eq!(vec![1], seq_list(&set));
+        drop(set);
+        set_mode(&lock, 0o644);
+    }
+
+    /// Rung 3: no lock file and a directory this process cannot write. Java's
+    /// read-only-medium branch — the reader is admitted with no lock, and a
+    /// writable open cannot get in at all.
+    #[test]
+    fn a_read_only_medium_admits_a_lockless_reader_and_no_writer() {
+        if running_as_root() {
+            return;
+        }
+        let dir = scratch("lock-rung3");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &header_image(1, 1));
+        set_mode(&dir, 0o555);
+        let set = WalSegmentSet::open(&base, true).expect("lockless reader");
+        assert_eq!(vec![1], seq_list(&set));
+        assert!(
+            !with_suffix(&base, ".lock").exists(),
+            "no lock file was created"
+        );
+        assert!(
+            WalSegmentSet::open(&base, false).is_err(),
+            "a writer cannot take the lock it needs"
+        );
+        drop(set);
+        set_mode(&dir, 0o755);
+    }
+
+    /// Rung 4: the create failed, the file does not exist, and the directory IS
+    /// writable — so a writer may be running. Inconclusive fails CLOSED.
+    #[test]
+    fn an_inconclusive_read_only_lock_refuses_rather_than_going_lockless() {
+        let dir = scratch("lock-rung4");
+        // A name whose `.lock` sibling exceeds NAME_MAX: the create fails, the
+        // path cannot exist, and the directory is plainly writable.
+        let base = dir.join("x".repeat(252));
+        match WalSegmentSet::open(&base, true) {
+            Err(DbError::Locked(_)) => {}
+            Err(e) => panic!("inconclusive must fail closed, got {e}"),
+            Ok(_) => panic!("inconclusive must not open locklessly"),
+        }
+    }
+
+    // ---------------------------------------------------------------- closed state
+
+    /// After `close()` the set no longer holds the lock, so the operations that
+    /// need it refuse rather than mutating an unowned namespace.
+    #[test]
+    fn a_closed_set_refuses_to_mutate_the_namespace() {
+        let dir = scratch("closed");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &header_image(1, 1));
+        let mut set = WalSegmentSet::open(&base, false).expect("open");
+        set.close();
+        assert!(matches!(set.create_segment(1), Err(DbError::StoreClosed)));
+        assert!(matches!(set.unlink_through(1), Err(DbError::StoreClosed)));
+        assert!(seg_path(&base, 1).exists(), "nothing was removed");
     }
 }

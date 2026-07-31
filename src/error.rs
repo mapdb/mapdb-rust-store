@@ -30,7 +30,11 @@ pub enum DbError {
     /// On-disk bytes failed a structural/parity/checksum invariant.
     /// The `&'static str` names the specific check for diagnostics.
     DataCorruption(Corruption),
-    /// Allocator hit the 44-bit volume ceiling (or backing store is full).
+    /// A capacity ceiling was reached with nothing damaged: the allocator hit
+    /// the 44-bit volume ceiling, the backing store is full, or a WAL segment
+    /// namespace has no sequence number left to create (Java throws a plain
+    /// `DBException` for that last one — the port refuses to call an intact
+    /// store corrupt).
     StoreFull,
     /// Operation attempted on a closed store.
     StoreClosed,
