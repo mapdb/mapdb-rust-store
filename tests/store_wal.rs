@@ -580,30 +580,201 @@ fn a_second_open_of_the_same_store_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// checkpoint(): slice A2 implements the roll half. The re-emission cycle, the
-// 'K' mark and the unlink arrive in A3.
+// checkpoint(): the incremental cleaner with its budget set to "everything".
+// Roll, re-emit every record the range below still owns as 'C' images, verify
+// (W10), write the forced 'K', unlink. The v1 whole-file rewrite is gone.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn checkpoint_rolls_the_active_segment_and_preserves_state() {
+fn checkpoint_compacts_the_log_and_preserves_state() {
     let base = tmp();
-    let s = StoreWAL::open(&base).unwrap();
-    let a = s.put(&5i64, &L).unwrap();
-    s.commit().unwrap();
-    assert_eq!(s.segment_seqs(), vec![1]);
+    let mut recids = Vec::new();
+    let s = StoreWAL::open_segment_bytes(&base, 200).unwrap();
+    for i in 0..60i64 {
+        let r = s.put(&i, &L).unwrap();
+        s.commit().unwrap();
+        recids.push(r);
+        // keep rewriting one record so the log holds superseded images
+        s.update(recids[0], Some(&i), &L).unwrap();
+        s.commit().unwrap();
+    }
+    let before = log_len(&base);
+    let segs_before = s.segment_seqs().len();
+    assert!(segs_before > 5, "expected a multi-segment log");
     s.checkpoint().unwrap();
-    assert_eq!(s.segment_seqs(), vec![1, 2], "the active segment is sealed");
-    // An empty active segment is never rolled: a second checkpoint is a no-op.
-    s.checkpoint().unwrap();
-    assert_eq!(s.segment_seqs(), vec![1, 2]);
-    assert_eq!(s.get(a, &L).unwrap(), Some(5));
+    let after = log_len(&base);
+    assert!(
+        after < before,
+        "checkpoint must compact the log: {before} -> {after}"
+    );
+    assert!(
+        s.segment_seqs().len() < segs_before,
+        "and retire segments: {segs_before} -> {}",
+        s.segment_seqs().len()
+    );
+    let (written, retired) = s.cleaner_bytes();
+    assert!(
+        retired > written,
+        "it must pay for itself: {retired} vs {written}"
+    );
+
+    // State preserved live, and across a reopen that replays only what is left.
+    for (i, r) in recids.iter().enumerate() {
+        let want = if i == 0 { 59 } else { i as i64 };
+        assert_eq!(s.get(*r, &L).unwrap(), Some(want));
+    }
+    s.verify().unwrap();
     s.close().unwrap();
 
     let s = StoreWAL::open(&base).unwrap();
-    assert_eq!(s.get(a, &L).unwrap(), Some(5));
-    let b = s.put(&6i64, &L).unwrap();
+    for (i, r) in recids.iter().enumerate() {
+        let want = if i == 0 { 59 } else { i as i64 };
+        assert_eq!(s.get(*r, &L).unwrap(), Some(want));
+    }
+    s.verify().unwrap();
+    // still writable after a clean
+    let r = s.put(&777i64, &L).unwrap();
     s.commit().unwrap();
-    assert_eq!(s.get(b, &L).unwrap(), Some(6));
+    assert_eq!(s.get(r, &L).unwrap(), Some(777));
+}
+
+#[test]
+fn checkpoint_on_an_empty_log_is_a_no_op() {
+    let base = tmp();
+    let s = StoreWAL::open(&base).unwrap();
+    s.checkpoint().unwrap();
+    assert_eq!(
+        s.segment_seqs(),
+        vec![1],
+        "nothing to roll, nothing to retire"
+    );
+    let a = s.put(&5i64, &L).unwrap();
+    s.commit().unwrap();
+    // One nonempty segment: the roll creates its successor and the cycle then
+    // retires the original behind a mark.
+    s.checkpoint().unwrap();
+    assert_eq!(s.segment_seqs(), vec![2]);
+    assert_eq!(s.get(a, &L).unwrap(), Some(5));
+    s.close().unwrap();
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(
+        s.get(a, &L).unwrap(),
+        Some(5),
+        "the image replays from the 'C'"
+    );
+    s.verify().unwrap();
+}
+
+#[test]
+fn a_deleted_record_is_not_re_emitted_by_a_clean() {
+    let base = tmp();
+    let s = StoreWAL::open_segment_bytes(&base, 200).unwrap();
+    let mut live = Vec::new();
+    let mut gone = Vec::new();
+    for i in 0..20i64 {
+        let r = s.put(&i, &L).unwrap();
+        s.commit().unwrap();
+        if i % 2 == 0 {
+            live.push((r, i));
+        } else {
+            gone.push(r);
+        }
+    }
+    for r in &gone {
+        s.delete(*r).unwrap();
+    }
+    s.commit().unwrap();
+    s.checkpoint().unwrap();
+    s.close().unwrap();
+
+    let s = StoreWAL::open(&base).unwrap();
+    for (r, v) in &live {
+        assert_eq!(s.get(*r, &L).unwrap(), Some(*v));
+    }
+    for r in &gone {
+        assert!(matches!(s.get(*r, &L), Err(DbError::GetVoid(_))));
+    }
+    s.verify().unwrap();
+}
+
+#[test]
+fn a_base_in_the_retired_range_is_re_emitted_with_its_delta_folded_in() {
+    // The worry a clean has to answer: a delta ABOVE the retiring range whose
+    // base image lies INSIDE it. It cannot survive as a dangling reference,
+    // because the recid's state entry is in the range too — so it is a
+    // candidate, and its image is re-emitted with the delta already folded in.
+    let base = tmp();
+    let a;
+    let mut want;
+    {
+        let s = StoreWAL::open_segment_bytes(&base, 200).unwrap();
+        want = bytes(21, 60);
+        a = s.put(&want, &R).unwrap();
+        s.commit().unwrap();
+        s.update_with_headroom(a, &want, &R, 200).unwrap();
+        s.commit().unwrap();
+        // deltas, each in a later section (and, at this segment size, later
+        // segments) than the image they extend
+        for i in 0..6u8 {
+            s.append(a, &[i; 8]).unwrap();
+            s.commit().unwrap();
+            want.extend_from_slice(&[i; 8]);
+        }
+        assert!(s.segment_seqs().len() > 1);
+        s.checkpoint().unwrap();
+        assert_eq!(s.get(a, &R).unwrap(), Some(want.clone()));
+        s.close().unwrap();
+    }
+    let s = StoreWAL::open(&base).unwrap();
+    assert_eq!(s.get(a, &R).unwrap(), Some(want));
+    s.verify().unwrap();
+}
+
+#[test]
+fn automatic_cleaning_bounds_log_growth() {
+    // A small live set overwritten many times: the log fills with superseded
+    // images while the store's footprint stays flat, which is the shape the
+    // trigger exists for. The footprint is page-granular (it reports ~2 MiB for
+    // a store holding a few hundred bytes), so the amplification term — not the
+    // floor — is what decides here; that bias is documented on `cleaning_target`.
+    let base = tmp();
+    let s = StoreWAL::open_segment_bytes(&base, 64 << 10).unwrap();
+    s.set_min_log_bytes(4096).unwrap();
+    s.set_space_amplification(1).unwrap();
+    let mut recids = Vec::new();
+    for i in 0..20u64 {
+        recids.push(s.put(&bytes(i, 4000), &R).unwrap());
+        s.commit().unwrap();
+    }
+    for i in 0..1200u64 {
+        let victim = recids[(i as usize) % recids.len()];
+        s.update(victim, Some(&bytes(10_000 + i, 4000)), &R)
+            .unwrap();
+        s.commit().unwrap();
+    }
+    let (written, retired) = s.cleaner_bytes();
+    assert!(
+        retired > 0,
+        "automatic cleaning must have retired segments (wrote {written})"
+    );
+    let unbounded = 1220 * 4100;
+    assert!(
+        log_len(&base) < unbounded / 2,
+        "the log must stay well below its unbounded size, got {}",
+        log_len(&base)
+    );
+    s.verify().unwrap();
+    let snapshot: Vec<Option<Vec<u8>>> = recids.iter().map(|r| s.get(*r, &R).unwrap()).collect();
+    s.close().unwrap();
+
+    let s = StoreWAL::open(&base).unwrap();
+    for (r, want) in recids.iter().zip(&snapshot) {
+        assert_eq!(
+            &s.get(*r, &R).unwrap(),
+            want,
+            "state survives the retirement"
+        );
+    }
     s.verify().unwrap();
 }
 

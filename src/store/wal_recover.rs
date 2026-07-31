@@ -177,7 +177,6 @@ pub(crate) fn build_sec_hdr(
 }
 
 /// The 16-byte `'K'` body. Written by the cleaner (A3) and by the test kit.
-#[allow(dead_code)] // consumed by A3's cleaner; A2 and A3 land together
 pub(crate) fn build_mark_body(cleaned_through_seq: i64, log_start_lsn: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&cleaned_through_seq.to_be_bytes());
@@ -268,37 +267,88 @@ fn body_crc(
 /// verified in pass 1, before a single entry is decoded ("garbage never
 /// allocates"). The v1 reader this replaced computed one incrementally, because
 /// its legacy trailing-seal format could only be checked at the end.
-struct SecIn<'a> {
+pub(crate) struct SecIn<'a> {
     file: &'a File,
-    /// End of the section being decoded.
+    /// SOFT end: the section being decoded. Reading past it is corruption.
     limit: u64,
+    /// HARD end: how far the window may read AHEAD of the soft limit. Equal to
+    /// the soft limit for replay, which decodes one section at a time; the
+    /// cleaner's scan sets it to the segment's validated end so one window can
+    /// span a section boundary.
+    ///
+    /// That split is what makes the scan cost one syscall per WINDOW instead of
+    /// per section. Java measured the difference: a log written by single-op
+    /// commits is nearly all section headers, and reading each one with its own
+    /// positional read (plus the window drop that followed) issued ~148k reads
+    /// to walk 34 MB.
+    hard_limit: u64,
     win: Vec<u8>,
     win_start: u64,
     win_pos: usize,
     win_len: usize,
+    /// Reads issued, for the scan-cost test. Never reset; a test takes a
+    /// difference.
+    reads: u64,
 }
 
 impl<'a> SecIn<'a> {
-    fn new(file: &'a File, bufsize: usize) -> SecIn<'a> {
+    pub(crate) fn new(file: &'a File, bufsize: usize) -> SecIn<'a> {
         SecIn {
             file,
             limit: 0,
+            hard_limit: 0,
             win: vec![0u8; bufsize.max(16)],
             win_start: 0,
             win_pos: 0,
             win_len: 0,
+            reads: 0,
         }
     }
 
-    fn reset(&mut self, start: u64, end: u64) {
+    /// Positions the reader over `[start, end)` and DROPS the window. Both
+    /// bounds become `end`.
+    pub(crate) fn reset(&mut self, start: u64, end: u64) {
         self.win_start = start;
         self.limit = end;
+        self.hard_limit = end;
         self.win_pos = 0;
         self.win_len = 0;
     }
 
-    fn pos(&self) -> u64 {
+    /// Positions the reader over `[start, end)` and KEEPS the window when it
+    /// already covers `start`. The hard limit is untouched, so this narrows the
+    /// soft bound to one section without paying for a re-read.
+    pub(crate) fn rebound(&mut self, start: u64, end: u64) {
+        self.limit = end;
+        if start >= self.win_start && start < self.win_start + self.win_len as u64 {
+            self.win_pos = (start - self.win_start) as usize;
+        } else {
+            self.win_start = start;
+            self.win_pos = 0;
+            self.win_len = 0;
+        }
+    }
+
+    /// Sets the hard bound the window may read to, dropping it. Used once per
+    /// segment by the cleaner's scan.
+    pub(crate) fn reset_hard(&mut self, start: u64, hard_end: u64) {
+        self.reset(start, hard_end);
+    }
+
+    /// Moves to `pos` within the current bounds, keeping the window when it
+    /// covers the target — the payload seek that makes the scan's cost
+    /// proportional to entries rather than to the bytes they carry.
+    pub(crate) fn seek(&mut self, pos: u64) {
+        let limit = self.limit;
+        self.rebound(pos, limit);
+    }
+
+    pub(crate) fn pos(&self) -> u64 {
         self.win_start + self.win_pos as u64
+    }
+
+    pub(crate) fn reads(&self) -> u64 {
+        self.reads
     }
 
     fn remaining(&self) -> u64 {
@@ -319,17 +369,20 @@ impl<'a> SecIn<'a> {
         }
         // Minimum in u64, THEN narrow — see `body_crc`. A 4 GiB remainder that
         // cast to 0 first would leave `win_len` at zero and hand the caller a
-        // byte it never read.
-        let n = (self.limit - self.win_start).min(self.win.len() as u64) as usize;
+        // byte it never read. Filled to the HARD limit, so one window can serve
+        // several sections; the soft limit above is what bounds the caller.
+        let n =
+            (self.hard_limit.max(self.limit) - self.win_start).min(self.win.len() as u64) as usize;
         self.file
             .read_exact_at(&mut self.win[..n], self.win_start)
             .map_err(DbError::Io)?;
         self.win_len = n;
+        self.reads += 1;
         Ok(())
     }
 
-    fn read_byte(&mut self) -> Result<u8> {
-        if self.win_pos >= self.win_len {
+    pub(crate) fn read_byte(&mut self) -> Result<u8> {
+        if self.pos() >= self.limit || self.win_pos >= self.win_len {
             self.refill()?;
         }
         let b = self.win[self.win_pos];
@@ -344,7 +397,7 @@ impl<'a> SecIn<'a> {
     /// encodings agree, so the cap only changes which *malformed* input is
     /// refused and how quickly. It is recorded as a per-engine expectation in
     /// the corruption fixtures rather than smoothed over.
-    fn unpack_long(&mut self) -> Result<u64> {
+    pub(crate) fn unpack_long(&mut self) -> Result<u64> {
         let mut ret: u64 = 0;
         for _ in 0..10 {
             let v = self.read_byte()?;
@@ -356,10 +409,10 @@ impl<'a> SecIn<'a> {
         Err(DbError::corrupt("WAL packed long too long"))
     }
 
-    fn read_fully(&mut self, dst: &mut [u8]) -> Result<()> {
+    pub(crate) fn read_fully(&mut self, dst: &mut [u8]) -> Result<()> {
         let mut off = 0;
         while off < dst.len() {
-            if self.win_pos >= self.win_len {
+            if self.pos() >= self.limit || self.win_pos >= self.win_len {
                 self.refill()?;
             }
             let n = (self.win_len - self.win_pos).min(dst.len() - off);

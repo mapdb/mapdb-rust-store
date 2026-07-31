@@ -990,47 +990,49 @@ impl StoreDirect {
         Ok(Some(r))
     }
 
-    /// Visit every recid that must survive a WAL checkpoint (ascending order):
-    /// `(recid, prealloc, cap_bytes, content)`. Sink invoked outside locks.
-    #[allow(dead_code)]
-    pub(crate) fn wal_snapshot(
+    /// Snapshot ONE recid for the WAL cleaner: `(prealloc, cap_bytes, content)`
+    /// through `sink`, returning whether the record exists at all (`false` for a
+    /// void or deleted slot, where the sink is not invoked).
+    ///
+    /// Per-recid rather than a whole-store walk, because the cleaner re-homes
+    /// the records it MEETS in the segments it is retiring — a walk over every
+    /// recid would be O(store) under the WAL write lock, which is the pause the
+    /// incremental cleaner exists to remove. The sink runs after the per-recid
+    /// lock is released, so the caller must hold its own barrier (the WAL write
+    /// lock) if it needs check-copy-publish to be one serialized unit.
+    pub(crate) fn wal_snapshot_one(
         &self,
-        mut sink: impl FnMut(u64, bool, usize, Option<Vec<u8>>) -> Result<()>,
-    ) -> Result<()> {
+        recid: u64,
+        sink: impl FnOnce(bool, usize, Option<Vec<u8>>) -> Result<()>,
+    ) -> Result<bool> {
         let _c = self.mutate_enter()?;
-        let max = {
-            let _s = self.structural();
-            self.max_recid()?
-        };
-        for recid in 1..=max {
-            let mut emit = false;
-            let mut prealloc = false;
-            let mut cap_bytes = 0usize;
-            let mut content: Option<Vec<u8>> = None;
-            {
-                let _rg = self.segs.read(recid);
-                let ivval = self.raw_index_get(recid);
-                let cap = iv::cap_units(ivval);
-                if ivval != 0 && cap != iv::CAP_DELETED {
-                    emit = true;
-                    if cap == iv::CAP_NULL {
-                        prealloc = iv::is_prealloc(ivval);
-                    } else if iv::is_linked(ivval) {
-                        content = Some(self.linked_get(ivval)?);
-                    } else {
-                        let (off, used) = self.read_used(ivval)?;
-                        let mut c = vec![0u8; used];
-                        self.vol.get_data(off + 4, &mut c);
-                        content = Some(c);
-                        cap_bytes = cap as usize * 16;
-                    }
+        let mut emit = false;
+        let mut prealloc = false;
+        let mut cap_bytes = 0usize;
+        let mut content: Option<Vec<u8>> = None;
+        {
+            let _rg = self.segs.read(recid);
+            let ivval = self.raw_index_get(recid);
+            let cap = iv::cap_units(ivval);
+            if ivval != 0 && cap != iv::CAP_DELETED {
+                emit = true;
+                if cap == iv::CAP_NULL {
+                    prealloc = iv::is_prealloc(ivval);
+                } else if iv::is_linked(ivval) {
+                    content = Some(self.linked_get(ivval)?);
+                } else {
+                    let (off, used) = self.read_used(ivval)?;
+                    let mut c = vec![0u8; used];
+                    self.vol.get_data(off + 4, &mut c);
+                    content = Some(c);
+                    cap_bytes = cap as usize * 16;
                 }
             }
-            if emit {
-                sink(recid, prealloc, cap_bytes, content)?;
-            }
         }
-        Ok(())
+        if emit {
+            sink(prealloc, cap_bytes, content)?;
+        }
+        Ok(emit)
     }
 
     // ---------- verify ----------
