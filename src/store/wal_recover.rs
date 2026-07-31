@@ -818,8 +818,12 @@ fn adjudicate(segments: &[Segment], cleaned_through: i64, mark_log_start: i64) -
                 }
             }
             Some(p) => {
+                // Wrapping: `last_lsn` is a disk field, and a crafted section
+                // carrying i64::MAX reaches here through the sentinel guard (the
+                // first section of a segment is accepted whatever its LSN). The
+                // reference wraps; rust would panic.
                 let after = if p.last_lsn != 0 {
-                    p.last_lsn + 1
+                    p.last_lsn.wrapping_add(1)
                 } else {
                     p.header_first_lsn()
                 };
@@ -829,7 +833,7 @@ fn adjudicate(segments: &[Segment], cleaned_through: i64, mark_log_start: i64) -
                          up to {}: sections between them are gone",
                         seg_name(s),
                         seg_name(p),
-                        after - 1
+                        after.wrapping_sub(1)
                     )));
                 }
             }
@@ -875,6 +879,16 @@ fn pass2(
         file.read_exact_at(&mut hdr, pos).map_err(DbError::Io)?;
         let (tag, lsn, body_len, _, _) = parse_sec_hdr(&hdr);
         let body_start = pos + SEC_HDR as u64;
+        // Unreachable by construction — pass 1 validated exactly these bytes and
+        // `valid_end` is where it stopped — and checked anyway, because "cannot
+        // happen" plus an `as u64` cast is a panic rather than a wrong answer if
+        // the file changes underneath us.
+        if body_len < 0 || body_len as u64 > seg.valid_end - body_start {
+            return Err(DbError::corrupt_msg(format!(
+                "WAL segment {} changed between recovery passes at offset {pos}",
+                seg_name(seg)
+            )));
+        }
         // A 'K' body carries no entries and is NEVER passed to the entry
         // decoder; 'C' is semantically identical to 'S' and gets no special
         // handling.
@@ -1056,12 +1070,18 @@ fn entry_recid(seen: &mut HashSet<u64>, recid: u64) -> Result<u64> {
 /// LSN >= 1, since LSNs start at 1. Both bounds are what make the table's
 /// comparison meaningful instead of an accidental "skip" on a garbage value.
 fn decode_base_lsn(delta: u64, lsn: i64, recid: u64) -> Result<i64> {
-    if delta < 1 || delta > (lsn - 1).max(0) as u64 {
+    // Compared as i64 with the same bits the reference sees, and wrapping where
+    // it wraps. `lsn` is a number read off a disk that may hold anything — a
+    // crafted section is accepted with ANY lsn while the segment is still empty
+    // (the sentinel guard) — so `lsn - 1` on i64::MIN is a reachable input, and
+    // in rust it is a panic where in Java it is a wrap.
+    let delta = delta as i64;
+    if delta < 1 || delta > lsn.wrapping_sub(1) {
         return Err(DbError::corrupt_msg(format!(
             "bad WAL append base delta {delta} in section LSN {lsn}, recid={recid}"
         )));
     }
-    Ok(lsn - delta as i64)
+    Ok(lsn.wrapping_sub(delta))
 }
 
 // ---------- the ordered algorithm ----------
@@ -2074,6 +2094,53 @@ mod tests {
             .write(&base);
         let msg = corrupt_msg(open_rw(&base));
         assert!(msg.contains("its leading sections are gone"), "{msg}");
+    }
+
+    #[test]
+    fn an_lsn_at_the_top_of_the_range_does_not_panic_the_chain() {
+        let dir = scratch("r4_maxlsn");
+        let base = base_in(&dir);
+        // Reachable, not theoretical: the density checks do not apply to a
+        // segment's FIRST section, so one crafted section can carry i64::MAX,
+        // and a mark attesting `logStartLsn = i64::MAX` makes the floor accept
+        // the header that states it. The chain then computes `last_lsn + 1` on
+        // i64::MAX — a wrap in the reference and a PANIC in a debug rust build,
+        // which is the difference between refusing an image and taking the
+        // process down with it.
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(b"a")))
+            .write(&base);
+        SegImage::new(2, i64::MAX)
+            .mark(i64::MAX, 1, i64::MAX)
+            .write(&base);
+        SegImage::new(3, 1).write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("sections between them are gone"), "{msg}");
+    }
+
+    #[test]
+    fn an_append_base_delta_cannot_overflow_the_section_lsn() {
+        // The decoder's bounds are compared in i64 with the reference's bits and
+        // wrap where it wraps. R4's self check happens to gate every negative
+        // `lsn` out of pass 2 today, so this exercises the arithmetic directly
+        // rather than through an image — the guard is there because that gating
+        // is a property of a DIFFERENT rule, not of this function.
+        // The reference's own answer on the extreme: `lsn - 1` wraps to
+        // i64::MAX, so the delta passes its bound and the base wraps too. Pinned
+        // as-is — a port that "fixed" it by refusing would accept a different
+        // set of images than the reference on a doctored one.
+        assert_eq!(decode_base_lsn(1, i64::MIN, 10).expect("wraps"), i64::MAX);
+        // A delta above i64::MAX is negative in the reference's arithmetic, and
+        // that is what rejects it — not an unsigned comparison.
+        assert!(decode_base_lsn(u64::MAX, i64::MIN, 10).is_err());
+        assert!(decode_base_lsn(0, 5, 10).is_err());
+        assert!(decode_base_lsn(5, 5, 10).is_err());
+        assert!(decode_base_lsn(u64::MAX, 5, 10).is_err());
+        assert_eq!(decode_base_lsn(4, 5, 10).expect("valid"), 1);
+        assert_eq!(
+            decode_base_lsn(1, i64::MAX, 10).expect("valid"),
+            i64::MAX - 1
+        );
     }
 
     // ------------------------- the frozen lsn==0 sentinel edge (J0 pins these)
