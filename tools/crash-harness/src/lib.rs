@@ -624,8 +624,10 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
                 // Position is part of the meaning: `postcompact` must name the
                 // state a completed compaction left behind.
                 match (at, open_maint) {
-                    // Exactly one per ACK, and only there: `ack_just_before`
-                    // was set by the previous record and cleared by any other.
+                    // At most one, and only directly after an ACK:
+                    // `ack_just_before` was set by the previous record and
+                    // cleared by any other. Not one PER ack — a cut between the
+                    // two appends legitimately leaves the ACK alone.
                     (NsAt::Group, None) => {
                         if !ack_just_before {
                             return Err(JournalError("journal-namespace-position"));

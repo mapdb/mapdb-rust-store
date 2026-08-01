@@ -83,10 +83,13 @@ const BODY_CHUNK: usize = 8192;
 /// stop only ever lowers the derived floor, which weakens the assertion and can
 /// never fail a correct store — but without them a corrupt `bodyLen` chain or a
 /// legitimately enormous segment turns a crash verdict into a checker timeout,
-/// which reads as a product failure. `MAX_WALK_BYTES` bounds the bytes actually
-/// HASHED, checked against each section's end before its body is streamed; it
-/// is D8's DEFAULT `segmentBytes`, so a default-configured store is always
-/// walked whole.
+/// which reads as a product failure. They bound work jointly and neither alone
+/// is the whole story: the byte member bounds the admitted on-disk prefix —
+/// checked against each section's END before its body is streamed, which is the
+/// only check that constrains a single huge `bodyLen` — and the section member
+/// bounds the fixed per-section overhead (the CRC domain, a mark's 16-byte
+/// reread) that the byte member does not count. The byte member is D8's DEFAULT
+/// `segmentBytes`, so a default-configured store is always walked whole.
 /// `(bytes, sections)`. The ONE place the production walk's ceilings are
 /// written, so a test can pin them: `highest_mark` destructures this and has no
 /// literals of its own.
@@ -1307,9 +1310,12 @@ mod tests {
             Some(3),
             "with no budget the whole segment is walked"
         );
-        // The first body alone is 100 KB. A checker that tested only the START
-        // offset against the budget would hash all of it and then return the
-        // mark behind it.
+        // The first body alone is 100 KB, so a 50 KB budget must refuse it.
+        // This pins the RESULT only: a start-only check would also answer
+        // `None` here, having hashed the whole body first. What discriminates
+        // start-from-end is the 41-byte case above; what a test in this process
+        // cannot yet observe is the reads themselves, so moving this check
+        // below the S4 loop survives the suite (round 6, non-blocking).
         assert_eq!(
             highest_mark_bounded(&file, &hdr, 9, len, 50_000, u64::MAX),
             None,
