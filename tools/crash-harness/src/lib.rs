@@ -568,9 +568,10 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
     let mut saw_precompact = false;
     let mut saw_postcompact = false;
     // A group observation is only meaningful attached to the durability point
-    // it describes, so the grammar accepts one only DIRECTLY after an ACK —
-    // which is the only place the workload emits one. Without this the format
-    // would accept coverage evidence no real run could produce.
+    // it describes, so the grammar accepts AT MOST ONE, and only DIRECTLY after
+    // an ACK — which is the only place the workload emits one. It cannot demand
+    // one per ACK: the pair is two appends, and a cut between them legitimately
+    // leaves the ACK alone.
     let mut expect_group_ns = false;
     for (i, rec) in records.iter().enumerate() {
         if i == 0 && !matches!(rec, Record::Header(_)) {
@@ -630,8 +631,11 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
                             return Err(JournalError("journal-namespace-position"));
                         }
                     }
+                    // One bracket per interval: neither a second `precompact`
+                    // nor a second PAIR, which consuming `saw_precompact` alone
+                    // would have let through.
                     (NsAt::PreCompact, Some((MaintKind::Compact, _))) => {
-                        if saw_precompact {
+                        if saw_precompact || saw_postcompact {
                             return Err(JournalError("journal-namespace-position"));
                         }
                         saw_precompact = true;
@@ -941,13 +945,22 @@ mod tests {
                 v
             },
             // `postcompact` is CONSUMED, so a second one in the same interval
-            // is refused exactly as a second `precompact` is.
+            // is refused exactly as a second `precompact` is — and so is a
+            // second whole pair.
             vec![
                 head.clone(),
                 begin.clone(),
                 ns(NsAt::PreCompact, 1, 2, 2),
                 ns(NsAt::PostCompact, 2, 3, 2),
                 ns(NsAt::PostCompact, 2, 3, 2),
+            ],
+            vec![
+                head.clone(),
+                begin.clone(),
+                ns(NsAt::PreCompact, 1, 2, 2),
+                ns(NsAt::PostCompact, 2, 3, 2),
+                ns(NsAt::PreCompact, 2, 3, 2),
+                ns(NsAt::PostCompact, 3, 4, 2),
             ],
         ] {
             assert_eq!(

@@ -83,10 +83,14 @@ const BODY_CHUNK: usize = 8192;
 /// stop only ever lowers the derived floor, which weakens the assertion and can
 /// never fail a correct store — but without them a corrupt `bodyLen` chain or a
 /// legitimately enormous segment turns a crash verdict into a checker timeout,
-/// which reads as a product failure. `MAX_WALK_BYTES` is D8's DEFAULT
-/// `segmentBytes`, so a default-configured store is always walked whole.
-const MAX_WALK_BYTES: u64 = 64 << 20;
-const MAX_WALK_SECTIONS: u64 = 1 << 20;
+/// which reads as a product failure. `MAX_WALK_BYTES` bounds the bytes actually
+/// HASHED, checked against each section's end before its body is streamed; it
+/// is D8's DEFAULT `segmentBytes`, so a default-configured store is always
+/// walked whole.
+/// `(bytes, sections)`. The ONE place the production walk's ceilings are
+/// written, so a test can pin them: `highest_mark` destructures this and has no
+/// literals of its own.
+const WALK_LIMITS: (u64, u64) = (64 << 20, 1 << 20);
 
 /// zlib CRC-32, bitwise and incremental. Deliberately not the store's
 /// `crc32fast`: an oracle that imported the same checksum implementation as the
@@ -165,8 +169,11 @@ pub struct Namespace {
     /// Whether this scan walked section prefixes for `'K'` marks. Recorded
     /// rather than assumed: [`Namespace::authorized_floor`] answers `None` both
     /// for "no mark" and for "never looked", and the difference is the whole
-    /// unfinished-unlink rule. [`Namespace::check_recovered`] refuses to be
-    /// asked for the floor rule by a scan that never looked.
+    /// unfinished-unlink rule. [`Namespace::check_recovered`] SKIPS the floor
+    /// rule when its `pre` never looked — asserting a floor nobody derived
+    /// would be worse — so the caller that needs the rule is the one that must
+    /// insist, and the crash checker does exactly that before it opens the
+    /// store.
     pub marks_scanned: bool,
 }
 
@@ -289,14 +296,8 @@ fn classify_header(path: &Path, name_seq: i64, want_marks: bool) -> Result<Segme
 /// prefix (`wal_recover.rs:1241-1254`), taken before R4's adjudication and used
 /// verbatim by R5's `unlink_through` (`:1289`).
 fn highest_mark(file: &File, seg_hdr: &[u8; SEG_HDR_LEN], seg_seq: i64, len: u64) -> Option<i64> {
-    highest_mark_bounded(
-        file,
-        seg_hdr,
-        seg_seq,
-        len,
-        MAX_WALK_BYTES,
-        MAX_WALK_SECTIONS,
-    )
+    let (max_bytes, max_sections) = WALK_LIMITS;
+    highest_mark_bounded(file, seg_hdr, seg_seq, len, max_bytes, max_sections)
 }
 
 /// [`highest_mark`] with the ceilings injected, so a test can reach them without
@@ -316,7 +317,7 @@ fn highest_mark_bounded(
     let mut buf = [0u8; BODY_CHUNK];
     loop {
         sections += 1;
-        if sections > max_sections || off - SEG_HDR_LEN as u64 > max_bytes {
+        if sections > max_sections {
             return best; // conservative ceiling, never a verdict
         }
         if len - off < SEC_HDR_LEN as u64 {
@@ -349,6 +350,14 @@ fn highest_mark_bounded(
         };
         if body_end > len {
             return best; // the body is not all there
+        }
+        // The byte ceiling has to cover the bytes this section will make us
+        // HASH, not merely where it starts: `bodyLen` is a disk value that Java
+        // accepts for any width that fits the file, so one CRC-valid header
+        // claiming a gigabyte would otherwise stream a gigabyte before the
+        // ceiling was consulted again.
+        if body_end - SEG_HDR_LEN as u64 > max_bytes {
+            return best;
         }
         // S4, streamed: the body is `bodyLen` wide and `bodyLen` came off the
         // disk, so it is hashed in fixed chunks and never buffered whole.
@@ -1265,8 +1274,74 @@ mod tests {
         assert_eq!(all, Some(3), "unbounded, every mark is read");
         let capped = highest_mark_bounded(&file, &hdr, 9, len, u64::MAX, 2);
         assert_eq!(capped, Some(2), "the section ceiling stops the walk early");
-        let capped = highest_mark_bounded(&file, &hdr, 9, len, 1, u64::MAX);
+        // One section here is 25 + 16 = 41 bytes, so a 41-byte budget admits
+        // exactly the first and stops before the second.
+        let capped = highest_mark_bounded(&file, &hdr, 9, len, 41, u64::MAX);
         assert_eq!(capped, Some(1), "so does the byte ceiling");
+        let capped = highest_mark_bounded(&file, &hdr, 9, len, 1, u64::MAX);
+        assert_eq!(capped, None, "a budget below one section admits nothing");
+    }
+
+    /// The ceiling must bound the bytes HASHED, not the offset a section starts
+    /// at: `bodyLen` is a disk value and the reference accepts any width that
+    /// fits the file, so a budget consulted only at section boundaries is no
+    /// budget at all against a single huge body.
+    #[test]
+    fn the_byte_ceiling_covers_the_body_a_section_is_about_to_stream() {
+        let dir = scratch("mark-bigbody");
+        let base = base_in(&dir);
+        write_seg_with(
+            &base,
+            9,
+            1,
+            &[(b'S', vec![7u8; 100_000]), (TAG_MARK, mark_body(3, 2))],
+        );
+        let path = base.with_file_name("store.db.wal.0000000000000009");
+        let file = File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let mut hdr = [0u8; SEG_HDR_LEN];
+        file.read_exact_at(&mut hdr, 0).unwrap();
+
+        assert_eq!(
+            highest_mark_bounded(&file, &hdr, 9, len, u64::MAX, u64::MAX),
+            Some(3),
+            "with no budget the whole segment is walked"
+        );
+        // The first body alone is 100 KB. A checker that tested only the START
+        // offset against the budget would hash all of it and then return the
+        // mark behind it.
+        assert_eq!(
+            highest_mark_bounded(&file, &hdr, 9, len, 50_000, u64::MAX),
+            None,
+            "the walk stops before streaming a body that crosses the budget"
+        );
+    }
+
+    /// The ceilings the PRODUCTION walk is wired with. Reaching them
+    /// behaviourally would need a 64 MiB fixture, so this pins the values
+    /// instead — and `highest_mark` destructures `WALK_LIMITS` rather than
+    /// writing any ceiling of its own, so this is the only place either number
+    /// can be raised.
+    #[test]
+    fn the_production_walk_is_actually_bounded() {
+        assert_eq!(WALK_LIMITS, (64 << 20, 1 << 20));
+    }
+
+    /// S8's width row. A mark body that is not exactly 16 bytes is refused
+    /// before its contents mean anything — otherwise a CRC-valid wider body
+    /// whose first eight bytes happen to read as a sequence number would
+    /// authorize a floor Java refuses outright.
+    #[test]
+    fn a_mark_body_of_the_wrong_width_is_not_authority() {
+        let dir = scratch("mark-width");
+        let base = base_in(&dir);
+        let mut wide = mark_body(3, 1);
+        wide.extend_from_slice(&[0u8; 8]); // 24 bytes, sealed with a valid CRC
+        write_seg_with(&base, 9, 1, &[(TAG_MARK, wide)]);
+        assert_eq!(
+            scan_with_marks(&base).expect("scan").authorized_floor(),
+            None
+        );
     }
 
     /// A scan that never looked answers `None` exactly like a scan that found
