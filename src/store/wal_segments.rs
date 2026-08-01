@@ -638,6 +638,13 @@ impl WalSegmentSet {
         }
         if !self.read_only && !residue.is_empty() {
             for seq in residue {
+                // R2's unlink is a reported operation, exactly like W5's. Java
+                // emits it (`WalSegmentSet.java:376-381`); this port did not,
+                // because the seam arrived with A2 and nothing came back for the
+                // one namespace mutation an OPEN performs. Without the event it
+                // is neither observable nor fault-injectable, and the zig port's
+                // B0 review is what found the gap.
+                wal_io_event(&self.io, WalOpKind::Unlink, seq, 0, 0, 0)?;
                 remove_if_exists(&self.segment_file(seq))?;
             }
             self.fsync_dir()?;
@@ -1425,6 +1432,57 @@ mod tests {
             assert!(!seg_path(&base, 2).exists(), "{tag}: residue is unlinked");
             assert_eq!(3, set.next_seq(), "{tag}: W6 burnt the residue's number");
         }
+    }
+
+    /// R2's residue removal is a REPORTED operation, like W5's — Java emits
+    /// `UNLINK` before each of these deletes (`WalSegmentSet.java:376-381`).
+    /// This port did not until the zig port's B0 review found the gap: the seam
+    /// arrived with A2 and nothing came back for the one namespace mutation an
+    /// OPEN performs, leaving it neither observable nor fault-injectable.
+    #[test]
+    fn residue_removal_at_open_reports_its_unlink_and_its_fsync() {
+        #[derive(Default)]
+        struct Trace {
+            kinds: Mutex<Vec<(WalOpKind, i64)>>,
+            fail_first: bool,
+        }
+        impl WalIo for Trace {
+            fn before(&self, e: &super::super::wal_write::WalIoEvent) -> Result<()> {
+                if self.fail_first && e.kind == WalOpKind::Unlink {
+                    return Err(DbError::Io(std::io::Error::other("injected")));
+                }
+                self.kinds
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((e.kind, e.seq));
+                Ok(())
+            }
+        }
+
+        let dir = scratch("r2-seam");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &header_image(1, 1));
+        write_segment(&base, 2, &[]); // H1 residue on the highest name
+
+        let trace = Arc::new(Trace::default());
+        let set = WalSegmentSet::open_with_io(&base, false, Some(trace.clone())).expect("open");
+        assert_eq!(
+            vec![(WalOpKind::Unlink, 2), (WalOpKind::DirSync, 0)],
+            *trace.kinds.lock().unwrap(),
+            "R2's unlink is reported before the directory fsync that seals it"
+        );
+        assert!(!seg_path(&base, 2).exists());
+        drop(set);
+
+        // ...and because it is reported, it is injectable: a residue unlink that
+        // fails fails the OPEN rather than leaving a half-tidied namespace.
+        write_segment(&base, 2, &[]);
+        let failing = Arc::new(Trace {
+            fail_first: true,
+            ..Default::default()
+        });
+        assert!(WalSegmentSet::open_with_io(&base, false, Some(failing)).is_err());
+        assert!(seg_path(&base, 2).exists(), "untouched by the refused open");
     }
 
     /// The same shapes anywhere below the highest name are corruption: a
