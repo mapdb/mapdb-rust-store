@@ -27,12 +27,12 @@ pub mod parity;
 pub mod readonly;
 pub mod volume;
 pub mod wal;
-/// WAL format v3 codec and recovery state machine (slice A1) — built and
-/// tested, not yet reachable from a public open. See the module docs.
+/// WAL format v3 codec and recovery state machine (tables S, K, R).
 pub(crate) mod wal_recover;
-/// WAL format v3 namespace layer (slice A0) — built and tested, not yet
-/// reachable from a public open. See the module docs.
+/// WAL format v3 namespace layer: files, the store lock, tables N and H.
 pub(crate) mod wal_segments;
+/// WAL format v3 section writer (table W) and the durability event seam.
+pub(crate) mod wal_write;
 
 pub use bytearray::StoreByteArray;
 pub use direct::StoreDirect;

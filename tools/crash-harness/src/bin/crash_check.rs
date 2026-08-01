@@ -25,23 +25,56 @@
 //!   plus both markers (exercises the routing path independently). `size_long()`
 //!   must equal the replayed entry count, and `store.verify()` must pass.
 //!
+//! - the format v3 **segment namespace** must satisfy its own invariants, at
+//!   the cut and again after recovery. The contents oracle above cannot see any
+//!   of this: a recovery that reused a burnt segment name, resurrected a retired
+//!   one, left create-crash residue behind, or failed to finish an unlink the
+//!   crash interrupted produces exactly the right logical map and would have
+//!   passed. The namespace is read INDEPENDENTLY (`ch::wal_namespace`, which
+//!   re-derives names and headers from the format description rather than
+//!   calling the store's own enumerator), once before the open — recovery
+//!   mutates the file set, so the image is only observable then — and once
+//!   after.
+//! - the run must have EXERCISED that machinery: the journal's own namespace
+//!   observations must show it rotating, retiring, and completing a whole-log
+//!   clean that retired something. A round that never rotated cannot pass by
+//!   satisfying namespace rules vacuously.
+//! - the **recovery successor** must work: after the contents oracle, the
+//!   checker commits one record on the recovered store, closes, and reopens. A
+//!   bad `nextLsn`/`nextSeq` handoff is invisible in the store recovery just
+//!   produced — it only bites whatever is written next, which in a crash round
+//!   is nothing at all.
+//!
 //! Verdict: one stable stdout line
 //! `CRASH_CHECK verdict=PASS|FAIL [reason=<code>] backend=wal recovered_txid=…
 //! ack_txid=… intents=… entries=… ready_groups=… ready_checkpoints=…
-//! ready_compactions=… last_record=… maint_open_at_cut=0|1`; diagnostics on
-//! stderr; exit 0 iff PASS. `maint_open_at_cut` reports an unmatched `M begin`
-//! at the witness cutoff — NOT proof the cut landed inside compaction (the
-//! process may die before the `M done` sync).
+//! ready_compactions=… last_record=… maint_open_at_cut=0|1 ns_segs_at_cut=…
+//! ns_seq_lo=… ns_seq_hi=… ns_residue_at_cut=0|1 ns_gap_at_cut=…
+//! ns_unlinked_by_recovery=… ns_created_by_recovery=0|1
+//! ns_compactions_retiring=… ns_autoclean_events=…`; diagnostics on stderr;
+//! exit 0 iff PASS. `maint_open_at_cut` reports an unmatched `M begin` at the
+//! witness cutoff — NOT proof the cut landed inside compaction (the process may
+//! die before the `M done` sync). `ns_residue_at_cut` and `ns_gap_at_cut` are
+//! the rare-window counters: residue means a cut landed between a segment's
+//! creation and its forced header, a gap means one landed inside an unlink run
+//! or that a residue name was burnt. Neither can be required of a round, so
+//! both are reported and aggregated across a campaign instead.
 
 use mapdb_rust_store::db::DB;
 use mapdb_rust_store::ser::bytearray::ByteArrayFormat;
 use mapdb_rust_store::store::{Store, StoreWAL};
+use mapdb_rust_store_crash_harness::wal_namespace::{self, Namespace};
 use mapdb_rust_store_crash_harness::{
-    self as ch, Config, Model, Record, COMMITTED_SEQ_KEY, RUN_ID_KEY,
+    self as ch, Config, Model, NsAt, Record, COMMITTED_SEQ_KEY, RUN_ID_KEY,
 };
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// The key the successor phase writes AFTER recovery. Outside the generated
+/// universe (universe keys start `k`) and distinct from both markers, so the
+/// exact-equality oracle can account for it explicitly on the second open.
+const SUCCESSOR_KEY: &[u8] = b"!crash-post-recovery";
 
 struct Fail {
     reason: &'static str,
@@ -69,6 +102,29 @@ struct JournalView {
     /// The type token of the last complete journal record (result metadata).
     last_record: &'static str,
     intents: Vec<(u64, u32)>, // (seq == txid, digest)
+    /// The last complete `N` observation: (lo, hi, count).
+    ns_last: Option<(u64, u64, u64)>,
+    /// What the run's own observations prove about the namespace machinery.
+    ns: NsCoverage,
+}
+
+/// Namespace coverage, computed from the journal alone — deterministic, and so
+/// a *requirement* rather than a cut-dependent counter. `ns_rotated` and
+/// `ns_retired` are absolute facts about the run: a store's first segment is
+/// seq 1, `hi` only moves when a segment is created, and `lo` only moves when
+/// one is unlinked behind a forced `'K'`.
+#[derive(Clone, Copy, Default, Debug)]
+struct NsCoverage {
+    /// A create beyond the store's first segment happened (rotate).
+    rotated: bool,
+    /// A segment was retired (forced `'K'` + `unlinkThrough`).
+    retired: bool,
+    /// Completed compactions whose bracketing pair shows `lo` advancing — the
+    /// whole-log clean did retire the segments it rolled past.
+    compactions_retiring: u64,
+    /// Group boundaries where `lo` advanced with no compaction around them:
+    /// the AUTOMATIC cleaning path, the one that runs inside `commit`.
+    autoclean_events: u64,
 }
 
 /// The workload's group protocol, enforced over the ORDERED records — stronger
@@ -128,6 +184,78 @@ fn validate_group_protocol(records: &[Record], group: u64) -> Result<(), Fail> {
     Ok(())
 }
 
+/// The namespace half of the ordered-record protocol. The shared grammar
+/// already refuses an observation whose ends moved backwards; this reads the
+/// same records for what they prove about the two operations that move them,
+/// and holds each completed compaction to its bracketing pair.
+fn namespace_coverage(records: &[Record]) -> Result<NsCoverage, Fail> {
+    let mut cov = NsCoverage::default();
+    let mut pre: Option<(u64, u64, u64)> = None; // the open compaction's `precompact`
+    let mut prev_lo: Option<u64> = None; // the previous observation of ANY kind
+    for rec in records {
+        if let Record::Namespace { at, lo, hi, count } = rec {
+            match at {
+                NsAt::Group => {
+                    // Only two things sit between the previous observation and
+                    // this one: the group's applies, and its commit. Explicit
+                    // compaction is accounted by its own bracketing pair, so a
+                    // floor that advanced here advanced INSIDE `commit` — the
+                    // automatic path.
+                    if let Some(prev) = prev_lo {
+                        if *lo > prev {
+                            cov.autoclean_events += 1;
+                        }
+                    }
+                    prev_lo = Some(*lo);
+                }
+                NsAt::PreCompact => {
+                    pre = Some((*lo, *hi, *count));
+                    prev_lo = Some(*lo);
+                }
+                NsAt::PostCompact => {
+                    let Some((plo, phi, pcount)) = pre else {
+                        return Err(fail(
+                            "ns-compact-bracket",
+                            "a postcompact observation with no precompact",
+                        ));
+                    };
+                    // A whole-log clean rolls to a fresh segment and retires
+                    // everything below it, so a multi-segment log MUST come out
+                    // with a higher floor. (A single-segment log has nothing
+                    // below the active one to retire — K4 keeps it.)
+                    if pcount > 1 && *lo <= plo {
+                        return Err(fail(
+                            "ns-compact-no-retire",
+                            format!(
+                                "compaction over {pcount} segments [{plo}, {phi}] left the floor \
+                                 at {lo}: a whole-log clean retires every segment below the one \
+                                 it rolls to"
+                            ),
+                        ));
+                    }
+                    if *lo > plo {
+                        cov.compactions_retiring += 1;
+                    }
+                    // What this compaction retired is credited to it, not to
+                    // the automatic path at the next group boundary.
+                    prev_lo = Some(*lo);
+                    pre = None;
+                }
+            }
+        }
+    }
+    if let Some((lo, hi, _)) = records.iter().rev().find_map(|r| match r {
+        Record::Namespace { lo, hi, count, .. } => Some((*lo, *hi, *count)),
+        _ => None,
+    }) {
+        // The store's first segment is seq 1 and neither end ever moves
+        // backwards, so these two comparisons are the whole history.
+        cov.rotated = hi > 1;
+        cov.retired = lo > 1;
+    }
+    Ok(cov)
+}
+
 fn load_journal(path: &PathBuf) -> Result<JournalView, Fail> {
     let bytes = std::fs::read(path).map_err(|e| fail("journal-read", e.to_string()))?;
     let (records, _torn) =
@@ -138,6 +266,8 @@ fn load_journal(path: &PathBuf) -> Result<JournalView, Fail> {
         _ => return Err(fail("journal-no-header", "missing header")),
     };
     validate_group_protocol(&records, group)?;
+    let ns_cov = namespace_coverage(&records)?;
+    let mut ns_last = None;
     let mut cfg = None;
     let mut intents = Vec::new();
     let mut max_ack = 0;
@@ -150,6 +280,7 @@ fn load_journal(path: &PathBuf) -> Result<JournalView, Fail> {
             Record::Intent { .. } => "I",
             Record::PostApply { .. } => "P",
             Record::Ack { .. } => "F",
+            Record::Namespace { .. } => "N",
             Record::Maint { .. } => "M",
             Record::Ready { .. } => "R",
         };
@@ -158,6 +289,7 @@ fn load_journal(path: &PathBuf) -> Result<JournalView, Fail> {
             Record::Intent { seq, digest, .. } => intents.push((seq, digest)),
             Record::PostApply { .. } => {}
             Record::Ack { txid } => max_ack = txid,
+            Record::Namespace { lo, hi, count, .. } => ns_last = Some((lo, hi, count)),
             Record::Maint { begin, .. } => open_maint = begin,
             Record::Ready {
                 ack_txid,
@@ -176,6 +308,8 @@ fn load_journal(path: &PathBuf) -> Result<JournalView, Fail> {
         last_record,
         intents,
         cfg,
+        ns_last,
+        ns: ns_cov,
     })
 }
 
@@ -213,12 +347,37 @@ fn expected_bytes(model: &Model, cfg: &Config, g: u64) -> BTreeMap<Vec<u8>, Vec<
     m
 }
 
+/// Everything the verdict line reports about the namespace. The invariants are
+/// asserted; these are the coverage numbers behind them.
+#[derive(Clone, Copy, Default)]
+struct NsVerdict {
+    segs_at_cut: u64,
+    lo_at_cut: u64,
+    hi_at_cut: u64,
+    /// Residue at the cut: a create that crashed before its header was forced
+    /// (R2). Rare — the window is one `CREATE_NEW` plus one write wide.
+    residue_at_cut: bool,
+    /// A hole in the sequence numbers at the cut. Legitimate, and evidence
+    /// that a cut landed inside an unlink run or that a residue name was burnt.
+    gap_at_cut: u64,
+    /// What RECOVERY did to the namespace: the K5/K8 replay of an unlink the
+    /// crash interrupted, and the successor it rolled to (R7/N1).
+    unlinked_by_recovery: u64,
+    created_by_recovery: bool,
+    /// The floor a `'K'` in the image obliged recovery to reach, or 0 when the
+    /// image carried no valid mark. Reported because it is the one assertion
+    /// here that reads past a segment header: if it were silently always 0 the
+    /// unfinished-unlink rule would be dead code, and the verdict line would
+    /// still say PASS.
+    authorized_floor: i64,
+}
+
 fn check(
     backend: &str,
     store: &Path,
     journal: &PathBuf,
     min_ack: u64,
-) -> Result<(JournalView, u64, u64), Fail> {
+) -> Result<(JournalView, u64, u64, NsVerdict), Fail> {
     let view = load_journal(journal)?;
     if view.cfg.backend != backend {
         return Err(fail("config", "journal backend disagrees with --backend"));
@@ -273,14 +432,201 @@ fn check(
         ));
     }
 
-    let db = DB::<StoreWAL>::make_wal(store).map_err(|e| fail("open", format!("{e:?}")))?;
-    let outcome = check_open(&db, &view, group, g_hi);
-    // Always close (best-effort on the error path) so the WAL file is released.
-    match outcome {
-        Ok((recovered, entries)) => {
-            db.close().map_err(|e| fail("close", format!("{e:?}")))?;
-            Ok((view, recovered, entries))
+    // Coverage the run itself must have produced. Without these two the
+    // namespace assertions below are vacuous — they would be holding a store
+    // that never rotated and never retired to rules about rotating and
+    // retiring — so they are a FAIL, not a counter.
+    if !view.ns.rotated {
+        return Err(fail(
+            "ns-coverage",
+            "the run never rotated: the highest segment sequence stayed 1, so create/rollover, \
+             the forced 'K' and its unlink were never exercised",
+        ));
+    }
+    if !view.ns.retired {
+        return Err(fail(
+            "ns-coverage",
+            "the run never retired a segment: the lowest sequence stayed 1, so no forced 'K' ever \
+             authorized an unlink",
+        ));
+    }
+    if view.ns.compactions_retiring == 0 {
+        return Err(fail(
+            "ns-coverage",
+            "no completed compaction retired anything: the whole-log clean's third phase \
+             (forced 'K' then unlinkThrough) is unproven",
+        ));
+    }
+
+    // The crash image, read BEFORE anything opens it — recovery mutates the
+    // namespace (R2 deletes residue, R5 replays an unlink, R7 rotates), so this
+    // is the only chance to see what the cut actually left behind.
+    // With marks: the floor a forced `'K'` obliges recovery to reach is the one
+    // assertion that cannot be derived from names, and this pre-open scan is the
+    // only observation that can supply it.
+    let pre = wal_namespace::scan_with_marks(store).map_err(|e| fail("ns-scan", e))?;
+    if !pre.marks_scanned {
+        return Err(fail(
+            "ns-scan",
+            "the crash image was scanned without marks: the unfinished-unlink rule would pass \
+             vacuously for the rest of this round",
+        ));
+    }
+    // Before any verdict about the store: is the directory the one this oracle
+    // assumes? Foreign names and `.ckpt` are LEGAL for the format — the store
+    // ignores them — so this is a statement about the harness, not the product,
+    // and it is deliberately not part of `check_image`.
+    pre.check_harness_environment()
+        .map_err(|e| fail("harness-env", e))?;
+    pre.check_image().map_err(|e| fail("ns-image", e))?;
+    let mut nsv = NsVerdict {
+        segs_at_cut: pre.count(),
+        lo_at_cut: pre.lo() as u64,
+        hi_at_cut: pre.hi() as u64,
+        residue_at_cut: !pre.bad().is_empty(),
+        gap_at_cut: pre.gaps(),
+        authorized_floor: pre.authorized_floor().unwrap_or(0),
+        ..NsVerdict::default()
+    };
+    // The image against the last thing the workload saw. Between that
+    // observation and the cut the store may have created names above and
+    // retired names below; it may never do the reverse, and a name it burnt is
+    // gone for good.
+    if let Some((lo, hi, _)) = view.ns_last {
+        if nsv.lo_at_cut < lo || nsv.hi_at_cut < hi {
+            return Err(fail(
+                "ns-regressed-at-cut",
+                format!(
+                    "the crash image holds [{}, {}] but the workload last observed [{lo}, {hi}]: \
+                     a retired name came back, or a burnt one was reused",
+                    nsv.lo_at_cut, nsv.hi_at_cut
+                ),
+            ));
         }
+    }
+
+    let db = DB::<StoreWAL>::make_wal(store).map_err(|e| fail("open", format!("{e:?}")))?;
+    let outcome = check_open(&db, &view, group, g_hi).and_then(|got| {
+        // The namespace recovery left behind. Unlike the image half, nothing
+        // here is excused by the cut point: recovery ran to completion, so
+        // every partially applied namespace operation must now be finished.
+        let post = wal_namespace::scan(store).map_err(|e| fail("ns-scan", e))?;
+        post.check_harness_environment()
+            .map_err(|e| fail("harness-env", e))?;
+        post.check_recovered(&pre)
+            .map_err(|e| fail("ns-recovered", e))?;
+        nsv.unlinked_by_recovery = pre.count().saturating_sub(
+            pre.segs
+                .iter()
+                .filter(|s| post.segs.iter().any(|p| p.seq == s.seq))
+                .count() as u64,
+        );
+        nsv.created_by_recovery = post.count() + nsv.unlinked_by_recovery > pre.count();
+        Ok((got, post))
+    });
+    // Always close (best-effort on the error path) so the segments are released.
+    let ((recovered, entries), post) = match outcome {
+        Ok(v) => {
+            db.close().map_err(|e| fail("close", format!("{e:?}")))?;
+            v
+        }
+        Err(f) => {
+            let _ = db.close();
+            return Err(f);
+        }
+    };
+
+    // The recovery successor: a wrong `nextLsn` or `nextSeq` handoff is
+    // invisible in the store recovery just produced — it only bites the next
+    // thing written. So write one, and reopen.
+    check_successor(store, &view, &post, recovered)?;
+    Ok((view, recovered, entries, nsv))
+}
+
+/// Uses what recovery handed the writer: commits one record on the recovered
+/// store, closes it, and reopens. A successor segment with a stale `firstLsn`,
+/// a reused sequence number, or an `nextLsn` that collides with the recovered
+/// log survives the first open and fails here — which is the point, since
+/// nothing downstream of a crash round would ever have noticed.
+fn check_successor(
+    store: &Path,
+    view: &JournalView,
+    after_recovery: &Namespace,
+    g: u64,
+) -> Result<(), Fail> {
+    let db =
+        DB::<StoreWAL>::make_wal(store).map_err(|e| fail("successor-open", format!("{e:?}")))?;
+    let outcome = (|| -> Result<(), Fail> {
+        let map = db
+            .tree_map("crash", ByteArrayFormat, ByteArrayFormat)
+            .open()
+            .map_err(|e| fail("successor-open-map", format!("{e:?}")))?;
+        map.put(SUCCESSOR_KEY.to_vec(), g.to_string().into_bytes())
+            .map_err(|e| fail("successor-put", format!("{e:?}")))?;
+        db.commit()
+            .map_err(|e| fail("successor-commit", format!("{e:?}")))?;
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => db
+            .close()
+            .map_err(|e| fail("successor-close", format!("{e:?}")))?,
+        Err(f) => {
+            let _ = db.close();
+            return Err(f);
+        }
+    }
+
+    // Reopen: the post-recovery commit must itself be durable, and the whole
+    // recovered state must still be there underneath it.
+    // Reusing the recovery rules here is deliberate and safe: the successor
+    // phase's one small commit can only rotate (one create, above everything)
+    // or auto-clean (a low run retired), and both are already what these rules
+    // permit. It carries no floor of its own — `after_recovery` was scanned
+    // without marks — so the mark rule is skipped rather than answered wrongly.
+    let ns = wal_namespace::scan(store).map_err(|e| fail("ns-scan", e))?;
+    ns.check_harness_environment()
+        .map_err(|e| fail("harness-env", e))?;
+    ns.check_recovered(after_recovery)
+        .map_err(|e| fail("ns-successor", e))?;
+    let db = DB::<StoreWAL>::make_wal(store).map_err(|e| fail("reopen", format!("{e:?}")))?;
+    let outcome = (|| -> Result<(), Fail> {
+        db.store()
+            .verify()
+            .map_err(|e| fail("reopen-verify", format!("{e:?}")))?;
+        let map = db
+            .tree_map("crash", ByteArrayFormat, ByteArrayFormat)
+            .open()
+            .map_err(|e| fail("reopen-map", format!("{e:?}")))?;
+        let mut actual: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for (k, v) in map
+            .entries()
+            .map_err(|e| fail("reopen-read", format!("{e:?}")))?
+        {
+            actual.insert(k, v);
+        }
+        let model = replay_capture(view, &[g])?
+            .remove(&g)
+            .ok_or_else(|| fail("replay", format!("no model snapshot at boundary {g}")))?;
+        let mut expected = expected_bytes(&model, &view.cfg, g);
+        expected.insert(SUCCESSOR_KEY.to_vec(), g.to_string().into_bytes());
+        if actual != expected {
+            return Err(fail(
+                "successor-state-mismatch",
+                format!(
+                    "after a post-recovery commit and reopen, contents != replay({g}) + the \
+                     successor key (entries {}, expected {})",
+                    actual.len(),
+                    expected.len()
+                ),
+            ));
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => db
+            .close()
+            .map_err(|e| fail("reopen-close", format!("{e:?}"))),
         Err(f) => {
             let _ = db.close();
             Err(f)
@@ -458,17 +804,30 @@ fn main() {
         usage()
     };
     match check(&backend, &store, &journal, min_ack) {
-        Ok((view, recovered, entries)) => {
+        Ok((view, recovered, entries, ns)) => {
             let (_, r_groups, r_ckpts, r_compacts) = view.ready.unwrap_or_default();
             println!(
                 "CRASH_CHECK verdict=PASS backend={backend} recovered_txid={recovered} \
                  ack_txid={} intents={} entries={entries} ready_groups={r_groups} \
                  ready_checkpoints={r_ckpts} ready_compactions={r_compacts} \
-                 last_record={} maint_open_at_cut={}",
+                 last_record={} maint_open_at_cut={} ns_segs_at_cut={} ns_seq_lo={} \
+                 ns_seq_hi={} ns_residue_at_cut={} ns_gap_at_cut={} \
+                 ns_unlinked_by_recovery={} ns_created_by_recovery={} \
+                 ns_authorized_floor={} ns_compactions_retiring={} ns_autoclean_events={}",
                 view.max_ack,
                 view.max_intent,
                 view.last_record,
-                u8::from(view.maint_open_at_cut)
+                u8::from(view.maint_open_at_cut),
+                ns.segs_at_cut,
+                ns.lo_at_cut,
+                ns.hi_at_cut,
+                u8::from(ns.residue_at_cut),
+                ns.gap_at_cut,
+                ns.unlinked_by_recovery,
+                u8::from(ns.created_by_recovery),
+                ns.authorized_floor,
+                view.ns.compactions_retiring,
+                view.ns.autoclean_events,
             );
         }
         Err(f) => {

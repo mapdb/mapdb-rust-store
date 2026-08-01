@@ -115,8 +115,10 @@ pub struct DB<S> {
     store: Arc<S>,
     admin: Mutex<Admin>,
     state: AtomicU8,
-    /// Files removed after the store closes (temp DB / delete-after-close). Both
-    /// `<path>` and `<path>.ckpt` are deleted, if present.
+    /// Files removed after the store closes (temp DB / delete-after-close).
+    /// NON-TRANSACTIONAL backends only: a WAL store owns a segment namespace
+    /// rather than a file and deletes it itself, inside `close`, while it still
+    /// holds the store lock (D2).
     cleanup_paths: Vec<PathBuf>,
     /// Closes the backing store. Captured at construction so `Drop` (which cannot
     /// carry `S: Store` bounds) can close without those bounds. NO auto-commit.
@@ -739,13 +741,11 @@ fn combine_close_errors(store_res: Result<()>, cleanup_res: Result<()>) -> Resul
 impl<S> DB<S> {
     fn run_cleanup(&self) -> Result<()> {
         let mut first_err: Option<DbError> = None;
-        for path in &self.cleanup_paths {
-            for p in [path.clone(), with_ckpt(path)] {
-                if p.exists() {
-                    if let Err(e) = std::fs::remove_file(&p) {
-                        if first_err.is_none() {
-                            first_err = Some(DbError::Io(e));
-                        }
+        for p in &self.cleanup_paths {
+            if p.exists() {
+                if let Err(e) = std::fs::remove_file(p) {
+                    if first_err.is_none() {
+                        first_err = Some(DbError::Io(e));
                     }
                 }
             }
@@ -755,13 +755,6 @@ impl<S> DB<S> {
             None => Ok(()),
         }
     }
-}
-
-/// `<path>.ckpt` — the Java WAL checkpoint sidecar.
-fn with_ckpt(path: &std::path::Path) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(".ckpt");
-    PathBuf::from(s)
 }
 
 impl<S> Drop for DB<S> {

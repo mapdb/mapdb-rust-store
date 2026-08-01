@@ -5,8 +5,9 @@
 # the harness binaries against the real StoreWAL open/log-replay/recovery path;
 # it is NOT a power-cut test (the OS page cache survives SIGKILL) and a green run
 # here is no ext4/XFS durability evidence — that is ci/crash/crash-tier.sh's job.
-# Any failure is a real bug by definition: an acked-then-lost write or a corrupt
-# reopen.
+# Any failure is a real bug by definition: an acked-then-lost write, a corrupt
+# reopen, or a format v3 segment namespace the recovery left in a state no
+# sequence of create/unlink/residue-delete could have produced.
 #
 # WAL only: mapdb5's StoreDirect is non-transactional (an uncommitted in-place
 # mutation makes a reopen fail the header checksum by design), so only the WAL
@@ -48,7 +49,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # let images and journals from two executions of the same cell cross-pair
   # undetected.
   RUN_ID="smoke-wal-$round-$$-$(date +%s%N)"
-  "$WORKLOAD" --backend wal --store "$R/store.wal" \
+  "$WORKLOAD" --backend wal --store "$R/store.db" \
     --journal "$R/journal" --run-id "$RUN_ID" \
     --seed "$round" 2>"$R/workload.err" &
   WPID=$!
@@ -76,7 +77,7 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
   # Strict per-round bound: a recovery deadlock must
   # fail the gate, never hang it. 124 = timeout's own verdict.
-  if ! timeout -k 10 120 "$CHECKER" --backend wal --store "$R/store.wal" \
+  if ! timeout -k 10 120 "$CHECKER" --backend wal --store "$R/store.db" \
     --journal "$R/journal" --min-ack "$MIN_ACK" | tee "$R/verdict"; then
     fail "wal round $round checker verdict (124 = 120s timeout)" "$R"
   fi

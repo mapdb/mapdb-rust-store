@@ -192,12 +192,22 @@ impl DBMaker {
                 }
             }
             Backend::File(path) => {
-                if self.delete_after_close {
-                    cleanup.push(path.clone());
-                }
                 if self.transaction_enable {
-                    ConfiguredStore::Wal(StoreWAL::open(path)?)
+                    // D2: a WAL store owns a NAMESPACE, not a file, and deleting
+                    // it is the store's own job — inside `close`, while it still
+                    // holds the store lock. Handing the path to the DB-layer
+                    // cleanup instead would delete after the lock was released,
+                    // where a second opener can already have acquired the
+                    // namespace, and would miss every segment besides.
+                    let wal = StoreWAL::open(path)?;
+                    if self.delete_after_close {
+                        wal.set_delete_on_close(true);
+                    }
+                    ConfiguredStore::Wal(wal)
                 } else {
+                    if self.delete_after_close {
+                        cleanup.push(path.clone());
+                    }
                     let direct = StoreDirect::open_file(path)?;
                     if self.delete_after_open {
                         // Defer: unlink only once `DB::with_cleanup` has validated
@@ -221,11 +231,10 @@ impl DBMaker {
         let db = DB::with_cleanup(Arc::new(store), cleanup)?;
         // Validated as a real MapDB store: now it is safe to unlink for
         // delete-after-open (the open store handle keeps working until close).
-        // Java deletes both `<path>` and `<path>.ckpt` and PROPAGATES a real
-        // deletion error; on failure we tear down the just-built DB (never leaking
+        // Java PROPAGATES a real deletion error; on failure we tear down the just-built DB (never leaking
         // an open handle) and surface the error, preserving any close error (R10).
         if let Some(path) = delete_after_open_path {
-            if let Err(del_err) = remove_file_and_ckpt(&path) {
+            if let Err(del_err) = remove_file(&path) {
                 return Err(match db.close() {
                     Ok(()) => del_err,
                     Err(close_err) => DbError::corrupt_msg(format!(
@@ -238,18 +247,17 @@ impl DBMaker {
     }
 }
 
-/// Delete `<path>` and its `<path>.ckpt` WAL sidecar. A missing file is not an
-/// error (already gone); any other IO error on either file is returned (Java
-/// deletes both and propagates non-NotFound failures — R10).
-fn remove_file_and_ckpt(path: &Path) -> Result<()> {
-    let mut ckpt = path.as_os_str().to_os_string();
-    ckpt.push(".ckpt");
-    for p in [path.to_path_buf(), PathBuf::from(ckpt)] {
-        match std::fs::remove_file(&p) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(DbError::Io(e)),
-        }
+/// Delete `<path>`. A missing file is not an error (already gone); any other IO
+/// error is returned (Java propagates non-NotFound failures — R10).
+///
+/// `fileDeleteAfterOpen` applies to the non-transactional backend only, so this
+/// deletes one file. The `<path>.ckpt` sidecar it also removed belonged to WAL
+/// format v1, which had a rename-checkpoint temp; v3 has no such file, and a WAL
+/// store's namespace is deleted by the store itself under its lock (D2).
+fn remove_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(DbError::Io(e)),
     }
-    Ok(())
 }

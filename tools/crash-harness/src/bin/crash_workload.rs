@@ -32,10 +32,21 @@
 //! Committed states are therefore exactly the group boundaries, and the
 //! committed marker records which one — the facts `crash_check` relies on.
 //!
-//! Maintenance: [`DB::compact`](mapdb_rust_store::db::DB::compact) on a WAL store performs
-//! a log-compacting checkpoint (snapshot + fsync + atomic rename, then replay
-//! from the truncated log), so it is journaled as a `compact` maintenance
-//! interval and is the coverage the readiness policy requires.
+//! Maintenance: [`DB::compact`](mapdb_rust_store::db::DB::compact) on a WAL store cleans
+//! the log — under format v3 that seals the active segment and (from slice A3)
+//! retires the segments below it behind a forced `'K'` mark — so it is
+//! journaled as a `compact` maintenance interval and is the coverage the
+//! readiness policy requires.
+//!
+//! Namespace: format v3 spreads the log over a set of files, and every
+//! maintenance operation is a change to that set — rotate adds a name above,
+//! the forced `'K'` plus `unlinkThrough` removes a run from below, a crashed
+//! create leaves residue, and recovery finishes whichever of those was in
+//! flight. The workload therefore journals an `N` observation of the segment
+//! set at each point where nothing is in flight (after a group's ACK, and on
+//! both sides of a compaction). Those observations are what let `crash_check`
+//! require that a passing round actually rotated and actually retired, and hold
+//! the recovered store to the image it recovered from.
 //!
 //! Readiness: only after the header, the run-id batch plus two later durable
 //! groups, and one completed compaction does the workload journal an `R` record
@@ -45,16 +56,17 @@
 use mapdb_rust_store::db::DB;
 use mapdb_rust_store::ser::bytearray::ByteArrayFormat;
 use mapdb_rust_store_crash_harness::{
-    self as ch, Config, GenOp, MaintKind, Model, Record, COMMITTED_SEQ_KEY, RUN_ID_KEY,
+    self as ch, Config, GenOp, MaintKind, Model, NsAt, Record, COMMITTED_SEQ_KEY, RUN_ID_KEY,
 };
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Maintenance cadence in durable groups: compact (WAL checkpoint) at group 2,
+/// Maintenance cadence in durable groups: compact (whole-log clean) at group 2,
 /// then every 6th group — early enough that the readiness threshold (>=3
-/// groups, >=1 compaction) is met by group 3, and often enough to keep exercising the
-/// log-truncation replay path over a long run.
+/// groups, >=1 compaction) is met by group 3, and often enough to keep
+/// exercising the cleaning cycle's third phase (forced `'K'`, then the unlink
+/// of everything it authorized) over a long run.
 const COMPACT_EVERY: u64 = 6;
 
 struct Journal {
@@ -86,11 +98,29 @@ impl Journal {
 
 fn run(cfg: Config, store_path: PathBuf, journal_path: PathBuf) -> Result<(), String> {
     let db = DB::make_wal(&store_path).map_err(|e| format!("open wal: {e:?}"))?;
-    // Bound the WAL log so the inline auto-checkpoint keeps firing under load,
-    // exercising replay-from-a-truncated-log recovery between explicit compacts.
+    // D8's three knobs, all set explicitly, because at their defaults this test
+    // exercises none of format v3's namespace machinery (design §6 risk 9).
+    //
+    // `segment_bytes` is the load-bearing one: the default is 64 MiB and a
+    // crash round lives for seconds, so the store would write its entire life
+    // into segment 1 — rotate, the forced `'K'` and its unlink would never run,
+    // and the namespace oracle below would assert over a set of one file that
+    // never changed. At 256 KiB a group rotates several times.
+    //
+    // `min_log_bytes` is lowered for the same reason: the cleaning trigger is
+    // `logBytes > max(minLogBytes, spaceAmplification x liveData)`, and at a
+    // 1 GiB floor automatic cleaning never fires at this scale — only the
+    // explicit compactions would, which would leave the automatic path (the one
+    // that runs INSIDE `commit`, where a crash is most interesting) untested.
     db.store()
-        .set_auto_checkpoint_bytes(cfg.max_wal_bytes as i64)
-        .map_err(|e| format!("auto-checkpoint config: {e:?}"))?;
+        .set_segment_bytes(cfg.segment_bytes)
+        .map_err(|e| format!("segment-bytes config: {e:?}"))?;
+    db.store()
+        .set_min_log_bytes(cfg.max_wal_bytes)
+        .map_err(|e| format!("min-log-bytes config: {e:?}"))?;
+    db.store()
+        .set_space_amplification(cfg.space_amplification)
+        .map_err(|e| format!("space-amplification config: {e:?}"))?;
     // Byte-array keys and values so the generated universe round-trips exactly;
     // values-outside-nodes so the large (>256 KiB) size classes become external
     // linked records rather than blowing the node size.
@@ -162,10 +192,17 @@ fn run(cfg: Config, store_path: PathBuf, journal_path: PathBuf) -> Result<(), St
             .map_err(|e| format!("put committed-seq: {e:?}"))?;
         db.commit().map_err(|e| format!("commit: {e:?}"))?;
         journal.append(&Record::Ack { txid: ack })?;
+        // The namespace as it stands at this durable boundary. Appended in the
+        // same buffer as the ACK and synced with it: the ACK's meaning is
+        // unchanged (both are written only after the commit barrier returned,
+        // and both are on disk before the next group starts), and a crash
+        // between the two writes leaves the `N` line as the one torn tail the
+        // grammar already tolerates.
+        journal.append(&observe(&store_path, NsAt::Group)?)?;
         journal.sync()?;
         groups += 1;
 
-        // --- explicit maintenance (WAL log-compacting checkpoint) ---
+        // --- explicit maintenance (whole-log clean) ---
         if groups % COMPACT_EVERY == 2 {
             compactions += 1;
             journal.append(&Record::Maint {
@@ -173,8 +210,14 @@ fn run(cfg: Config, store_path: PathBuf, journal_path: PathBuf) -> Result<(), St
                 kind: MaintKind::Compact,
                 ordinal: compactions,
             })?;
+            // Bracketing the call with observations is what makes a completed
+            // compaction assertable: a whole-log clean must retire every
+            // segment below the one it rolled to, so `lo` has to advance across
+            // this pair unless the log was already a single segment.
+            journal.append(&observe(&store_path, NsAt::PreCompact)?)?;
             journal.sync()?;
             db.compact().map_err(|e| format!("compact: {e:?}"))?;
+            journal.append(&observe(&store_path, NsAt::PostCompact)?)?;
             journal.append(&Record::Maint {
                 begin: false,
                 kind: MaintKind::Compact,
@@ -202,6 +245,28 @@ fn run(cfg: Config, store_path: PathBuf, journal_path: PathBuf) -> Result<(), St
             ready = true;
         }
     }
+}
+
+/// Reads the segment namespace and turns it into a journal record. Called only
+/// with no store operation in flight, so the observation is a real instant of
+/// the file set rather than a smear across one.
+fn observe(store_path: &Path, at: NsAt) -> Result<Record, String> {
+    let ns = ch::wal_namespace::scan(store_path)?;
+    // An open store always has at least one segment; observing none means the
+    // set was torn out from under the workload, and journaling `lo = 0` would
+    // turn that into a grammar violation two binaries later instead of here.
+    if ns.is_empty() {
+        return Err(format!(
+            "namespace observation at {at:?}: no segments under {}",
+            store_path.display()
+        ));
+    }
+    Ok(Record::Namespace {
+        at,
+        lo: ns.lo() as u64,
+        hi: ns.hi() as u64,
+        count: ns.count(),
+    })
 }
 
 fn sentinel_path(journal: &Path) -> PathBuf {
@@ -261,7 +326,11 @@ fn main() {
         keys,
         batch_ops,
         group,
-        max_wal_bytes: 64 << 20,
+        // D8 knobs sized so a seconds-long round actually exercises format v3's
+        // namespace: see the comment at the top of `run`.
+        max_wal_bytes: 1 << 20,
+        segment_bytes: 256 << 10,
+        space_amplification: 1,
     };
     // The loop only returns on error; a healthy workload dies by SIGKILL.
     if let Err(e) = run(cfg, store, journal) {

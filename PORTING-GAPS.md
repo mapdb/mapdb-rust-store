@@ -161,7 +161,7 @@ mapdb5's durability model:
   allocator-consistent unreachable record is not independently rejected. The
   privileged tier's device teardown and the always-on CI gate are likewise open
   follow-ups (the campaign workflow is weekly/on-demand only).
-- **checkpoint == compact.** `StoreWAL::compact` *is* a log-compacting checkpoint,
+- **checkpoint == compact.** `StoreWAL::compact` *is* a log clean,
   so the workload emits only `compact` maintenance records and the readiness policy
   requires `groups>=3 && compactions>=1` (the source's WAL-only `checkpoints>=1`
   collapses into it).
@@ -181,7 +181,14 @@ encoding it was ported from.
 
 They are **not** a statement that a store file interoperates. A store file is
 those codecs plus a header, an allocator layout, a WAL framing and a recovery
-protocol, and those have diverged — the Java engine is on segmented WAL format
-v3 while this lineage is on v1. A per-codec fidelity claim says the bytes of one
-value match; it says nothing about whether another engine can open the file
-those bytes live in. It cannot.
+protocol. The WAL half of that no longer diverges by DESIGN — this engine
+adopted the Java engine's segmented WAL format v3 — but note what does and does
+not yet back that up: the format is pinned byte-for-byte against a
+Java-written segment in `wal_recover.rs`'s test kit, while the cross-engine
+FIXTURES do not pin v3 yet. Stage C is what supplies the v3 namespace bundles;
+until it lands, the four v1 WAL fixture cells are skipped and no fixture
+exercises a v3 namespace. The store file's own header and allocator layout are
+a separate question
+that those fixtures answer per case. A per-codec fidelity claim says the bytes
+of one value match; it says nothing about whether another engine can open the
+file those bytes live in. It cannot.
