@@ -18,8 +18,13 @@
 //! ```
 //!
 //! All integers big-endian; `headerCrc` is zlib CRC-32 over header bytes
-//! `[0, 32)`. It reads headers only — sections, LSN chains and the `'K'` mark
-//! body stay the store's business, and the store's own recovery tests own them.
+//! `[0, 32)`. [`scan`] reads those headers and nothing else. [`scan_with_marks`]
+//! additionally walks each segment's valid section prefix for `'K'` marks,
+//! because the floor a forced mark obliges recovery to reach cannot be derived
+//! from names alone; that walk mirrors the reference's acceptance predicate row
+//! for row and is documented at [`highest_mark`]. Everything else about
+//! sections — what they contain, whether replay applied them — stays the
+//! store's business, and the store's own recovery tests own it.
 //!
 //! # What the namespace is allowed to do
 //!
@@ -43,6 +48,8 @@
 //! that shows up.
 
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 /// magic(8) + version(4) + flags(4) + segmentSeq(8) + firstLsn(8) + headerCrc(4).
@@ -52,23 +59,67 @@ const SEG_HDR_CRC_LEN: usize = 32;
 const MAGIC: &[u8; 8] = b"MDBS.WAL";
 const FORMAT_VERSION: i32 = 3;
 
-/// zlib CRC-32, bitwise. Deliberately not the store's `crc32fast`: 36 bytes per
-/// segment makes the table irrelevant, and an oracle that imported the same
-/// checksum implementation as the code under test would agree with it by
-/// construction.
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in bytes {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
+/// tag(1) + lsn(8) + bodyLen(8) + hdrCrc(4) + bodyCrc(4).
+const SEC_HDR_LEN: usize = 25;
+/// Section-header bytes covered by `hdrCrc`.
+const SEC_HDR_CRC_LEN: usize = 17;
+const TAG_SECTION: u8 = b'S';
+const TAG_IMAGE: u8 = b'C';
+const TAG_MARK: u8 = b'K';
+/// cleanedThroughSeq(8) + logStartLsn(8).
+const MARK_BODY_LEN: u64 = 16;
+
+/// `validTag` (`StoreWAL.java:717-719`). A tag outside this set fails S3
+/// together with the header CRC, so the walk stops there exactly as Java does.
+fn valid_tag(tag: u8) -> bool {
+    matches!(tag, TAG_SECTION | TAG_IMAGE | TAG_MARK)
+}
+
+/// Buffer the body walk streams through. Fixed and stack-resident: a section
+/// body is `bodyLen` wide and `bodyLen` comes off the disk, so it must never
+/// size an allocation.
+const BODY_CHUNK: usize = 8192;
+/// Conservative ceilings on ONE segment's walk. Neither is a format rule — a
+/// stop only ever lowers the derived floor, which weakens the assertion and can
+/// never fail a correct store — but without them a corrupt `bodyLen` chain or a
+/// legitimately enormous segment turns a crash verdict into a checker timeout,
+/// which reads as a product failure. `MAX_WALK_BYTES` is D8's DEFAULT
+/// `segmentBytes`, so a default-configured store is always walked whole.
+const MAX_WALK_BYTES: u64 = 64 << 20;
+const MAX_WALK_SECTIONS: u64 = 1 << 20;
+
+/// zlib CRC-32, bitwise and incremental. Deliberately not the store's
+/// `crc32fast`: an oracle that imported the same checksum implementation as the
+/// code under test would agree with it by construction. Incremental because the
+/// CRC domains here are `segment header ‖ offset ‖ bytes` and a body is read in
+/// bounded chunks — neither may be assembled into a buffer first.
+struct Crc32(u32);
+
+impl Crc32 {
+    fn new() -> Self {
+        Crc32(0xFFFF_FFFF)
+    }
+    fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u32;
+            for _ in 0..8 {
+                self.0 = if self.0 & 1 != 0 {
+                    (self.0 >> 1) ^ 0xEDB8_8320
+                } else {
+                    self.0 >> 1
+                };
+            }
         }
     }
-    !crc
+    fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut c = Crc32::new();
+    c.update(bytes);
+    c.finish()
 }
 
 fn be32(b: &[u8], off: usize) -> i32 {
@@ -90,6 +141,9 @@ pub struct SegmentInfo {
     /// `firstLsn` from the header — meaningless unless `bad` is `None`.
     pub first_lsn: i64,
     pub len: u64,
+    /// Highest `cleanedThroughSeq` authorized by a `'K'` in this segment's
+    /// valid section prefix, if any. Only computed for a valid header.
+    pub mark: Option<i64>,
     /// `None` when every header row passed; otherwise a stable reason code.
     pub bad: Option<&'static str>,
 }
@@ -108,6 +162,12 @@ pub struct Namespace {
     pub legacy_wal: bool,
     /// A `<base>.ckpt` entry — v1's rename-checkpoint (D1).
     pub legacy_ckpt: bool,
+    /// Whether this scan walked section prefixes for `'K'` marks. Recorded
+    /// rather than assumed: [`Namespace::authorized_floor`] answers `None` both
+    /// for "no mark" and for "never looked", and the difference is the whole
+    /// unfinished-unlink rule. [`Namespace::check_recovered`] refuses to be
+    /// asked for the floor rule by a scan that never looked.
+    pub marks_scanned: bool,
 }
 
 impl SegmentInfo {
@@ -119,25 +179,40 @@ impl SegmentInfo {
 /// Reads the 36-byte header and applies rows H1-H9 in the reference's order:
 /// the semantic rows are reached only after the CRC passes, so editing a field
 /// without resealing is a CRC verdict rather than a semantic one.
-fn classify_header(path: &Path, name_seq: i64) -> Result<SegmentInfo, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-    let len = meta.len();
+///
+/// `want_marks` additionally walks the segment's valid section prefix for `'K'`
+/// marks. That is the only thing here that reads past 36 bytes, so it is opt-in:
+/// the workload scans the namespace at every group boundary and needs names
+/// only.
+fn classify_header(path: &Path, name_seq: i64, want_marks: bool) -> Result<SegmentInfo, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
     let mut info = SegmentInfo {
         seq: name_seq,
         first_lsn: 0,
         len,
+        mark: None,
         bad: None,
     };
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    if bytes.is_empty() {
+    // 36 bytes, positionally — NEVER the whole file. A segment is a tuning knob
+    // wide (`StoreWAL::set_segment_bytes`) and a crash image may hold hundreds
+    // of them; reading each one whole to look at its header would let a large
+    // or corrupt image exhaust the checker before it can report a verdict.
+    if len == 0 {
         info.bad = Some("h1-empty");
         return Ok(info);
     }
-    if bytes.len() < SEG_HDR_LEN {
+    if len < SEG_HDR_LEN as u64 {
         info.bad = Some("h2-short");
         return Ok(info);
     }
-    let hdr = &bytes[..SEG_HDR_LEN];
+    let mut hdr_buf = [0u8; SEG_HDR_LEN];
+    file.read_exact_at(&mut hdr_buf, 0)
+        .map_err(|e| format!("read header {}: {e}", path.display()))?;
+    let hdr = &hdr_buf[..];
     if crc32(&hdr[..SEG_HDR_CRC_LEN]) as i32 != be32(hdr, 32) {
         info.bad = Some("h3-hdr-crc");
         return Ok(info);
@@ -161,15 +236,187 @@ fn classify_header(path: &Path, name_seq: i64) -> Result<SegmentInfo, String> {
     info.first_lsn = be64(hdr, 24);
     if info.first_lsn <= 0 {
         info.bad = Some("h9-first-lsn");
+        return Ok(info);
+    }
+    if want_marks {
+        info.mark = highest_mark(&file, &hdr_buf, name_seq, len);
     }
     Ok(info)
+}
+
+/// Walks this segment's VALID SECTION PREFIX and returns the highest
+/// `cleanedThroughSeq` any `'K'` mark in it authorizes.
+///
+/// This is the one place the harness reads past a header, and it exists because
+/// the requirement it serves cannot be met without it: a recovery that simply
+/// *ignores* a forced `'K'` — leaving every segment the mark retired on disk —
+/// removes nothing, so a rule about the shape of what disappeared sees nothing
+/// wrong. The authorized floor has to come from the mark itself.
+///
+/// It mirrors `scanSegment`'s acceptance predicate row for row, and errs in ONE
+/// direction: **any doubt ends the walk**. Reading too little yields a lower
+/// floor and therefore a weaker assertion; reading too much would demand a floor
+/// recovery correctly did not reach, and fail a green CI on a correct store.
+/// Every early return below is that stop, and it is always safe because the rule
+/// this feeds is one-sided (`post.lo() > floor`): a floor below Java's still
+/// holds against a store that retired more.
+///
+/// Mirroring the predicate is not optional, because a section Java REFUSES must
+/// not raise this floor. The rows, in Java's order
+/// (`StoreWAL.java:617-697`), each of which stops the walk here:
+///
+/// - **S3** header CRC over `segment header ‖ offset ‖ hdr[0,17)`, and
+///   `validTag`. Java folds the tag into the same verdict, so a `'X'` section
+///   with a valid CRC ends the prefix rather than being stepped over.
+/// - **S5** `0 <= bodyLen <= len - bodyStart`.
+/// - **S4** the body CRC of **every** section, not just a mark's. Skipping it
+///   would let a torn ordinary body be stepped over and a later mark counted,
+///   which is a floor Java never derives.
+/// - **S2/S9** LSN density. Java restarts density at each segment boundary and
+///   only applies it once `lastLsn != 0`, so it accepts a first section whose
+///   LSN disagrees with the header and defers that to R4's self check. Demanding
+///   the header's `firstLsn` here instead is strictly more conservative, and it
+///   is also how the deliberately unmodelled `lsn == 0` leading-run edge stops.
+/// - **S8** a mark's body is exactly 16 bytes, `through > 0`, and
+///   `0 < logStart <= ` the mark's own LSN.
+/// - **K4** `through < seg.seq`: a mark may not authorize removing its own
+///   segment. Java HOLDS such a segment (`StoreWAL.java:691-694`) and the floor
+///   it carries never reaches R5 — so counting it here is the one construction
+///   that makes this oracle fail a correct store, and it is why every row above
+///   is checked rather than assumed.
+///
+/// Sound because `cleaned_through` is exactly `max` over each segment's valid
+/// prefix (`wal_recover.rs:1241-1254`), taken before R4's adjudication and used
+/// verbatim by R5's `unlink_through` (`:1289`).
+fn highest_mark(file: &File, seg_hdr: &[u8; SEG_HDR_LEN], seg_seq: i64, len: u64) -> Option<i64> {
+    highest_mark_bounded(
+        file,
+        seg_hdr,
+        seg_seq,
+        len,
+        MAX_WALK_BYTES,
+        MAX_WALK_SECTIONS,
+    )
+}
+
+/// [`highest_mark`] with the ceilings injected, so a test can reach them without
+/// building a 64 MiB fixture.
+fn highest_mark_bounded(
+    file: &File,
+    seg_hdr: &[u8; SEG_HDR_LEN],
+    seg_seq: i64,
+    len: u64,
+    max_bytes: u64,
+    max_sections: u64,
+) -> Option<i64> {
+    let mut best: Option<i64> = None;
+    let mut off = SEG_HDR_LEN as u64;
+    let mut expect_lsn = be64(seg_hdr, 24);
+    let mut sections: u64 = 0;
+    let mut buf = [0u8; BODY_CHUNK];
+    loop {
+        sections += 1;
+        if sections > max_sections || off - SEG_HDR_LEN as u64 > max_bytes {
+            return best; // conservative ceiling, never a verdict
+        }
+        if len - off < SEC_HDR_LEN as u64 {
+            return best; // no room for another section header
+        }
+        let mut hdr = [0u8; SEC_HDR_LEN];
+        if file.read_exact_at(&mut hdr, off).is_err() {
+            return best; // short read: the prefix ends here
+        }
+        // S3. The header CRC is domain-bound to this segment's identity AND this
+        // offset, so a section copied from elsewhere fails here exactly as it
+        // does in recovery.
+        let tag = hdr[0];
+        let mut c = Crc32::new();
+        c.update(seg_hdr);
+        c.update(&off.to_be_bytes());
+        c.update(&hdr[..SEC_HDR_CRC_LEN]);
+        if c.finish() as i32 != be32(&hdr, 17) || !valid_tag(tag) {
+            return best;
+        }
+        // S5.
+        let body_len = be64(&hdr, 9);
+        if body_len < 0 {
+            return best;
+        }
+        let body_len = body_len as u64;
+        let body_start = off + SEC_HDR_LEN as u64; // <= len, checked above
+        let Some(body_end) = body_start.checked_add(body_len) else {
+            return best;
+        };
+        if body_end > len {
+            return best; // the body is not all there
+        }
+        // S4, streamed: the body is `bodyLen` wide and `bodyLen` came off the
+        // disk, so it is hashed in fixed chunks and never buffered whole.
+        let mut c = Crc32::new();
+        c.update(seg_hdr);
+        c.update(&off.to_be_bytes());
+        let mut p = body_start;
+        while p < body_end {
+            let n = ((body_end - p) as usize).min(buf.len());
+            if file.read_exact_at(&mut buf[..n], p).is_err() {
+                return best;
+            }
+            c.update(&buf[..n]);
+            p += n as u64;
+        }
+        if c.finish() as i32 != be32(&hdr, 21) {
+            return best;
+        }
+        // S2/S9.
+        let lsn = be64(&hdr, 1);
+        if lsn != expect_lsn {
+            return best;
+        }
+        if tag == TAG_MARK {
+            // S8, then K4.
+            if body_len != MARK_BODY_LEN {
+                return best;
+            }
+            let mut body = [0u8; MARK_BODY_LEN as usize];
+            if file.read_exact_at(&mut body, body_start).is_err() {
+                return best;
+            }
+            let (through, log_start) = (be64(&body, 0), be64(&body, 8));
+            if through <= 0 || log_start <= 0 || log_start > lsn || through >= seg_seq {
+                return best;
+            }
+            best = Some(best.map_or(through, |b: i64| b.max(through)));
+        }
+        // The frozen reference opens an LSN-exhausted image by wrapping
+        // (`wal_recover.rs:1313-1324` records the reachable construction), so
+        // the exhausted edge is a legal image the oracle must not panic on. It
+        // is also the end of any prefix this walk can vouch for.
+        let Some(next) = expect_lsn.checked_add(1) else {
+            return best;
+        };
+        expect_lsn = next;
+        off = body_end;
+    }
 }
 
 /// Enumerates the namespace of `base` (the path handed to `DB::make_wal`).
 ///
 /// Reads the directory once and stats/reads only the 36-byte headers, so it is
-/// cheap enough for the workload to call at every group boundary.
+/// cheap enough for the workload to call at every group boundary. The resulting
+/// [`Namespace`] therefore carries no marks and cannot answer the floor rule;
+/// use [`scan_with_marks`] where that is needed.
 pub fn scan(base: &Path) -> Result<Namespace, String> {
+    scan_inner(base, false)
+}
+
+/// [`scan`], plus a walk of each valid segment's section prefix for the highest
+/// `'K'` it authorizes. Reads the segment bodies, so it is for the crash
+/// checker's one pre-open image scan, not for a hot loop.
+pub fn scan_with_marks(base: &Path) -> Result<Namespace, String> {
+    scan_inner(base, true)
+}
+
+fn scan_inner(base: &Path, want_marks: bool) -> Result<Namespace, String> {
     let dir = base
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -187,6 +434,7 @@ pub fn scan(base: &Path) -> Result<Namespace, String> {
         foreign: Vec::new(),
         legacy_wal: false,
         legacy_ckpt: false,
+        marks_scanned: want_marks,
     };
     for entry in std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
@@ -228,7 +476,8 @@ pub fn scan(base: &Path) -> Result<Namespace, String> {
             ns.foreign.push(name.to_string());
             continue;
         }
-        ns.segs.push(classify_header(&entry.path(), seq)?);
+        ns.segs
+            .push(classify_header(&entry.path(), seq, want_marks)?);
     }
     ns.segs.sort_by_key(|s| s.seq);
     Ok(ns)
@@ -261,6 +510,21 @@ impl Namespace {
     }
     pub fn bad(&self) -> Vec<&SegmentInfo> {
         self.segs.iter().filter(|s| !s.ok()).collect()
+    }
+    /// The highest `cleanedThroughSeq` any valid `'K'` in this set authorizes —
+    /// the floor a recovery of this image is obliged to reach. Recovery
+    /// computes the same reduction (`max` over each segment's valid prefix,
+    /// `wal_recover.rs:1241-1254`) and feeds it to `unlink_through` (`:1289`);
+    /// this one is deliberately never higher (see [`highest_mark`]).
+    ///
+    /// Always `None` for a [`scan`] that did not look — check `marks_scanned`
+    /// before reading anything into the answer.
+    pub fn authorized_floor(&self) -> Option<i64> {
+        self.segs
+            .iter()
+            .filter(|s| s.ok())
+            .filter_map(|s| s.mark)
+            .max()
     }
 
     /// Invariants of a **crash image**, before anything opens it. Everything
@@ -309,11 +573,37 @@ impl Namespace {
                 b.bad.unwrap_or("?")
             ));
         }
+        // The floor a forced `'K'` in the image OBLIGES recovery to reach. This
+        // is the half a shape test cannot see: a recovery that ignores the mark
+        // entirely removes nothing, so "everything removed was a low run" holds
+        // vacuously and the segments the mark retired sit there forever (K5/K8
+        // make an unfinished unlink the NEXT open's job, not a licence to
+        // forget it).
+        // Only a scan that actually looked can be asked; `authorized_floor`
+        // answers `None` for "no mark" and for "never looked" alike, and
+        // silently taking the second for the first is how this rule would
+        // become dead code without a test noticing.
+        if pre.marks_scanned {
+            if let Some(through) = pre.authorized_floor() {
+                if self.lo() <= through {
+                    return Err(format!(
+                        "recovered: a valid 'K' authorizes retiring through {through:016x} but \
+                         the lowest surviving segment is {:016x} — R5 must replay the unlink the \
+                         crash interrupted",
+                        self.lo()
+                    ));
+                }
+            }
+        }
         let (pre_seqs, post_seqs) = (pre.seqs(), self.seqs());
         // W6: a name is never reused. Anything recovery created is strictly
-        // above every name the image held, residue included (the residue name
-        // is burnt by the same rule).
-        let created: Vec<i64> = post_seqs.difference(&pre_seqs).copied().collect();
+        // above every name the image held — and a name whose header was
+        // unreadable is BURNT by that same rule, so recovery deleting the
+        // residue at N and then creating a fresh segment at N is a reuse even
+        // though the two sets have the same members. `created` is therefore
+        // computed against the names that survived AS THEMSELVES.
+        let pre_valid: BTreeSet<i64> = pre.segs.iter().filter(|s| s.ok()).map(|s| s.seq).collect();
+        let created: Vec<i64> = post_seqs.difference(&pre_valid).copied().collect();
         if created.len() > 1 {
             return Err(format!(
                 "recovered: {} new segments {:?} — an open creates at most one (N1's first \
@@ -349,22 +639,49 @@ impl Namespace {
         Ok(())
     }
 
-    /// The rows that hold at every instant, open or closed.
-    fn check_common(&self, what: &str, strict_chain: bool) -> Result<(), String> {
+    /// Hermeticity of the harness's own working directory. **This is not a
+    /// namespace rule and is deliberately not reachable from one** — it is
+    /// called by the crash checker as an environment precondition, before any
+    /// verdict about the store.
+    ///
+    /// The frozen reference IGNORES everything that is not an exact segment
+    /// name: uppercase-hex siblings, wrong-width names, and directories or
+    /// symlinks at segment-shaped names all open perfectly well
+    /// (`WalSegmentSet.java:279-310`; Appendix A.1 "everything else IGNORED").
+    /// A namespace checker that refused them would be making a false claim
+    /// about the FORMAT, and would fail CI on a legal store. `.ckpt` is the
+    /// same: D1's sentinel is a PORTS rule, and Java's constructor tests only a
+    /// regular `<base>.wal` (`WalSegmentSet.java:210-219`).
+    ///
+    /// What it is instead is a statement about this test. The smoke runner
+    /// recreates its work root per campaign and the privileged runner gets a
+    /// fresh filesystem per round, so nothing but the workload writes there and
+    /// the workload creates none of these. One appearing means the round's
+    /// environment is not what the oracle assumes, and every assertion
+    /// downstream is about the wrong thing — a harness failure, reported as
+    /// one.
+    pub fn check_harness_environment(&self) -> Result<(), String> {
         if self.legacy_wal || self.legacy_ckpt {
             return Err(format!(
-                "{what}: a v1 artifact is present (<base>.wal={}, <base>.ckpt={}) — D1 refuses the \
-                 open rather than starting a fresh segment set beside it, so the harness must \
-                 never produce one",
+                "harness environment: the round's own directory holds a v1 artifact \
+                 (<base>.wal={}, <base>.ckpt={}) — nothing in this test creates one, and D1 would \
+                 refuse the next open",
                 self.legacy_wal, self.legacy_ckpt
             ));
         }
         if !self.foreign.is_empty() {
             return Err(format!(
-                "{what}: names under the segment prefix that are not segments: {:?}",
+                "harness environment: the round's own directory holds names under the segment \
+                 prefix that are not segments: {:?}. The store correctly IGNORES these; this test \
+                 creates none, so their presence means something else wrote into the directory",
                 self.foreign
             ));
         }
+        Ok(())
+    }
+
+    /// The rows that hold at every instant, open or closed.
+    fn check_common(&self, what: &str, strict_chain: bool) -> Result<(), String> {
         if self.is_empty() {
             return Err(format!(
                 "{what}: no segments at all — an open always leaves at least one (N1 creates the \
@@ -440,6 +757,49 @@ mod tests {
         let crc = crc32(&h[..SEG_HDR_CRC_LEN]) as i32;
         h[32..36].copy_from_slice(&crc.to_be_bytes());
         h
+    }
+
+    /// A section: `tag | lsn i64 | bodyLen i64 | hdrCrc i32 | bodyCrc i32`, both
+    /// CRCs domain-bound to the segment header and this section's offset.
+    fn section(seg_hdr: &[u8], off: u64, tag: u8, lsn: i64, body: &[u8]) -> Vec<u8> {
+        let dom = |extra: &[u8]| {
+            let mut d = seg_hdr.to_vec();
+            d.extend_from_slice(&off.to_be_bytes());
+            d.extend_from_slice(extra);
+            crc32(&d) as i32
+        };
+        let mut h = vec![0u8; SEC_HDR_LEN];
+        h[0] = tag;
+        h[1..9].copy_from_slice(&lsn.to_be_bytes());
+        h[9..17].copy_from_slice(&(body.len() as i64).to_be_bytes());
+        let hdr_crc = dom(&h[..SEC_HDR_CRC_LEN]);
+        h[17..21].copy_from_slice(&hdr_crc.to_be_bytes());
+        h[21..25].copy_from_slice(&dom(body).to_be_bytes());
+        h.extend_from_slice(body);
+        h
+    }
+
+    fn mark_body(through: i64, log_start: i64) -> Vec<u8> {
+        let mut b = through.to_be_bytes().to_vec();
+        b.extend_from_slice(&log_start.to_be_bytes());
+        b
+    }
+
+    /// Writes a segment whose sections are the given `(tag, body)` pairs, at
+    /// consecutive LSNs from `first_lsn`.
+    fn write_seg_with(base: &Path, seq: i64, first_lsn: i64, secs: &[(u8, Vec<u8>)]) {
+        let hdr = header(seq, first_lsn);
+        let mut bytes = hdr.clone();
+        for (i, (tag, body)) in secs.iter().enumerate() {
+            let off = bytes.len() as u64;
+            let s = section(&hdr, off, *tag, first_lsn + i as i64, body);
+            bytes.extend_from_slice(&s);
+        }
+        let p = base.with_file_name(format!(
+            "{}.wal.{seq:016x}",
+            base.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::write(p, bytes).expect("write segment");
     }
 
     fn write_seg(base: &Path, seq: i64, first_lsn: i64) {
@@ -660,21 +1020,300 @@ mod tests {
         assert!(err.contains("does not increase"), "{err}");
     }
 
+    /// Foreign names and `.ckpt` are a HARNESS-environment verdict, never a
+    /// namespace one. The reference ignores both, so a namespace checker that
+    /// refused them would fail CI on a legal store; the crash checker asks for
+    /// them separately, before it says anything about the product.
     #[test]
-    fn v1_artifacts_and_foreign_names_are_refused() {
+    fn v1_artifacts_and_foreign_names_are_a_harness_verdict_not_a_namespace_one() {
         let dir = scratch("legacy");
         let base = base_in(&dir);
         write_seg(&base, 1, 1);
         std::fs::write(dir.join("store.db.ckpt"), b"v1").unwrap();
         let ns = scan(&base).expect("scan");
         assert!(ns.legacy_ckpt);
-        assert!(ns.check_image().unwrap_err().contains("v1 artifact"));
+        ns.check_image()
+            .expect("a `.ckpt` sibling does not make the namespace illegal");
+        ns.check_recovered(&ns).expect("nor after recovery");
+        assert!(ns
+            .check_harness_environment()
+            .unwrap_err()
+            .contains("v1 artifact"));
 
         std::fs::remove_file(dir.join("store.db.ckpt")).unwrap();
+        // Every shape the store ignores: wrong width, uppercase hex, a
+        // directory at a well-formed segment name.
         std::fs::write(dir.join("store.db.wal.000000000000000Z"), b"x").unwrap();
+        std::fs::write(dir.join("store.db.wal.000000000000000A"), b"x").unwrap();
+        std::fs::create_dir(dir.join("store.db.wal.00000000000000ff")).unwrap();
         let ns = scan(&base).expect("scan");
-        assert_eq!(ns.count(), 1, "the non-hex name is not a segment");
-        assert!(ns.check_image().unwrap_err().contains("not segments"));
+        assert_eq!(ns.count(), 1, "none of them is a segment");
+        assert_eq!(ns.foreign.len(), 3);
+        ns.check_image()
+            .expect("the store IGNORES these, so the namespace is legal");
+        ns.check_recovered(&ns).expect("still legal after recovery");
+        assert!(ns
+            .check_harness_environment()
+            .unwrap_err()
+            .contains("something else wrote into the directory"));
+    }
+
+    /// The defect a shape test cannot see: recovery that ignores a forced `'K'`
+    /// removes NOTHING, so "everything removed was a low run" holds vacuously.
+    #[test]
+    fn a_forced_mark_obliges_recovery_to_reach_its_floor() {
+        let dir = scratch("mark");
+        let base = base_in(&dir);
+        write_seg(&base, 1, 1);
+        write_seg(&base, 2, 2);
+        // Segment 3 carries a mark retiring everything through 2.
+        write_seg_with(&base, 3, 3, &[(TAG_MARK, mark_body(2, 3))]);
+        let pre = scan_with_marks(&base).expect("scan");
+        assert_eq!(pre.authorized_floor(), Some(2), "the mark was read");
+
+        // A recovery that unlinked nothing: same set, no hole, no reuse — every
+        // other rule in this module passes it.
+        let err = pre.check_recovered(&pre).expect_err("the mark was ignored");
+        assert!(err.contains("authorizes retiring through"), "{err}");
+
+        // Having replayed the unlink, it passes.
+        let dir2 = scratch("mark-done");
+        let b2 = base_in(&dir2);
+        write_seg_with(&b2, 3, 3, &[(TAG_MARK, mark_body(2, 3))]);
+        let post = scan(&b2).expect("scan");
+        post.check_recovered(&pre).expect("unlink replayed");
+    }
+
+    /// `unlinkThrough(t)` removes every segment with `seq <= t`, so the surviving
+    /// low name must be strictly ABOVE the floor. A checker written with `<`
+    /// instead of `<=` passes the test above and fails only here.
+    #[test]
+    fn the_floor_is_inclusive_so_the_authorized_segment_itself_must_be_gone() {
+        let dir = scratch("mark-eq");
+        let base = base_in(&dir);
+        write_seg(&base, 2, 2);
+        write_seg_with(&base, 3, 3, &[(TAG_MARK, mark_body(2, 3))]);
+        let pre = scan_with_marks(&base).expect("scan");
+        assert_eq!(pre.authorized_floor(), Some(2));
+        // Segment 2 IS the segment the mark authorized; leaving it is the
+        // unfinished unlink.
+        let err = pre
+            .check_recovered(&pre)
+            .expect_err("lo == through is not good enough");
+        assert!(err.contains("authorizes retiring through"), "{err}");
+    }
+
+    /// **The construction that made the first version of this oracle unsound.**
+    /// A CRC-valid mark that authorizes removing its OWN segment fails K4, so
+    /// Java holds that segment and never derives its floor
+    /// (`StoreWAL.java:691-694`). An oracle that read the number anyway would
+    /// demand a floor of 100 and fail a recovery that correctly retired
+    /// through 2.
+    #[test]
+    fn a_k4_invalid_mark_is_not_authority_even_with_a_valid_crc() {
+        let dir = scratch("mark-k4");
+        let base = base_in(&dir);
+        // Segment 2's mark authorizes removing segment 100 — including itself.
+        write_seg_with(&base, 2, 2, &[(TAG_MARK, mark_body(100, 1))]);
+        // Segment 3's mark is the real one.
+        write_seg_with(&base, 3, 3, &[(TAG_MARK, mark_body(2, 3))]);
+        let pre = scan_with_marks(&base).expect("scan");
+        assert_eq!(
+            pre.authorized_floor(),
+            Some(2),
+            "K4 refuses the mark in segment 2; only segment 3's counts"
+        );
+
+        // What a CORRECT recovery leaves: everything through 2 retired.
+        let dir2 = scratch("mark-k4-post");
+        let b2 = base_in(&dir2);
+        write_seg_with(&b2, 3, 3, &[(TAG_MARK, mark_body(2, 3))]);
+        let post = scan(&b2).expect("scan");
+        post.check_recovered(&pre)
+            .expect("a correct recovery must not be failed by a mark Java held");
+    }
+
+    /// The walk stops at the first thing it cannot vouch for, so a mark behind
+    /// damage never raises the floor. Reading too little only weakens the
+    /// assertion; reading too much would fail a correct store.
+    #[test]
+    fn a_mark_is_only_counted_inside_the_valid_section_prefix() {
+        let dir = scratch("mark-prefix");
+        let base = base_in(&dir);
+        let name = |seq: i64| {
+            base.with_file_name(format!(
+                "{}.wal.{seq:016x}",
+                base.file_name().unwrap().to_str().unwrap()
+            ))
+        };
+        let floor = || scan_with_marks(&base).expect("scan").authorized_floor();
+
+        // A torn section ahead of the mark: the walk stops at the tear.
+        write_seg_with(&base, 9, 1, &[(TAG_MARK, mark_body(7, 1))]);
+        let mut bytes = std::fs::read(name(9)).unwrap();
+        bytes[SEG_HDR_LEN + 20] ^= 0xff; // corrupt the section header CRC
+        std::fs::write(name(9), &bytes).unwrap();
+        assert_eq!(floor(), None);
+
+        // A torn mark BODY is not authority either.
+        write_seg_with(&base, 9, 1, &[(TAG_MARK, mark_body(7, 1))]);
+        let mut bytes = std::fs::read(name(9)).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xff; // corrupt the body
+        std::fs::write(name(9), &bytes).unwrap();
+        assert_eq!(floor(), None);
+
+        // A mark whose body is not all there yet.
+        write_seg_with(&base, 9, 1, &[(TAG_MARK, mark_body(7, 1))]);
+        let bytes = std::fs::read(name(9)).unwrap();
+        std::fs::write(name(9), &bytes[..bytes.len() - 4]).unwrap();
+        assert_eq!(floor(), None);
+
+        // A mark AFTER an ordinary section is reached; the highest wins.
+        write_seg_with(
+            &base,
+            9,
+            1,
+            &[
+                (b'S', vec![9u8; 40]),
+                (TAG_MARK, mark_body(3, 2)),
+                (TAG_MARK, mark_body(5, 3)),
+            ],
+        );
+        assert_eq!(floor(), Some(5));
+
+        // An ordinary section whose BODY is corrupt (its own CRC no longer
+        // matches) ends the prefix — a walk that only checksummed marks would
+        // step over it and count the 5 behind it.
+        let hdr = header(9, 1);
+        let mut bytes = hdr.clone();
+        let off = bytes.len() as u64;
+        bytes.extend_from_slice(&section(&hdr, off, b'S', 1, &[9u8; 40]));
+        let corrupt_at = bytes.len() - 1;
+        bytes[corrupt_at] ^= 0xff;
+        let off = bytes.len() as u64;
+        bytes.extend_from_slice(&section(&hdr, off, TAG_MARK, 2, &mark_body(5, 1)));
+        std::fs::write(name(9), &bytes).unwrap();
+        assert_eq!(floor(), None, "a torn ordinary body ends the prefix");
+
+        // A tag outside {S, C, K} fails S3 with the header CRC, so it ends the
+        // prefix rather than being stepped over.
+        let mut bytes = hdr.clone();
+        let off = bytes.len() as u64;
+        bytes.extend_from_slice(&section(&hdr, off, b'X', 1, &[1u8; 8]));
+        let off = bytes.len() as u64;
+        bytes.extend_from_slice(&section(&hdr, off, TAG_MARK, 2, &mark_body(5, 1)));
+        std::fs::write(name(9), &bytes).unwrap();
+        assert_eq!(floor(), None, "an unknown tag ends the prefix");
+
+        // S8's logStart rows: it must be positive and at or below the mark's
+        // own LSN.
+        write_seg_with(&base, 9, 1, &[(TAG_MARK, mark_body(7, 5))]);
+        assert_eq!(floor(), None, "logStart 5 is above the mark's LSN 1");
+        write_seg_with(&base, 9, 1, &[(TAG_MARK, mark_body(7, 0))]);
+        assert_eq!(floor(), None, "logStart 0 is not an LSN");
+
+        // A section whose LSN breaks the run ends the walk before the mark.
+        let mut bytes = hdr.clone();
+        let off = bytes.len() as u64;
+        bytes.extend_from_slice(&section(&hdr, off, b'S', 99, &[1u8; 8]));
+        let off = bytes.len() as u64;
+        bytes.extend_from_slice(&section(&hdr, off, TAG_MARK, 100, &mark_body(4, 1)));
+        std::fs::write(name(9), &bytes).unwrap();
+        assert_eq!(floor(), None);
+    }
+
+    /// The LSN-exhausted image is one the frozen reference OPENS (it wraps to
+    /// `i64::MIN`), so the walk must end at it rather than overflow. Before this
+    /// was checked the increment panicked in a debug build of the checker.
+    #[test]
+    fn an_lsn_exhausted_segment_ends_the_walk_instead_of_overflowing() {
+        let dir = scratch("mark-lsn-max");
+        let base = base_in(&dir);
+        write_seg_with(&base, 9, i64::MAX, &[(TAG_MARK, mark_body(4, 1))]);
+        let ns = scan_with_marks(&base).expect("scan");
+        assert_eq!(
+            ns.authorized_floor(),
+            Some(4),
+            "the mark at i64::MAX is vouched for; the walk simply cannot continue past it"
+        );
+    }
+
+    /// The ceilings are a stop, never a verdict: reaching one lowers the floor,
+    /// which weakens the assertion and can never fail a correct store.
+    #[test]
+    fn the_walk_ceilings_stop_conservatively() {
+        let dir = scratch("mark-bound");
+        let base = base_in(&dir);
+        write_seg_with(
+            &base,
+            9,
+            1,
+            &[
+                (TAG_MARK, mark_body(1, 1)),
+                (TAG_MARK, mark_body(2, 2)),
+                (TAG_MARK, mark_body(3, 3)),
+            ],
+        );
+        let path = base.with_file_name("store.db.wal.0000000000000009");
+        let file = File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let mut hdr = [0u8; SEG_HDR_LEN];
+        file.read_exact_at(&mut hdr, 0).unwrap();
+
+        let all = highest_mark_bounded(&file, &hdr, 9, len, u64::MAX, u64::MAX);
+        assert_eq!(all, Some(3), "unbounded, every mark is read");
+        let capped = highest_mark_bounded(&file, &hdr, 9, len, u64::MAX, 2);
+        assert_eq!(capped, Some(2), "the section ceiling stops the walk early");
+        let capped = highest_mark_bounded(&file, &hdr, 9, len, 1, u64::MAX);
+        assert_eq!(capped, Some(1), "so does the byte ceiling");
+    }
+
+    /// A scan that never looked answers `None` exactly like a scan that found
+    /// nothing, so the floor rule is skipped rather than passed vacuously — and
+    /// the crash checker asserts `marks_scanned` before it relies on it.
+    #[test]
+    fn the_floor_rule_is_skipped_by_a_scan_that_did_not_look_for_marks() {
+        let dir = scratch("mark-unscanned");
+        let base = base_in(&dir);
+        write_seg(&base, 1, 1);
+        write_seg_with(&base, 3, 3, &[(TAG_MARK, mark_body(2, 3))]);
+
+        let headers_only = scan(&base).expect("scan");
+        assert!(!headers_only.marks_scanned);
+        assert_eq!(headers_only.authorized_floor(), None);
+        headers_only
+            .check_recovered(&headers_only)
+            .expect("no floor was derived, so no floor is demanded");
+
+        let with_marks = scan_with_marks(&base).expect("scan");
+        assert!(with_marks.marks_scanned);
+        assert_eq!(with_marks.authorized_floor(), Some(2));
+        assert!(with_marks.check_recovered(&with_marks).is_err());
+    }
+
+    /// Deleting the residue at N and creating a fresh segment AT N leaves both
+    /// sets with the same members, so a membership diff sees no new name at all.
+    #[test]
+    fn recovery_may_not_create_at_a_residue_name_it_just_deleted() {
+        let dir = scratch("residue-reuse");
+        let base = base_in(&dir);
+        write_seg(&base, 4, 9);
+        let top = base.with_file_name(format!(
+            "{}.wal.{:016x}",
+            base.file_name().unwrap().to_str().unwrap(),
+            5
+        ));
+        std::fs::write(&top, [0u8; 12]).unwrap(); // residue at 5
+        let pre = scan(&base).expect("scan");
+
+        let dir2 = scratch("residue-reuse-post");
+        let b2 = base_in(&dir2);
+        write_seg(&b2, 4, 9);
+        write_seg(&b2, 5, 11); // a VALID segment at the burnt name
+        let post = scan(&b2).expect("scan");
+        let err = post.check_recovered(&pre).expect_err("5 was burnt");
+        assert!(err.contains("never reuses one"), "{err}");
     }
 
     #[test]

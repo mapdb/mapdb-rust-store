@@ -566,10 +566,17 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
     let mut next_ord = [1u64, 1u64]; // [checkpoint, compact]
     let mut prev_ns: Option<(u64, u64)> = None; // (lo, hi)
     let mut saw_precompact = false;
+    let mut saw_postcompact = false;
+    // A group observation is only meaningful attached to the durability point
+    // it describes, so the grammar accepts one only DIRECTLY after an ACK —
+    // which is the only place the workload emits one. Without this the format
+    // would accept coverage evidence no real run could produce.
+    let mut expect_group_ns = false;
     for (i, rec) in records.iter().enumerate() {
         if i == 0 && !matches!(rec, Record::Header(_)) {
             return Err(JournalError("journal-no-header"));
         }
+        let ack_just_before = std::mem::take(&mut expect_group_ns);
         match rec {
             Record::Header(_) => {
                 if saw_header {
@@ -594,6 +601,7 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
                 }
                 max_ack = *txid;
                 acks += 1;
+                expect_group_ns = true;
             }
             // The namespace rules the STORE must obey, enforced over the
             // workload's own observations and independently of the store: a
@@ -615,17 +623,27 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
                 // Position is part of the meaning: `postcompact` must name the
                 // state a completed compaction left behind.
                 match (at, open_maint) {
-                    (NsAt::Group, None) => {}
+                    // Exactly one per ACK, and only there: `ack_just_before`
+                    // was set by the previous record and cleared by any other.
+                    (NsAt::Group, None) => {
+                        if !ack_just_before {
+                            return Err(JournalError("journal-namespace-position"));
+                        }
+                    }
                     (NsAt::PreCompact, Some((MaintKind::Compact, _))) => {
                         if saw_precompact {
                             return Err(JournalError("journal-namespace-position"));
                         }
                         saw_precompact = true;
                     }
+                    // Consumed, so a second `postcompact` inside one interval is
+                    // refused just as a second `precompact` is.
                     (NsAt::PostCompact, Some((MaintKind::Compact, _))) => {
                         if !saw_precompact {
                             return Err(JournalError("journal-namespace-position"));
                         }
+                        saw_precompact = false;
+                        saw_postcompact = true;
                     }
                     _ => return Err(JournalError("journal-namespace-position")),
                 }
@@ -646,9 +664,18 @@ fn validate_order(records: &[Record]) -> Result<(), JournalError> {
                     open_maint = Some((*kind, *ordinal));
                     next_ord[slot] += 1;
                     saw_precompact = false;
+                    saw_postcompact = false;
                 } else {
                     if open_maint != Some((*kind, *ordinal)) {
                         return Err(JournalError("journal-maint-order"));
+                    }
+                    // A COMPLETED compaction is what the retiring-floor rule is
+                    // asserted over, and it is asserted across the pre/post
+                    // pair. The workload writes `postcompact` before the closing
+                    // record and syncs both together, so a cut can lose the
+                    // close but never the observation.
+                    if matches!(kind, MaintKind::Compact) && !saw_postcompact {
+                        return Err(JournalError("journal-maint-unobserved"));
                     }
                     open_maint = None;
                     done_pairs[slot] += 1;
@@ -831,6 +858,24 @@ mod tests {
             parse_journal(&b).map(|(r, _)| r)
         };
         let head = Record::Header(cfg());
+        // A group observation is legal only directly after an ACK, so every
+        // fixture below has to earn its position the way the workload does.
+        let ack_then = |recs: &mut Vec<Record>, seq: u64| {
+            recs.push(Record::Intent {
+                seq,
+                txid: seq,
+                digest: 0,
+            });
+            recs.push(Record::Ack { txid: seq });
+        };
+        let after_acks = |ns_recs: &[Record]| {
+            let mut recs = vec![head.clone()];
+            for (i, n) in ns_recs.iter().enumerate() {
+                ack_then(&mut recs, i as u64 + 1);
+                recs.push(n.clone());
+            }
+            recs
+        };
 
         // Shape: a set is never empty, `hi` is never below `lo`, and a set
         // cannot hold more segments than its own range has names.
@@ -841,7 +886,7 @@ mod tests {
             ns(NsAt::Group, 1, 4, 5),
         ] {
             assert_eq!(
-                journal(&[head.clone(), bad]).unwrap_err(),
+                journal(&after_acks(&[bad])).unwrap_err(),
                 JournalError("journal-namespace-shape")
             );
         }
@@ -851,15 +896,14 @@ mod tests {
         // segment came back; a `hi` that fell means a burnt name was reused.
         for bad in [ns(NsAt::Group, 2, 9, 1), ns(NsAt::Group, 4, 8, 1)] {
             assert_eq!(
-                journal(&[head.clone(), ns(NsAt::Group, 3, 9, 3), bad]).unwrap_err(),
+                journal(&after_acks(&[ns(NsAt::Group, 3, 9, 3), bad])).unwrap_err(),
                 JournalError("journal-namespace-monotonic")
             );
         }
-        journal(&[
-            head.clone(),
+        journal(&after_acks(&[
             ns(NsAt::Group, 3, 9, 3),
             ns(NsAt::Group, 3, 9, 3),
-        ])
+        ]))
         .expect("standing still is legitimate");
 
         // Position: a compaction observation only means something inside its
@@ -869,6 +913,13 @@ mod tests {
             kind: MaintKind::Compact,
             ordinal: 1,
         };
+        let end = Record::Maint {
+            begin: false,
+            kind: MaintKind::Compact,
+            ordinal: 1,
+        };
+        let mut acked = vec![head.clone()];
+        ack_then(&mut acked, 1);
         for bad in [
             vec![head.clone(), ns(NsAt::PreCompact, 1, 2, 2)],
             vec![head.clone(), begin.clone(), ns(NsAt::Group, 1, 2, 2)],
@@ -879,17 +930,51 @@ mod tests {
                 ns(NsAt::PreCompact, 1, 2, 2),
                 ns(NsAt::PreCompact, 1, 2, 2),
             ],
+            // A group observation detached from the ACK it is supposed to
+            // describe: right after the header, and a second one after an ACK
+            // that already had its own.
+            vec![head.clone(), ns(NsAt::Group, 1, 2, 2)],
+            {
+                let mut v = acked.clone();
+                v.push(ns(NsAt::Group, 1, 2, 2));
+                v.push(ns(NsAt::Group, 1, 2, 2));
+                v
+            },
+            // `postcompact` is CONSUMED, so a second one in the same interval
+            // is refused exactly as a second `precompact` is.
+            vec![
+                head.clone(),
+                begin.clone(),
+                ns(NsAt::PreCompact, 1, 2, 2),
+                ns(NsAt::PostCompact, 2, 3, 2),
+                ns(NsAt::PostCompact, 2, 3, 2),
+            ],
         ] {
             assert_eq!(
                 journal(&bad).unwrap_err(),
                 JournalError("journal-namespace-position")
             );
         }
+
+        // A compaction that closes without its `postcompact` never produced the
+        // observation the retiring-floor rule is asserted over.
+        assert_eq!(
+            journal(&[
+                head.clone(),
+                begin.clone(),
+                ns(NsAt::PreCompact, 1, 2, 2),
+                end.clone()
+            ])
+            .unwrap_err(),
+            JournalError("journal-maint-unobserved")
+        );
+
         journal(&[
             head,
             begin,
             ns(NsAt::PreCompact, 1, 2, 2),
             ns(NsAt::PostCompact, 2, 3, 2),
+            end,
         ])
         .expect("a well-formed compaction bracket");
     }

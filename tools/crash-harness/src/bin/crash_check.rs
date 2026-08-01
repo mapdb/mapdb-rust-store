@@ -364,6 +364,12 @@ struct NsVerdict {
     /// crash interrupted, and the successor it rolled to (R7/N1).
     unlinked_by_recovery: u64,
     created_by_recovery: bool,
+    /// The floor a `'K'` in the image obliged recovery to reach, or 0 when the
+    /// image carried no valid mark. Reported because it is the one assertion
+    /// here that reads past a segment header: if it were silently always 0 the
+    /// unfinished-unlink rule would be dead code, and the verdict line would
+    /// still say PASS.
+    authorized_floor: i64,
 }
 
 fn check(
@@ -455,7 +461,23 @@ fn check(
     // The crash image, read BEFORE anything opens it — recovery mutates the
     // namespace (R2 deletes residue, R5 replays an unlink, R7 rotates), so this
     // is the only chance to see what the cut actually left behind.
-    let pre = wal_namespace::scan(store).map_err(|e| fail("ns-scan", e))?;
+    // With marks: the floor a forced `'K'` obliges recovery to reach is the one
+    // assertion that cannot be derived from names, and this pre-open scan is the
+    // only observation that can supply it.
+    let pre = wal_namespace::scan_with_marks(store).map_err(|e| fail("ns-scan", e))?;
+    if !pre.marks_scanned {
+        return Err(fail(
+            "ns-scan",
+            "the crash image was scanned without marks: the unfinished-unlink rule would pass \
+             vacuously for the rest of this round",
+        ));
+    }
+    // Before any verdict about the store: is the directory the one this oracle
+    // assumes? Foreign names and `.ckpt` are LEGAL for the format — the store
+    // ignores them — so this is a statement about the harness, not the product,
+    // and it is deliberately not part of `check_image`.
+    pre.check_harness_environment()
+        .map_err(|e| fail("harness-env", e))?;
     pre.check_image().map_err(|e| fail("ns-image", e))?;
     let mut nsv = NsVerdict {
         segs_at_cut: pre.count(),
@@ -463,6 +485,7 @@ fn check(
         hi_at_cut: pre.hi() as u64,
         residue_at_cut: !pre.bad().is_empty(),
         gap_at_cut: pre.gaps(),
+        authorized_floor: pre.authorized_floor().unwrap_or(0),
         ..NsVerdict::default()
     };
     // The image against the last thing the workload saw. Between that
@@ -488,6 +511,8 @@ fn check(
         // here is excused by the cut point: recovery ran to completion, so
         // every partially applied namespace operation must now be finished.
         let post = wal_namespace::scan(store).map_err(|e| fail("ns-scan", e))?;
+        post.check_harness_environment()
+            .map_err(|e| fail("harness-env", e))?;
         post.check_recovered(&pre)
             .map_err(|e| fail("ns-recovered", e))?;
         nsv.unlinked_by_recovery = pre.count().saturating_sub(
@@ -554,7 +579,14 @@ fn check_successor(
 
     // Reopen: the post-recovery commit must itself be durable, and the whole
     // recovered state must still be there underneath it.
+    // Reusing the recovery rules here is deliberate and safe: the successor
+    // phase's one small commit can only rotate (one create, above everything)
+    // or auto-clean (a low run retired), and both are already what these rules
+    // permit. It carries no floor of its own — `after_recovery` was scanned
+    // without marks — so the mark rule is skipped rather than answered wrongly.
     let ns = wal_namespace::scan(store).map_err(|e| fail("ns-scan", e))?;
+    ns.check_harness_environment()
+        .map_err(|e| fail("harness-env", e))?;
     ns.check_recovered(after_recovery)
         .map_err(|e| fail("ns-successor", e))?;
     let db = DB::<StoreWAL>::make_wal(store).map_err(|e| fail("reopen", format!("{e:?}")))?;
@@ -781,7 +813,7 @@ fn main() {
                  last_record={} maint_open_at_cut={} ns_segs_at_cut={} ns_seq_lo={} \
                  ns_seq_hi={} ns_residue_at_cut={} ns_gap_at_cut={} \
                  ns_unlinked_by_recovery={} ns_created_by_recovery={} \
-                 ns_compactions_retiring={} ns_autoclean_events={}",
+                 ns_authorized_floor={} ns_compactions_retiring={} ns_autoclean_events={}",
                 view.max_ack,
                 view.max_intent,
                 view.last_record,
@@ -793,6 +825,7 @@ fn main() {
                 ns.gap_at_cut,
                 ns.unlinked_by_recovery,
                 u8::from(ns.created_by_recovery),
+                ns.authorized_floor,
                 view.ns.compactions_retiring,
                 view.ns.autoclean_events,
             );
