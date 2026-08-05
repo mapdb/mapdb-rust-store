@@ -1,0 +1,67 @@
+version	2
+fixture	wal3-java-tail	wal3-namespace	java	c3s-golden
+file	wal3-java-tail	x.wal.0000000000000001	5436	ba242762e264bce6dfa9bf2b00347ca13593de999c6c7bb0452aa51c888350e7	7bdd65d83d98b979f3cd829cebf294b163cf4aba1bc3efb273989732e0b1f6a9
+file	wal3-java-tail	x.wal.0000000000000002	427	36ffbf301b4e6fba11b948117afbaffcafebaf072b6171e109272567f5ad1f5a	89266cae776f3ac6b1f060069b772b65ef12e977c0cd74eba7d9f487d149026d
+expect	wal3-java-tail	java	ro	accept	wal3	x
+expect	wal3-java-tail	java	rw	accept	wal3	x
+expect	wal3-java-tail	rust	ro	accept	wal3	x
+expect	wal3-java-tail	rust	rw	accept	wal3	x
+expect	wal3-java-tail	zig	ro	accept	wal3	x
+expect	wal3-java-tail	zig	rw	accept	wal3	x
+post	wal3-java-tail	java	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-tail	java	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-tail	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-tail	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-tail	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-tail	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+recid	wal3-java-tail	r1	1	live	103	120
+recid	wal3-java-tail	r2	2	live	104	64
+recid	wal3-java-tail	r3	3	prealloc	0	0
+recidrange	wal3-java-tail	r4_9	4	9	live	111	700
+recid	wal3-java-tail	r10	10	prealloc	0	0
+recid	wal3-java-tail	r11	11	live	0	0
+recid	wal3-java-tail	r12	12	null	105	32
+fixture	wal3-java-cleaned	wal3-namespace	java	c3s-golden
+file	wal3-java-cleaned	x.wal.0000000000000003	4502	af5cfd90c72255e7d34a34b8c2b760a2d51b8cea96cde9ae29a350d97bd1f5c1	618fce0a04e1f8e2884a941cbf54e0040f92f81683af859f9e6e653f559a8562
+file	wal3-java-cleaned	x.wal.0000000000000004	77	c790df30fb87a5899e9d5c07ecfa0f68ba5765f3d9e005236e508363d4d6da54	befed06b2ac3995778485bf36077b82e317810a3f34fcfe41d0c6539ed0b06cc
+expect	wal3-java-cleaned	java	ro	accept	wal3	x
+expect	wal3-java-cleaned	java	rw	accept	wal3	x
+expect	wal3-java-cleaned	rust	ro	accept	wal3	x
+expect	wal3-java-cleaned	rust	rw	accept	wal3	x
+expect	wal3-java-cleaned	zig	ro	accept	wal3	x
+expect	wal3-java-cleaned	zig	rw	accept	wal3	x
+post	wal3-java-cleaned	java	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-cleaned	java	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-cleaned	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-cleaned	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-cleaned	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-java-cleaned	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+recid	wal3-java-cleaned	r1	1	live	113	120
+recid	wal3-java-cleaned	r2	2	live	114	64
+recid	wal3-java-cleaned	r3	3	prealloc	0	0
+recidrange	wal3-java-cleaned	r4_9	4	9	live	121	700
+recid	wal3-java-cleaned	r10	10	prealloc	0	0
+recid	wal3-java-cleaned	r11	11	live	0	0
+recid	wal3-java-cleaned	r12	12	null	0	0
+fixture	wal3-zig-tail	wal3-namespace	zig	c3s-golden
+file	wal3-zig-tail	x.wal.0000000000000001	5436	a94feb488e397dbfc1ef823501b52267a8db7d3f0648c5a6fd15c96f4c554b10	90237dfa113b3bf8d357563532626a980a27262d97a85552708302e06b769b3d
+file	wal3-zig-tail	x.wal.0000000000000002	427	8eb07d25d21ab7460a786a64a1f9f6e470628e3853594aecc560bdf1dc3ad032	3428f8345757d57b705d5a921f4b9882e1fc94083c6527c8168ac6e281eb0c83
+expect	wal3-zig-tail	java	ro	accept	wal3	x
+expect	wal3-zig-tail	java	rw	accept	wal3	x
+expect	wal3-zig-tail	rust	ro	accept	wal3	x
+expect	wal3-zig-tail	rust	rw	accept	wal3	x
+expect	wal3-zig-tail	zig	ro	accept	wal3	x
+expect	wal3-zig-tail	zig	rw	accept	wal3	x
+post	wal3-zig-tail	java	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-zig-tail	java	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-zig-tail	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-zig-tail	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-zig-tail	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+post	wal3-zig-tail	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+recid	wal3-zig-tail	r1	1	live	143	120
+recid	wal3-zig-tail	r2	2	live	144	64
+recid	wal3-zig-tail	r3	3	prealloc	0	0
+recidrange	wal3-zig-tail	r4_9	4	9	live	151	700
+recid	wal3-zig-tail	r10	10	prealloc	0	0
+recid	wal3-zig-tail	r11	11	live	0	0
+recid	wal3-zig-tail	r12	12	null	145	32

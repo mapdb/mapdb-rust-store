@@ -79,10 +79,10 @@ pub(crate) const TAG_MARK: u8 = b'K';
 /// not a record, so it is not packLong-framed.
 pub(crate) const MARK_BODY_LEN: i64 = 16;
 
-const T_PREALLOC: u8 = 1;
-const T_RECORD: u8 = 2;
-const T_APPEND: u8 = 3;
-const T_DELETE: u8 = 4;
+pub(crate) const T_PREALLOC: u8 = 1;
+pub(crate) const T_RECORD: u8 = 2;
+pub(crate) const T_APPEND: u8 = 3;
+pub(crate) const T_DELETE: u8 = 4;
 
 /// `'S'`, `'C'` and `'K'` — **all three**, in the main scan and in the
 /// lookahead alike.

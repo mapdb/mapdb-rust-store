@@ -1,423 +1,113 @@
-//! Cross-port conformance harness (Stages 1+2) — consumes the checked-in
-//! `tests/xfixtures/` bundle produced by the sync script.
+//! Cross-port conformance harness — **both manifest schemas**, dispatched on
+//! the version line (Stage C slice **C3r**).
 //!
-//! These fixtures pin the CURRENT state of an UNSTABLE on-disk format for
-//! divergence detection between the engines. Cross-engine openability is an
-//! implementation fact, not a supported feature; any format change regenerates
-//! the fixtures as part of that change.
+//! `tests/xfixtures/` is the live schema-v1 tree; `tests/xfixtures-v2/` is the
+//! shared static schema-v2 sample (`todo/store-cross/sample-v2/`, byte for
+//! byte). Keeping both roots in the suite at once is deliberate: C6 is a data
+//! commit, and a reader that only ever saw the schema it was written for would
+//! discover the other one on cutover day.
 //!
-//! Flow: load `MANIFEST.tsv` (HARD-FAIL if missing or version != 1), gunzip
-//! every fixture file once into a session temp dir verifying length + SHA-256,
-//! then run every `expect` row with engine == rust in a fresh per-cell temp
-//! dir: accept cells (direct AND wal openers) run `verify()` + the per-recid
-//! contract + the `get_all_recids` set check; reject cells demand
-//! `DbError::DataCorruption`. Every cell asserts the working copy is
-//! byte-unchanged afterwards and that no files beyond the allowed `.lock`
-//! sidecars appeared (in particular, a `.ckpt` companion must NOT appear
-//! after a wal cell's clean close).
+//! What runs here, and what does not:
+//!
+//! - **v1 cells** — accept/reject, `direct` and `wal` openers, as before.
+//! - **v2 `rw` cells** — through the public [`StoreWAL::open`].
+//! - **v2 `ro` cells** — NOT here. They need the crate-internal read-only
+//!   opener and run in `src/store/xfix_ro.rs` (decision C-D3). Deleting a
+//!   `rw` expect row fails the set check below; deleting an `ro` one fails the
+//!   set check there.
+//! - **the two §11.2 comparisons** — framing against `GOLDEN-DECODE.tsv`,
+//!   decoded bodies against `GOLDEN-BODY.tsv`, which the frozen Java reader
+//!   authored.
 
-use flate2::read::GzDecoder;
-use mapdb_rust_store::error::{DbError, Result};
-use mapdb_rust_store::io::{DataInput2, DataOutput2};
-use mapdb_rust_store::ser::Serializer;
-use mapdb_rust_store::store::{Recid, Store, StoreDirect, StoreWAL};
-use sha2::{Digest, Sha256};
-use std::cmp::Ordering;
+#[path = "../src/store/xfix.rs"]
+mod xfix;
+
+use mapdb_rust_store::error::DbError;
+use mapdb_rust_store::store::{Store, StoreDirect, StoreWAL};
 use std::collections::BTreeSet;
-use std::io::Read as _;
-use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
-
-/// Raw-bytes serializer (same shape as the TCK's `RawSer`): record content ==
-/// logical value, so gets compare directly against the contract payloads.
-struct RawSer;
-impl Serializer<Vec<u8>> for RawSer {
-    fn serialize(&self, out: &mut DataOutput2, v: &Vec<u8>) {
-        out.write_all(v);
-    }
-    fn deserialize(&self, input: &mut dyn DataInput2, size: Option<usize>) -> Result<Vec<u8>> {
-        let n = size.expect("raw serializer needs a framed size");
-        let mut b = vec![0u8; n];
-        input.read_fully(&mut b)?;
-        Ok(b)
-    }
-    fn compare(&self, a: &Vec<u8>, b: &Vec<u8>) -> Ordering {
-        a.cmp(b)
-    }
-    fn equals(&self, a: &Vec<u8>, b: &Vec<u8>) -> bool {
-        a == b
-    }
-}
-const R: RawSer = RawSer;
-
-/// Contract payload function: `payload(payloadId, len)[i] = (i*131 + payloadId) & 0xff`.
-/// Recomputed per cell — the >1 MiB payload is never cached globally.
-fn payload(payload_id: u64, len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|i| ((i as u64).wrapping_mul(131).wrapping_add(payload_id) & 0xff) as u8)
-        .collect()
-}
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
-// MANIFEST.tsv model
+// schema v1 — the live tree
 // ---------------------------------------------------------------------------
 
-struct FileRow {
-    fixture: String,
-    rel: String,
-    raw_len: u64,
-    raw_sha: String,
-    gz_sha: String,
-}
-
-struct ExpectRow {
-    fixture: String,
-    engine: String,
-    verdict: String,
-    opener: String,
-    place_as: String,
-    open_arg: String,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum RecidState {
-    Live,
-    Null,
-    Prealloc,
-    Deleted,
-}
-
-struct RecidRow {
-    fixture: String,
-    label: String,
-    recid: u64,
-    state: RecidState,
-    payload_id: u64,
-    len: usize,
-}
-
-struct Manifest {
-    files: Vec<FileRow>,
-    expects: Vec<ExpectRow>,
-    recids: Vec<RecidRow>,
-}
-
-fn parse_state(s: &str, line: &str) -> RecidState {
-    match s {
-        "live" => RecidState::Live,
-        "null" => RecidState::Null,
-        "prealloc" => RecidState::Prealloc,
-        "deleted" => RecidState::Deleted,
-        other => panic!("unknown recid state {other:?} in manifest line: {line}"),
-    }
-}
-
-fn parse_manifest(text: &str) -> Manifest {
-    let mut m = Manifest {
-        files: Vec::new(),
-        expects: Vec::new(),
-        recids: Vec::new(),
-    };
-    let mut version_seen = false;
-    for line in text.lines() {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let f: Vec<&str> = line.split('\t').collect();
-        if !version_seen {
-            // first data line MUST be `version<TAB>1`; HARD-FAIL otherwise.
-            assert_eq!(
-                f,
-                vec!["version", "1"],
-                "unsupported MANIFEST.tsv version line: {line:?}"
-            );
-            version_seen = true;
-            continue;
-        }
-        match f[0] {
-            "fixture" => {
-                assert_eq!(f.len(), 5, "bad fixture row: {line}");
-                // id/kind/generatorEngine/generatorCommit — informational here.
-            }
-            "file" => {
-                assert_eq!(f.len(), 6, "bad file row: {line}");
-                m.files.push(FileRow {
-                    fixture: f[1].to_string(),
-                    rel: f[2].to_string(),
-                    raw_len: f[3].parse().expect("rawLen"),
-                    raw_sha: f[4].to_string(),
-                    gz_sha: f[5].to_string(),
-                });
-            }
-            "expect" => {
-                assert_eq!(f.len(), 7, "bad expect row: {line}");
-                m.expects.push(ExpectRow {
-                    fixture: f[1].to_string(),
-                    engine: f[2].to_string(),
-                    verdict: f[3].to_string(),
-                    opener: f[4].to_string(),
-                    place_as: f[5].to_string(),
-                    open_arg: f[6].to_string(),
-                });
-            }
-            "recid" => {
-                assert_eq!(f.len(), 7, "bad recid row: {line}");
-                m.recids.push(RecidRow {
-                    fixture: f[1].to_string(),
-                    label: f[2].to_string(),
-                    recid: f[3].parse().expect("recid"),
-                    state: parse_state(f[4], line),
-                    payload_id: f[5].parse().expect("payloadId"),
-                    len: f[6].parse().expect("len"),
-                });
-            }
-            "recidrange" => {
-                assert_eq!(f.len(), 8, "bad recidrange row: {line}");
-                let from: u64 = f[3].parse().expect("fromRecid");
-                let to: u64 = f[4].parse().expect("toRecid");
-                let state = parse_state(f[5], line);
-                let base: u64 = f[6].parse().expect("payloadIdBase");
-                let len: usize = f[7].parse().expect("len");
-                assert!(from <= to, "empty recidrange: {line}");
-                for r in from..=to {
-                    m.recids.push(RecidRow {
-                        fixture: f[1].to_string(),
-                        label: format!("{}[{}]", f[2], r - from),
-                        recid: r,
-                        state,
-                        // recidrange payloadId for recid r = base + (r - from)
-                        payload_id: base + (r - from),
-                        len,
-                    });
-                }
-            }
-            "edit" => {
-                assert_eq!(f.len(), 6, "bad edit row: {line}");
-                // informational (records how reject files were derived).
-            }
-            other => panic!("unknown manifest row type {other:?}: {line}"),
-        }
-    }
-    assert!(version_seen, "MANIFEST.tsv contains no version row");
-    m
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn nz(recid: u64) -> Recid {
-    NonZeroU64::new(recid).expect("manifest recid must be nonzero")
-}
-
-fn dir_entries(dir: &Path) -> BTreeSet<String> {
-    std::fs::read_dir(dir)
-        .expect("read cell dir")
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect()
-}
-
-/// Accept cell: verify() + per-recid contract + recid-set check + close.
-///
-/// Shared by the direct and wal arms — the SAME reader assertion block runs in
-/// both. `StoreWAL` DOES expose `verify()` (the `Store` trait requires it, see
-/// `impl Store for StoreWAL`), so wal cells run verify() too; nothing is
-/// skipped.
-fn run_accept<S: Store>(s: &S, recids: &[&RecidRow], ctx: &str) {
-    s.verify()
-        .unwrap_or_else(|e| panic!("[{ctx}] verify() failed: {e}"));
-    let mut want_all: BTreeSet<Recid> = BTreeSet::new();
-    for row in recids {
-        let recid = nz(row.recid);
-        let label = &row.label;
-        match row.state {
-            RecidState::Live => {
-                let got = s
-                    .get(recid, &R)
-                    .unwrap_or_else(|e| panic!("[{ctx}] get({label}) failed: {e}"));
-                assert_eq!(
-                    got,
-                    Some(payload(row.payload_id, row.len)),
-                    "[{ctx}] {label} (recid {recid}) content mismatch"
-                );
-                want_all.insert(recid);
-            }
-            RecidState::Null => {
-                assert_eq!(
-                    s.get(recid, &R).unwrap(),
-                    None,
-                    "[{ctx}] {label} (recid {recid}) must read as null"
-                );
-                want_all.insert(recid);
-            }
-            RecidState::Prealloc => {
-                assert_eq!(
-                    s.get(recid, &R).unwrap(),
-                    None,
-                    "[{ctx}] {label} (recid {recid}) prealloc must read as null"
-                );
-                // excluded from get_all_recids — enforced by the set equality below.
-            }
-            RecidState::Deleted => {
-                assert!(
-                    matches!(s.get(recid, &R), Err(DbError::GetVoid(x)) if x == recid.get()),
-                    "[{ctx}] {label} (recid {recid}) must be deleted (GetVoid)"
-                );
-            }
-        }
-    }
-    let all: BTreeSet<Recid> = s.get_all_recids().unwrap().into_iter().collect();
-    assert_eq!(
-        all, want_all,
-        "[{ctx}] get_all_recids must equal the manifest's live+null set"
-    );
-    s.close().unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// the suite: one test method driving all cells (per-cell context in messages)
-// ---------------------------------------------------------------------------
+/// The `wal-v1-*` accept cells RETIRE at this engine's WAL v3 cutover: the port
+/// refuses format v1 outright (there is no migration, by design) and its opener
+/// no longer takes a WAL FILE path at all, so the cell cannot even be
+/// expressed. D6 retires these IDs family-wide at Stage C; until the java and
+/// zig generators stop emitting v1 rows they stay in the shared manifest for
+/// the engines that still speak v1, and this engine skips them. The list is
+/// EXACT and asserted below: a new accept row addressed to rust must not be
+/// silently dropped by a prefix match.
+const RETIRED_V1_ACCEPTS: [&str; 4] = [
+    "wal-v1-rust-tail",
+    "wal-v1-rust-ckpt",
+    "wal-v1-zig-tail",
+    "wal-v1-zig-ckpt",
+];
 
 #[test]
-fn xfixture_conformance() {
-    let res_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/xfixtures");
-    let manifest_path = res_dir.join("MANIFEST.tsv");
-    // MUST fail (not skip) when absent: a missing manifest means the sync step
-    // was never run for this checkout.
-    let text = std::fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
-        panic!(
-            "{} is missing or unreadable ({e}); run the xfixtures sync step",
-            manifest_path.display()
-        )
-    });
-    let m = parse_manifest(&text);
+fn v1_cells_pass() {
+    let root = xfix::v1_root();
+    let loaded = xfix::parse(&xfix::read_root_text(&root, "MANIFEST.tsv"));
+    assert_eq!(loaded.version(), 1, "the live tree must still be schema v1");
+    let m = loaded.v1();
 
-    let session = std::env::temp_dir().join(format!("mapdb5_xfix_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&session);
-    std::fs::create_dir_all(&session).expect("create session dir");
+    let session = xfix::session_dir("xfix_v1");
 
-    // gunzip every fixture file once; verify gz + raw SHA-256 and rawLen
-    // BEFORE running any cell.
-    let mut baselines: std::collections::BTreeMap<(String, String), PathBuf> =
-        std::collections::BTreeMap::new();
-    for fr in &m.files {
-        let gz_path = res_dir.join(format!("{}.gz", fr.rel));
-        let gz = std::fs::read(&gz_path)
-            .unwrap_or_else(|e| panic!("fixture file {} missing: {e}", gz_path.display()));
-        assert_eq!(
-            sha256_hex(&gz),
-            fr.gz_sha,
-            "gzSha256 mismatch for {} ({})",
-            fr.rel,
-            fr.fixture
-        );
-        let mut raw = Vec::new();
-        GzDecoder::new(gz.as_slice())
-            .read_to_end(&mut raw)
-            .unwrap_or_else(|e| panic!("gunzip {} failed: {e}", fr.rel));
-        assert_eq!(
-            raw.len() as u64,
-            fr.raw_len,
-            "rawLen mismatch for {}",
-            fr.rel
-        );
-        assert_eq!(
-            sha256_hex(&raw),
-            fr.raw_sha,
-            "rawSha256 mismatch for {} ({})",
-            fr.rel,
-            fr.fixture
-        );
-        let base_dir = session.join("baseline").join(&fr.fixture);
-        std::fs::create_dir_all(&base_dir).unwrap();
-        let base = base_dir.join(&fr.rel);
-        std::fs::write(&base, &raw).unwrap();
-        baselines.insert((fr.fixture.clone(), fr.rel.clone()), base);
+    // gunzip every fixture file ONCE, verifying gz sha, raw length and raw sha
+    // before any cell runs.
+    let mut baselines = std::collections::BTreeMap::new();
+    for f in &m.files {
+        let gz = xfix::read_root_file(&root, &format!("{}.gz", f.rel));
+        assert_eq!(xfix::sha256_hex(&gz), f.gz_sha, "gzSha256 for {}", f.rel);
+        let raw = xfix::gunzip(&gz, &f.rel);
+        assert_eq!(raw.len() as u64, f.raw_len, "rawLen for {}", f.rel);
+        assert_eq!(xfix::sha256_hex(&raw), f.raw_sha, "rawSha256 for {}", f.rel);
+        baselines.insert((f.fixture.clone(), f.rel.clone()), raw);
     }
 
-    // The `wal-v1-*` accept cells RETIRE at this engine's WAL v3 cutover: the
-    // port refuses format v1 outright (there is no migration, by design), and
-    // its opener no longer takes a WAL FILE path at all, so the cell cannot even
-    // be expressed. D6 retires these IDs family-wide at Stage C, when the
-    // manifest gains the `wal3-namespace` bundle kind and the java/zig
-    // generators stop emitting v1 rows; until then the rows stay in the shared
-    // manifest for the engines that still speak v1, and this engine skips them.
-    //
-    // The list is EXACT and asserted below: a new accept row addressed to rust
-    // must not be silently dropped by a prefix match.
-    const RETIRED_V1_ACCEPTS: [&str; 4] = [
-        "wal-v1-rust-tail",
-        "wal-v1-rust-ckpt",
-        "wal-v1-zig-tail",
-        "wal-v1-zig-ckpt",
-    ];
     let mut retired = Vec::new();
-
-    // run every expect row addressed to this engine.
     let mut ran = 0usize;
-    for (i, ex) in m.expects.iter().enumerate() {
-        if ex.engine != "rust" {
+    for (i, e) in m.expects.iter().enumerate() {
+        if e.engine != xfix::ENGINE {
             continue;
         }
-        if ex.verdict == "accept" && ex.opener == "wal" {
+        if e.verdict == "accept" && e.opener == "wal" {
             assert!(
-                RETIRED_V1_ACCEPTS.contains(&ex.fixture.as_str()),
+                RETIRED_V1_ACCEPTS.contains(&e.fixture.as_str()),
                 "cell {i}: accept-wal fixture {} is not one of the four v1 cells retired at the \
                  v3 cutover — a new WAL accept row needs a v3 (base-path) cell, not a skip",
-                ex.fixture
+                e.fixture
             );
-            retired.push(ex.fixture.clone());
+            retired.push(e.fixture.clone());
             continue;
         }
         ran += 1;
         let ctx = format!(
-            "cell {i}: fixture={} verdict={} opener={} placeAs={} openArg={}",
-            ex.fixture, ex.verdict, ex.opener, ex.place_as, ex.open_arg
+            "v1 cell {i}: fixture={} verdict={} opener={} placeAs={} openArg={}",
+            e.fixture, e.verdict, e.opener, e.place_as, e.open_arg
         );
-        let files: Vec<&FileRow> = m.files.iter().filter(|f| f.fixture == ex.fixture).collect();
-        // Stages 1+2: every fixture has exactly ONE file row.
-        assert_eq!(files.len(), 1, "[{ctx}] fixture must have exactly one file");
-        let baseline = &baselines[&(ex.fixture.clone(), files[0].rel.clone())];
+        let files = m.files_of(&e.fixture);
+        assert_eq!(files.len(), 1, "[{ctx}] a v1 fixture has exactly one file");
+        let baseline = &baselines[&(e.fixture.clone(), files[0].rel.clone())];
 
-        let cell = session.join(format!("cell-{i}"));
+        let cell = session.join(format!("v1-{i}"));
         std::fs::create_dir_all(&cell).unwrap();
-        let working = cell.join(&ex.place_as);
-        std::fs::copy(baseline, &working).unwrap();
-        let snapshot = std::fs::read(&working).unwrap();
+        let working = cell.join(&e.place_as);
+        std::fs::write(&working, baseline).unwrap();
         let before = dir_entries(&cell);
+        let target = cell.join(&e.open_arg);
 
-        let recids: Vec<&RecidRow> = m
-            .recids
-            .iter()
-            .filter(|r| r.fixture == ex.fixture)
-            .collect();
-        match (ex.verdict.as_str(), ex.opener.as_str()) {
+        let recids = m.recids_of(&e.fixture);
+        match (e.verdict.as_str(), e.opener.as_str()) {
             ("accept", "direct") => {
-                let s = StoreDirect::open_file(&cell.join(&ex.open_arg))
-                    .unwrap_or_else(|e| panic!("[{ctx}] accept cell failed to open: {e}"));
-                run_accept(&s, &recids, &ctx);
+                let s = StoreDirect::open_file(&target)
+                    .unwrap_or_else(|err| panic!("[{ctx}] accept cell failed to open: {err}"));
+                xfix::assert_reader_contract(&s, &recids, &ctx);
+                s.close().unwrap();
             }
-            ("accept", "wal") => {
-                // openArg is the literal WAL file path within the cell dir
-                // (`StoreWAL::open` takes the WAL FILE path itself).
-                let s = StoreWAL::open(&cell.join(&ex.open_arg))
-                    .unwrap_or_else(|e| panic!("[{ctx}] accept wal cell failed to open: {e}"));
-                run_accept(&s, &recids, &ctx);
-                // A `.ckpt` companion must NOT exist after a clean close; its
-                // appearance is a failure (also enforced by the generic
-                // new-files check below, which only allows `.lock`).
-                assert!(
-                    !dir_entries(&cell).iter().any(|f| f.ends_with(".ckpt")),
-                    "[{ctx}] .ckpt companion must not exist after a clean close"
-                );
-            }
-            ("reject", "direct") => match StoreDirect::open_file(&cell.join(&ex.open_arg)) {
+            ("reject", "direct") => match StoreDirect::open_file(&target) {
                 Err(DbError::DataCorruption(_)) => {}
                 Err(other) => panic!("[{ctx}] expected DataCorruption, got: {other}"),
                 Ok(s) => {
@@ -426,13 +116,12 @@ fn xfixture_conformance() {
                 }
             },
             ("reject", "wal") => {
-                // The v3 opener takes a BASE path. Every reject row's openArg
-                // names a regular file the cell placed there, so each of these
+                // The v3 opener takes a BASE path. Every v1 reject row's
+                // openArg names a regular file the cell placed there, so each
                 // now refuses through D1's bare-base row rather than through a
                 // v1 header check — the same verdict for the same image, which
                 // is what the cell asserts.
-                let wal_file = cell.join(&ex.open_arg);
-                match StoreWAL::open(&wal_file) {
+                match StoreWAL::open(&target) {
                     Err(DbError::DataCorruption(_)) => {}
                     Err(other) => panic!("[{ctx}] expected DataCorruption, got: {other}"),
                     Ok(s) => {
@@ -444,11 +133,11 @@ fn xfixture_conformance() {
             (v, o) => panic!("[{ctx}] unsupported cell verdict={v} opener={o}"),
         }
 
-        // working copy must be byte-identical...
-        let after = std::fs::read(&working).unwrap();
-        assert_eq!(after, snapshot, "[{ctx}] working copy bytes changed");
-        // ...and no new files may appear beyond the allowed sidecars, which are
-        // enumerated (and excluded from the byte comparison above).
+        assert_eq!(
+            std::fs::read(&working).unwrap(),
+            *baseline,
+            "[{ctx}] working copy bytes changed"
+        );
         let new_files: Vec<String> = dir_entries(&cell).difference(&before).cloned().collect();
         for f in &new_files {
             assert!(
@@ -458,13 +147,234 @@ fn xfixture_conformance() {
         }
         std::fs::remove_dir_all(&cell).unwrap();
     }
-    assert!(ran > 0, "manifest contains no expect rows for engine=rust");
+    assert!(ran > 0, "the v1 manifest has no expect rows for rust");
     retired.sort();
-    let mut expected: Vec<String> = RETIRED_V1_ACCEPTS.iter().map(|s| s.to_string()).collect();
+    let mut expected: Vec<String> = RETIRED_V1_ACCEPTS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     expected.sort();
     assert_eq!(
         retired, expected,
-        "every retired v1 accept cell must still be present in the shared manifest: if one is          gone, Stage C has begun and this skip list must go with it"
+        "every retired v1 accept cell must still be present in the shared manifest: if one is \
+         gone, Stage C has begun and this skip list must go with it"
     );
     let _ = std::fs::remove_dir_all(&session);
+}
+
+fn dir_entries(dir: &Path) -> BTreeSet<String> {
+    std::fs::read_dir(dir)
+        .expect("read cell dir")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// schema v2 — the shared static sample
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sample_v2_rw_cells_pass() {
+    let sample = xfix::load_sample_v2(&xfix::v2_root());
+    let session = xfix::session_dir("xfix_v2_rw");
+    xfix::run_v2_cells(&sample, "rw", &session, &StoreWAL::open);
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// FRAMING, against the python-authored pin.
+///
+/// This is the comparison `GOLDEN.tsv` cannot make: a raw sha attests which
+/// bytes were read and says nothing about the parse. It is also the only check
+/// in the slice that reaches the section COUNT — both section CRCs bind a
+/// section's own bytes to its own offset, so a reader that stopped one section
+/// early would still validate every section it did read, and would still open
+/// through the engine.
+#[test]
+fn sample_v2_framing_matches_golden_decode() {
+    let root = xfix::v2_root();
+    let sample = xfix::load_sample_v2(&root);
+    let want_text = xfix::read_root_text(&root, "GOLDEN-DECODE.tsv");
+    let want = xfix::golden_rows(&want_text);
+    let got = xfix::render_framing(&sample);
+    xfix::assert_rows_equal("GOLDEN-DECODE.tsv", &want, &got);
+    assert!(
+        want.iter().any(|r| r.starts_with("hdr\t")) && want.iter().any(|r| r.starts_with("sec\t")),
+        "GOLDEN-DECODE.tsv pins no headers or no sections"
+    );
+}
+
+/// DECODED BODIES, against the file the FROZEN JAVA READER authored.
+///
+/// Contract §11.2 settles body semantics engine-against-engine rather than in
+/// a python pin, because `walfmt.py` is a structural codec and store record
+/// semantics written there would be a fifth implementation nobody reviews.
+/// Java is authoritative by construction: it wrote this file.
+#[test]
+fn sample_v2_body_matches_golden_body() {
+    let root = xfix::v2_root();
+    let sample = xfix::load_sample_v2(&root);
+    let want_text = xfix::read_root_text(&root, "GOLDEN-BODY.tsv");
+    let want = xfix::golden_rows(&want_text);
+    let got = xfix::render_body(&sample);
+    xfix::assert_rows_equal("GOLDEN-BODY.tsv", &want, &got);
+
+    // The distinction the whole file exists for must actually be IN it, or the
+    // comparison above is a comparison of two files that never disagree about
+    // the interesting case. `lenPlus == 0` is NULL content, `lenPlus == 1` is
+    // zero-length content, and they differ in BOTH the lenPlus and the sha
+    // column so no single-column bug can hide one as the other.
+    assert!(
+        want.iter().any(|r| r.contains("\tRECORD\t12\t0\t0\t-")),
+        "GOLDEN-BODY.tsv pins no NULL-content record"
+    );
+    assert!(
+        want.iter()
+            .any(|r| r.ends_with(&format!("\t1\t{}", xfix::EMPTY_SHA))),
+        "GOLDEN-BODY.tsv pins no zero-length-content record"
+    );
+    assert!(
+        want.iter().any(|r| r.starts_with("mark\t")),
+        "GOLDEN-BODY.tsv pins no mark"
+    );
+}
+
+/// Nothing in the distributed v2 root may be unexplained.
+///
+/// The three tables plus one blob per `file` row, and nothing else. A stray
+/// `.gz` that no manifest row names is either a fixture the suite silently
+/// never runs or a leftover from a half-finished sync; both are the kind of
+/// thing that is only ever noticed by a check that enumerates.
+#[test]
+fn the_v2_resource_tree_has_nothing_unexplained() {
+    let root = xfix::v2_root();
+    let sample = xfix::load_sample_v2(&root);
+    let mut want: BTreeSet<String> = ["MANIFEST.tsv", "GOLDEN-DECODE.tsv", "GOLDEN-BODY.tsv"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for f in &sample.manifest.files {
+        assert!(
+            want.insert(f.blob_name()),
+            "two file rows claim the blob {}",
+            f.blob_name()
+        );
+    }
+    assert_eq!(
+        dir_entries(&root),
+        want,
+        "the distributed v2 root is not exactly the manifest's blobs plus the three tables"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the dispatch itself
+// ---------------------------------------------------------------------------
+
+/// The version line is a HARD dispatch, and the reason is the arity collision.
+///
+/// `expect <fid> <engine> <verdict> <opener> <placeAs> <openArg>` (v1) and
+/// `expect <fid> <engine> <mode> <verdict> <opener> <openArg>` (v2) are both
+/// seven fields. Guessing the schema from a row's shape would read `accept` as
+/// a mode and `wal3` as a verdict without a single arity check firing, so the
+/// version line decides and an unknown version is refused rather than assumed
+/// to be the newest.
+#[test]
+fn the_two_schemas_are_told_apart_by_their_version_line_only() {
+    let v1 = "version\t1\nfixture\tf\tk\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n\
+              expect\tf\trust\taccept\tdirect\tx.db\tx.db\n";
+    let v2 = "version\t2\nfixture\tf\tk\tjava\tc\nfile\tf\tx\t1\taa\tbb\n\
+              expect\tf\trust\tro\taccept\twal3\tx\n";
+    assert_eq!(xfix::parse(v1).version(), 1);
+    assert_eq!(xfix::parse(v2).version(), 2);
+
+    // The v1 row, read as v2, is not merely different — its third column is a
+    // verdict where v2 wants a mode, so the vocabulary check catches it. That
+    // is the collision made visible rather than assumed away.
+    let v1_rows_labelled_v2 = v1.replacen("version\t1", "version\t2", 1);
+    xfix::assert_manifest_refused(
+        "v1 expect rows under a v2 version line",
+        &v1_rows_labelled_v2,
+    );
+
+    xfix::assert_manifest_refused("an unknown schema version", "version\t3\n");
+    xfix::assert_manifest_refused("a manifest with no version line", "fixture\tf\tk\tj\tc\n");
+    xfix::assert_manifest_refused("a version line with a trailing field", "version\t2\tx\n");
+}
+
+/// Rows the reader must refuse rather than skip.
+///
+/// A reader that ignores what it does not recognise turns every future schema
+/// addition into a silent no-op: the row is in the manifest, the suite is
+/// green, and nothing ran.
+#[test]
+fn unrecognised_and_malformed_rows_are_refused() {
+    let head = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n";
+    let file = "file\tf\tx.wal.0000000000000001\t36\taa\tbb\n";
+
+    xfix::assert_manifest_refused(
+        "an unknown row type",
+        &format!("{head}{file}sparkle\tf\tx\n"),
+    );
+    xfix::assert_manifest_refused("a short file row", &format!("{head}file\tf\tx\t36\taa\n"));
+    xfix::assert_manifest_refused(
+        "a file row with an empty field",
+        &format!("{head}file\tf\tx\t36\t\tbb\n"),
+    );
+    xfix::assert_manifest_refused(
+        "a non-canonical integer",
+        &format!("{head}file\tf\tx\t036\taa\tbb\n"),
+    );
+    xfix::assert_manifest_refused(
+        "a relName that escapes the cell directory",
+        &format!("{head}file\tf\t../x\t36\taa\tbb\n"),
+    );
+    xfix::assert_manifest_refused(
+        "an unknown engine",
+        &format!("{head}{file}expect\tf\tgo\tro\taccept\twal3\tx\n"),
+    );
+    xfix::assert_manifest_refused(
+        "an unknown mode",
+        &format!("{head}{file}expect\tf\trust\trwx\taccept\twal3\tx\n"),
+    );
+    xfix::assert_manifest_refused(
+        "a duplicate expect row",
+        &format!(
+            "{head}{file}expect\tf\trust\tro\taccept\twal3\tx\n\
+             expect\tf\trust\tro\taccept\twal3\tx\n"
+        ),
+    );
+    xfix::assert_manifest_refused(
+        "an unknown post disposition",
+        &format!("{head}{file}post\tf\trust\tro\tx.lock\tvanished\n"),
+    );
+    xfix::assert_manifest_refused(
+        "a sized post disposition missing its sha",
+        &format!("{head}{file}post\tf\trust\tro\tx.lock\tcreated:0\n"),
+    );
+    xfix::assert_manifest_refused(
+        "a duplicate recid within one fixture",
+        &format!("{head}{file}recid\tf\ta\t1\tlive\t1\t1\nrecid\tf\tb\t1\tlive\t1\t1\n"),
+    );
+    xfix::assert_manifest_refused(
+        "an unbounded recidrange",
+        &format!("{head}{file}recidrange\tf\tr\t1\t99999999\tlive\t1\t1\n"),
+    );
+    xfix::assert_manifest_refused("a v2 manifest with no file rows", head);
+}
+
+/// A `bytes` row is refused BY NAME, not skipped.
+///
+/// `bytes` describes a derived fixture built by `walfmt.py` from another
+/// fixture's image, and C4 is the slice that introduces both the deriver and
+/// the fixtures. Until then the honest thing for a reader to do is stop: a
+/// `bytes` row silently ignored is a fixture that the manifest says exists and
+/// that nothing ever opens.
+#[test]
+fn a_bytes_row_is_refused_until_c4_can_execute_it() {
+    xfix::assert_manifest_refused(
+        "a v2 `bytes` row",
+        "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n\
+         file\tf\tx.wal.0000000000000001\t36\taa\tbb\n\
+         bytes\tf\tsrc\tx\t0\t36\taa\n",
+    );
 }

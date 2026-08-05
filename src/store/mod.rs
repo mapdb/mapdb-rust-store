@@ -34,6 +34,14 @@ pub(crate) mod wal_segments;
 /// WAL format v3 section writer (table W) and the durability event seam.
 pub(crate) mod wal_write;
 
+/// Cross-port fixture harness shared by the in-crate `ro` executor and the
+/// integration tests (`#[path]`-included there). See C-D3.
+#[cfg(test)]
+mod xfix;
+/// The schema-v2 `ro` cells, in-crate because `open_cfg` is `pub(crate)`.
+#[cfg(test)]
+mod xfix_ro;
+
 pub use bytearray::StoreByteArray;
 pub use direct::StoreDirect;
 pub use heap::StoreOnHeap;

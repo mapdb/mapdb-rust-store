@@ -1,0 +1,87 @@
+# The DECODED BODIES of every pinned schema-v2 sample section, as the FROZEN JAVA
+# READER reads them — contract §11.2's engine-against-engine half.
+#
+#   sec  <bundle> <relName> <index> <tag> <entryCount>
+#   ent  <bundle> <relName> <index> <ord> <kind> <recid> <cap> <lenPlus> <contentSha256>
+#   mark <bundle> <relName> <index> <cleanedThroughSeq> <logStartLsn>
+#
+# GOLDEN-DECODE.tsv pins FRAMING and deliberately stops there: walfmt.py is a
+# structural codec, and store record semantics written in python would be a fifth
+# implementation no one reviews. This file is the other half, and Java authors it
+# because Java is the reference for what a body MEANS.
+#
+# lenPlus IS RAW, NOT A LENGTH. `lenPlus == 0` is NULL content; `lenPlus == 1` is
+# ZERO-LENGTH content (StoreWAL.applySection). A reader that decodes lenPlus into a
+# length collapses the two, and two readers that both collapse it agree forever.
+# contentSha256 is `-` for NULL and the empty-string sha for zero-length, so the two
+# differ in both columns. The sample contains one of each: recid 12 and recid 11.
+#
+# `-` means the column does not apply to that entry kind. cap is emitted because a
+# reader must decode it to find the next entry at all; leaving it out would be a
+# field the comparison never reaches.
+#
+# Regenerate with mapdb-java-store's org.mapdb.xfixtures.Wal3BodyDump; the java suite
+# re-derives it and fails on drift.
+sec	wal3-java-cleaned	x.wal.0000000000000003	0	C	12
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	0	RECORD	1	128	121	6b190a756c23e01700b85af8d2969ae48eed26bf1948ad75838f6f55cfae0f37
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	1	RECORD	2	80	65	142a21870801f79dbe62fc674dc7946f20984d69fa1ae37b239eee8d1682126b
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	2	PREALLOC	3	-	-	-
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	3	RECORD	4	704	701	f43d82e2ea0b51ee45aa99f661f10a0c231ad2a26b8e548dd28874bd09b63d5c
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	4	RECORD	5	704	701	68f0696ed754fc5b2fc260607317cf34026770a274bc5fcc1e270dbdb4570e21
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	5	RECORD	6	704	701	72cd9aca298b4248aabd5ca3ddf28233bee8be1a3eef4f9d2321ce43aaa313eb
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	6	RECORD	7	704	701	e55148740e398e5f51c29c50f82e157d4329c17af4b2b51e004a44b1f58a0932
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	7	RECORD	8	704	701	879d9c3ce4196bd028c6c630843576af6824710b8d9f4dd58cfd6f5cb0549496
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	8	RECORD	9	704	701	22892ae9506e862df3e105322477792449fb443732af7fda1ae3dfc964cf267c
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	9	PREALLOC	10	-	-	-
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	10	RECORD	11	16	1	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+ent	wal3-java-cleaned	x.wal.0000000000000003	0	11	RECORD	12	0	0	-
+sec	wal3-java-cleaned	x.wal.0000000000000004	0	K	-
+mark	wal3-java-cleaned	x.wal.0000000000000004	0	2	9
+sec	wal3-java-tail	x.wal.0000000000000001	0	S	3
+ent	wal3-java-tail	x.wal.0000000000000001	0	0	RECORD	1	208	201	e1c96fa630d7eac6971068208ed04767b927d1e9b8f96c6e17e424acd9ae4c6b
+ent	wal3-java-tail	x.wal.0000000000000001	0	1	RECORD	2	912	901	5a683afd3fef31c9205b8d9866cc357c4830bf2ea84e33f559f1438ab3c9a73c
+ent	wal3-java-tail	x.wal.0000000000000001	0	2	PREALLOC	3	-	-	-
+sec	wal3-java-tail	x.wal.0000000000000001	1	S	6
+ent	wal3-java-tail	x.wal.0000000000000001	1	0	RECORD	4	704	701	2d7ba99daf9df812710963c05102cf15528c485a686cafc1a84737a7741b7b09
+ent	wal3-java-tail	x.wal.0000000000000001	1	1	RECORD	5	704	701	8da85aa8e609f63894d5b9d21ca0ddf65e13a89e56776e76a88b12d1756f3648
+ent	wal3-java-tail	x.wal.0000000000000001	1	2	RECORD	6	704	701	790abb822398ddf541f8df95983310aeb9be6a5321207651a9dcd5f79e0a6954
+ent	wal3-java-tail	x.wal.0000000000000001	1	3	RECORD	7	704	701	a48df9fae1f85d955ad7f7c3ba1515229e872fc635f54d8977f2fb141ed7bd3a
+ent	wal3-java-tail	x.wal.0000000000000001	1	4	RECORD	8	704	701	1146de037919467fb4ab333270a32a4065bd52baae9d2ed2b50739b674c7dc1d
+ent	wal3-java-tail	x.wal.0000000000000001	1	5	RECORD	9	704	701	69ae8e97d290a5f5f27bd364675841bf4c5dfae775bdf225f0c3b0569c2bf104
+sec	wal3-java-tail	x.wal.0000000000000002	0	S	2
+ent	wal3-java-tail	x.wal.0000000000000002	0	0	RECORD	1	128	121	f3bc1137b3335e518964015a585455b0f1fa1f7fb1b46e709aeb3a7eefc3cf59
+ent	wal3-java-tail	x.wal.0000000000000002	0	1	DELETE	2	-	-	-
+sec	wal3-java-tail	x.wal.0000000000000002	1	S	1
+ent	wal3-java-tail	x.wal.0000000000000002	1	0	RECORD	2	80	65	2520e4372cdb01d28714e4f0d83618c671392281d6e7bd29d8a0619e88ef1ffa
+sec	wal3-java-tail	x.wal.0000000000000002	2	S	1
+ent	wal3-java-tail	x.wal.0000000000000002	2	0	PREALLOC	10	-	-	-
+sec	wal3-java-tail	x.wal.0000000000000002	3	S	1
+ent	wal3-java-tail	x.wal.0000000000000002	3	0	RECORD	11	16	1	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+sec	wal3-java-tail	x.wal.0000000000000002	4	S	1
+ent	wal3-java-tail	x.wal.0000000000000002	4	0	RECORD	12	48	33	a1c9453f99d108c6723b19c416b2861a12cb13103309bc033fef96f19d16658e
+sec	wal3-java-tail	x.wal.0000000000000002	5	S	1
+ent	wal3-java-tail	x.wal.0000000000000002	5	0	RECORD	12	0	0	-
+sec	wal3-zig-tail	x.wal.0000000000000001	0	S	3
+ent	wal3-zig-tail	x.wal.0000000000000001	0	0	RECORD	1	208	201	b3c9eed81f2ebdbd64e4d2f95b096207b1d2634fcb1b9c375ed894dabe19ea01
+ent	wal3-zig-tail	x.wal.0000000000000001	0	1	RECORD	2	912	901	df5aacf4253639876681bbe862f2eae16ccca0a89ddb20fedce49302bacf751e
+ent	wal3-zig-tail	x.wal.0000000000000001	0	2	PREALLOC	3	-	-	-
+sec	wal3-zig-tail	x.wal.0000000000000001	1	S	6
+ent	wal3-zig-tail	x.wal.0000000000000001	1	0	RECORD	4	704	701	f3dda275a2579b6e58134642ab32d135bf73d2b27b005cd789b95fd891bd7770
+ent	wal3-zig-tail	x.wal.0000000000000001	1	1	RECORD	5	704	701	741601bc7a60a6a8d1afaef8128b96dc75c23667e1a847d413795f58c80c4538
+ent	wal3-zig-tail	x.wal.0000000000000001	1	2	RECORD	6	704	701	ce5891549b5f6f9c8efc89fe027fc93594c05dc9b46acd678dcddd4065541ec0
+ent	wal3-zig-tail	x.wal.0000000000000001	1	3	RECORD	7	704	701	044980e04a85d9d857c6dd38222740758850b1bf0211da7238bc4d700c37c345
+ent	wal3-zig-tail	x.wal.0000000000000001	1	4	RECORD	8	704	701	adee082f0aed39aa3ffa89445454236e711f9bcc7552adbd25e14a7318d6cc5f
+ent	wal3-zig-tail	x.wal.0000000000000001	1	5	RECORD	9	704	701	76c4204b969000a8a0b0f8b1a7ad657957d8e695898975ea557571aaaf1c9868
+sec	wal3-zig-tail	x.wal.0000000000000002	0	S	2
+ent	wal3-zig-tail	x.wal.0000000000000002	0	0	RECORD	1	128	121	75f72fcf8e91df0d7fabac7d58ed8141583e3671d699a97853d79afa174bbb08
+ent	wal3-zig-tail	x.wal.0000000000000002	0	1	DELETE	2	-	-	-
+sec	wal3-zig-tail	x.wal.0000000000000002	1	S	1
+ent	wal3-zig-tail	x.wal.0000000000000002	1	0	RECORD	2	80	65	93e1159003ca59ba8187401c4e5de1cc93f006f2c3d249703f9e67e4ae3bf00a
+sec	wal3-zig-tail	x.wal.0000000000000002	2	S	1
+ent	wal3-zig-tail	x.wal.0000000000000002	2	0	PREALLOC	10	-	-	-
+sec	wal3-zig-tail	x.wal.0000000000000002	3	S	1
+ent	wal3-zig-tail	x.wal.0000000000000002	3	0	RECORD	11	16	1	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+sec	wal3-zig-tail	x.wal.0000000000000002	4	S	1
+ent	wal3-zig-tail	x.wal.0000000000000002	4	0	RECORD	12	48	33	27ac4200b187e024c5305df56ee15fa899bb8ca2750de8a0bcbffd7cabcd3a5d
+sec	wal3-zig-tail	x.wal.0000000000000002	5	S	1
+ent	wal3-zig-tail	x.wal.0000000000000002	5	0	RECORD	12	0	0	-

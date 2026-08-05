@@ -1,0 +1,43 @@
+# The EXPECTED DECODE of every pinned golden segment — round-2 finding 3.
+#
+#   hdr  <bundle> <relName> <version> <flags> <seq> <firstLsn> <headerCrc>
+#   sec  <bundle> <relName> <index> <off> <tag> <lsn> <bodyLen> <hdrCrc> <bodyCrc>
+#
+# GOLDEN.tsv pins WHICH BYTES were read; this pins WHAT THEY MEAN. A C3 reader
+# that frames sections wrongly still matches every sha256 in GOLDEN.tsv, because
+# a raw hash attests the input and says nothing about the parse. Each C3 reader
+# compares its own decode against this file.
+#
+# SCOPE, stated so no one mistakes its absence for an oversight: this pins
+# FRAMING — header fields and the (offset, tag, lsn, bodyLen) of every section.
+# It deliberately does NOT pin decoded 'S'/'C'/'K' BODY semantics. walfmt is a
+# structural codec; reimplementing store record semantics in python would be a
+# fifth implementation that no one reviews, and the frozen Java reader is the
+# authority for what a body MEANS. Body-level agreement is a C3 obligation
+# (contract §11.2), checked engine-against-engine, not against this file.
+#
+# Regenerate together with GOLDEN.tsv; the self-test fails if the two disagree.
+hdr	wal3-java-cleaned	x.wal.0000000000000003	3	0	3	9	6a6030ff
+sec	wal3-java-cleaned	x.wal.0000000000000003	0	36	C	9	4441	5e8196c3	46f5e77a
+hdr	wal3-java-cleaned	x.wal.0000000000000004	3	0	4	10	97080c8c
+sec	wal3-java-cleaned	x.wal.0000000000000004	0	36	K	10	16	da4966c2	94fb33f0
+hdr	wal3-java-tail	x.wal.0000000000000001	3	0	1	1	4a4d904b
+sec	wal3-java-tail	x.wal.0000000000000001	0	36	S	1	1114	31391437	19c09e1c
+sec	wal3-java-tail	x.wal.0000000000000001	1	1175	S	2	4236	97ca5a6f	a0fc5a08
+hdr	wal3-java-tail	x.wal.0000000000000002	3	0	2	3	9dcecda2
+sec	wal3-java-tail	x.wal.0000000000000002	0	36	S	3	127	a8b59793	a3c9c7f0
+sec	wal3-java-tail	x.wal.0000000000000002	1	188	S	4	68	ea4607eb	fa05ee65
+sec	wal3-java-tail	x.wal.0000000000000002	2	281	S	5	2	a2b74803	e2022c84
+sec	wal3-java-tail	x.wal.0000000000000002	3	308	S	6	4	dcb4a628	ed36d691
+sec	wal3-java-tail	x.wal.0000000000000002	4	337	S	7	36	f3903b14	323c8bb9
+sec	wal3-java-tail	x.wal.0000000000000002	5	398	S	8	4	db7dba9c	8fcbf266
+hdr	wal3-zig-tail	x.wal.0000000000000001	3	0	1	1	4a4d904b
+sec	wal3-zig-tail	x.wal.0000000000000001	0	36	S	1	1114	31391437	a32a12cd
+sec	wal3-zig-tail	x.wal.0000000000000001	1	1175	S	2	4236	97ca5a6f	733aaef4
+hdr	wal3-zig-tail	x.wal.0000000000000002	3	0	2	3	9dcecda2
+sec	wal3-zig-tail	x.wal.0000000000000002	0	36	S	3	127	a8b59793	c56b3d1c
+sec	wal3-zig-tail	x.wal.0000000000000002	1	188	S	4	68	ea4607eb	09423ba8
+sec	wal3-zig-tail	x.wal.0000000000000002	2	281	S	5	2	a2b74803	e2022c84
+sec	wal3-zig-tail	x.wal.0000000000000002	3	308	S	6	4	dcb4a628	ed36d691
+sec	wal3-zig-tail	x.wal.0000000000000002	4	337	S	7	36	f3903b14	f731452e
+sec	wal3-zig-tail	x.wal.0000000000000002	5	398	S	8	4	db7dba9c	8fcbf266

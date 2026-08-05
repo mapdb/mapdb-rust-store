@@ -8,6 +8,16 @@
 //! <https://github.com/mapdb/mapdb-java-store> is the reference implementation;
 //! see `PORTING-GAPS.md` for what this port does not yet cover.
 
+// `src/store/xfix.rs` is compiled BOTH here and — via `#[path]` — into
+// `tests/xfixture_conformance.rs` and `tests/wal3_decode.rs` (decision C-D3:
+// the schema-v2 `ro` cells need the crate-internal read-only opener, and the
+// rest of the harness must stay shared). `crate::` means a different crate in
+// each build, so that file names this one by its package name; this alias is
+// what makes the name resolve inside the lib. Test-only, so nothing about the
+// published crate changes.
+#[cfg(test)]
+extern crate self as mapdb_rust_store;
+
 pub mod btree;
 pub mod db;
 pub mod error;
