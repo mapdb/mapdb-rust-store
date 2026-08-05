@@ -192,6 +192,12 @@ fn shape_c(s: &StoreWAL, r: &Recids, base: u64) {
 /// overflows and only its successor rotates: one commit cannot do this, and the
 /// Stage C plan predicted otherwise. Both halves rewrite A and the second
 /// restores A's §5.2 content, so the final logical state is untouched.
+///
+/// "Only its successor rotates" is about ORDINARY appends. Cleaning rotates too,
+/// at two unconditional episode seals; neither is reachable here, because the
+/// sole checkpoint is already behind us and `min_log_bytes` keeps auto-clean
+/// from ever firing (§5.1). Rotating with one of those instead would change the
+/// cleaning history the whole shape is built around.
 fn shape_rotate(s: &StoreWAL, r: &Recids, base: u64) {
     s.update(r.a(), Some(&payload(base + 7, SEGMENT_BYTES as usize)), &R)
         .unwrap();
@@ -1127,9 +1133,12 @@ fn write_wal3_fixtures() {
 /// measures them against RUST, because "java behaves this way" is not evidence
 /// about a port: it is the hypothesis the port is supposed to test.
 ///
-/// Every variant ends in the final logical state §5.3 pins and asserts it
-/// before closing, so a variant that reaches the shape by changing what the
-/// fixture MEANS fails here rather than in review.
+/// Every variant that could become the generator's workload ends in the final
+/// logical state §5.3 pins and asserts it before closing, so a variant that
+/// reaches the shape by changing what the fixture MEANS fails here rather than
+/// in review. The one exception is `shaped-half-rotate`, which exists precisely
+/// to show that half of a state-preserving PAIR is not state-preserving; it
+/// returns before the assertion and says so in place.
 fn probe_variant(variant: &str, dir: &Path) {
     wipe(dir);
     std::fs::create_dir_all(dir).expect("create the probe namespace");
