@@ -55,6 +55,27 @@ pub const ENGINE: &str = "rust";
 pub const ENGINES: [&str; 3] = ["java", "rust", "zig"];
 pub const MODES: [&str; 2] = ["ro", "rw"];
 pub const STATES: [&str; 4] = ["live", "null", "prealloc", "deleted"];
+pub const VERDICTS: [&str; 2] = ["accept", "reject"];
+
+/// Contract §2's `kind` vocabulary. D6 fixed the v2 set as "all v1 kinds +
+/// `wal3-namespace`", and `port-wal`/`java-wal-namespace` are **retained as
+/// valid tokens** though no v2 fixture uses them — retiring a fixture family is
+/// not a reason to make a version-dispatch parser reject the token.
+pub const V1_KINDS: [&str; 4] = ["direct", "reject", "port-wal", "java-wal-namespace"];
+pub const V2_KINDS: [&str; 5] = [
+    "direct",
+    "reject",
+    "wal3-namespace",
+    "port-wal",
+    "java-wal-namespace",
+];
+
+/// A v2 fixture no engine wrote records `derived` here, and then owes exactly
+/// one `derived` row (contract §2, amendment 3).
+pub const V2_GENERATORS: [&str; 4] = ["java", "rust", "zig", "derived"];
+
+pub const V1_OPENERS: [&str; 2] = ["direct", "wal"];
+pub const V2_OPENERS: [&str; 2] = ["direct", "wal3"];
 
 /// sha256 of the empty byte string — the zero-length-content marker that has
 /// to stay distinguishable from NULL content.
@@ -90,6 +111,43 @@ pub fn payload(payload_id: u64, len: usize) -> Vec<u8> {
 pub fn hex32(v: u32) -> String {
     format!("{v:08x}")
 }
+
+/// The comment block `GOLDEN-BODY.tsv` carries, pinned verbatim.
+///
+/// Rust compares the two golden files by ROW, dropping comments — but for this
+/// file that loses something java's whole-text comparison keeps. The block is
+/// the file's PROVENANCE: it states that the frozen java reader authored it,
+/// that `lenPlus` is raw, and how to regenerate it. Without a pin, that header
+/// could be deleted or rewritten to claim python authorship while every test
+/// stayed green, and the next reader would be graded against a file whose
+/// authority claim nobody was checking. (`GOLDEN-DECODE.tsv` needs no
+/// equivalent: java compares it by row too.)
+pub const GOLDEN_BODY_HEADER: &[&str] = &[
+    "# The DECODED BODIES of every pinned schema-v2 sample section, as the FROZEN JAVA",
+    "# READER reads them — contract §11.2's engine-against-engine half.",
+    "#",
+    "#   sec  <bundle> <relName> <index> <tag> <entryCount>",
+    "#   ent  <bundle> <relName> <index> <ord> <kind> <recid> <cap> <lenPlus> <contentSha256>",
+    "#   mark <bundle> <relName> <index> <cleanedThroughSeq> <logStartLsn>",
+    "#",
+    "# GOLDEN-DECODE.tsv pins FRAMING and deliberately stops there: walfmt.py is a",
+    "# structural codec, and store record semantics written in python would be a fifth",
+    "# implementation no one reviews. This file is the other half, and Java authors it",
+    "# because Java is the reference for what a body MEANS.",
+    "#",
+    "# lenPlus IS RAW, NOT A LENGTH. `lenPlus == 0` is NULL content; `lenPlus == 1` is",
+    "# ZERO-LENGTH content (StoreWAL.applySection). A reader that decodes lenPlus into a",
+    "# length collapses the two, and two readers that both collapse it agree forever.",
+    "# contentSha256 is `-` for NULL and the empty-string sha for zero-length, so the two",
+    "# differ in both columns. The sample contains one of each: recid 12 and recid 11.",
+    "#",
+    "# `-` means the column does not apply to that entry kind. cap is emitted because a",
+    "# reader must decode it to find the next entry at all; leaving it out would be a",
+    "# field the comparison never reaches.",
+    "#",
+    "# Regenerate with mapdb-java-store's org.mapdb.xfixtures.Wal3BodyDump; the java suite",
+    "# re-derives it and fails on drift.",
+];
 
 /// Data lines of a golden `.tsv`: comments and blank lines dropped. The
 /// comment block is prose the authoring engine wrote; only the rows are a
@@ -132,6 +190,13 @@ pub const MARK_BODY_LEN: i64 = 16;
 pub const TAG_SECTION: u8 = b'S';
 pub const TAG_IMAGE: u8 = b'C';
 pub const TAG_MARK: u8 = b'K';
+
+/// `StoreDirect`'s plain-record capacity ceiling, transcribed from
+/// `index_val::MAX_CAPACITY` (checked in [`super::xfix_ro`]). It is half of
+/// `cap_valid`'s rule and the C3r review found it missing: without the ceiling,
+/// [`check_cap`] accepts capacities recovery rejects, and — worse — accepts
+/// `cap == 0` for content that is not oversize at all.
+pub const MAX_CAPACITY: i64 = 0xFFFD * 16;
 
 pub const T_PREALLOC: u8 = 1;
 pub const T_RECORD: u8 = 2;
@@ -767,6 +832,8 @@ fn parse_v1(lines: &[&str]) -> V1 {
             "version" => panic!("a second version row: {line}"),
             "fixture" => {
                 arity(&t, 5, line);
+                one_of(t[2], &V1_KINDS, "fixture kind", line);
+                one_of(t[3], &ENGINES, "generatorEngine", line);
                 check(
                     m.fixture_kinds
                         .insert(t[1].to_string(), t[2].to_string())
@@ -795,8 +862,8 @@ fn parse_v1(lines: &[&str]) -> V1 {
                 let e = V1Expect {
                     fixture: t[1].to_string(),
                     engine: one_of(t[2], &ENGINES, "engine", line),
-                    verdict: one_of(t[3], &["accept", "reject"], "verdict", line),
-                    opener: t[4].to_string(),
+                    verdict: one_of(t[3], &VERDICTS, "verdict", line),
+                    opener: one_of(t[4], &V1_OPENERS, "opener", line),
                     place_as: rel_name(t[5], line),
                     open_arg: rel_name(t[6], line),
                 };
@@ -852,11 +919,20 @@ fn parse_v1(lines: &[&str]) -> V1 {
     check(!m.files.is_empty(), || {
         "a v1 manifest with no file rows".to_string()
     });
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
+    referenced.extend(m.files.iter().map(|x| x.fixture.clone()));
+    referenced.extend(m.expects.iter().map(|x| x.fixture.clone()));
+    referenced.extend(m.recids.iter().map(|x| x.fixture.clone()));
+    referential_integrity(&m.fixture_kinds, &referenced);
     m
 }
 
 fn parse_v2(lines: &[&str]) -> V2 {
     let mut m = V2::default();
+    // Contract §2, amendment 3: a fixture whose generatorEngine is `derived`
+    // MUST have exactly one `derived` row, and no other fixture may have one.
+    let mut wants_derived: BTreeSet<String> = BTreeSet::new();
+    let mut has_derived: BTreeSet<String> = BTreeSet::new();
     for line in lines {
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -866,6 +942,10 @@ fn parse_v2(lines: &[&str]) -> V2 {
             "version" => panic!("a second version row: {line}"),
             "fixture" => {
                 arity(&t, 5, line);
+                one_of(t[2], &V2_KINDS, "fixture kind", line);
+                if one_of(t[3], &V2_GENERATORS, "generatorEngine", line) == "derived" {
+                    wants_derived.insert(t[1].to_string());
+                }
                 check(
                     m.fixture_kinds
                         .insert(t[1].to_string(), t[2].to_string())
@@ -882,6 +962,9 @@ fn parse_v2(lines: &[&str]) -> V2 {
                 // kind column and never be noticed, because nothing here
                 // consumes kinds.
                 nat(t[3], line);
+                check(has_derived.insert(t[1].to_string()), || {
+                    format!("two derived rows for {}: {line}", t[1])
+                });
             }
             "file" => {
                 arity(&t, 6, line);
@@ -905,8 +988,8 @@ fn parse_v2(lines: &[&str]) -> V2 {
                     fixture: t[1].to_string(),
                     engine: one_of(t[2], &ENGINES, "engine", line),
                     mode: one_of(t[3], &MODES, "mode", line),
-                    verdict: one_of(t[4], &["accept", "reject"], "verdict", line),
-                    opener: t[5].to_string(),
+                    verdict: one_of(t[4], &VERDICTS, "verdict", line),
+                    opener: one_of(t[5], &V2_OPENERS, "opener", line),
                     open_arg: rel_name(t[6], line),
                 };
                 for prior in &m.expects {
@@ -977,6 +1060,10 @@ fn parse_v2(lines: &[&str]) -> V2 {
             }
             "bytes" => {
                 arity(&t, 7, line);
+                one_of(t[2], &ENGINES, "engine", line);
+                one_of(t[3], &MODES, "mode", line);
+                rel_name(t[4], line);
+                nat(t[5], line);
                 panic!(
                     "a v2 `bytes` row, which this reader does not execute yet (C4 introduces \
                      the derived fixtures it describes): {line}"
@@ -988,7 +1075,45 @@ fn parse_v2(lines: &[&str]) -> V2 {
     check(!m.files.is_empty(), || {
         "a v2 manifest with no file rows".to_string()
     });
+    check(wants_derived == has_derived, || {
+        format!(
+            "the fixtures declaring generatorEngine=derived are {wants_derived:?} but the \
+             fixtures carrying a derived row are {has_derived:?}"
+        )
+    });
+    referential_integrity(&m.fixture_kinds, &referenced_v2(&m));
     m
+}
+
+/// Every fixture id a row REFERS to must be DECLARED by exactly one `fixture`
+/// row, and every declared fixture must be referred to.
+///
+/// Without this, one coordinated deletion defeats the exact-cell-set rule that
+/// §6.1 exists to enforce: drop a `fixture` row together with this engine's two
+/// `expect` rows and both halves of the executor see a consistently smaller
+/// world — `want` shrinks by the same fixture that `ran` lost. The `file` and
+/// `recid` rows stay behind, the golden comparisons still decode them, and the
+/// resource inventory is unchanged. The C3r review found that one; the fix is
+/// to make the declaration load-bearing for rows that are not being deleted.
+fn referential_integrity(declared: &BTreeMap<String, String>, referenced: &BTreeSet<String>) {
+    let known: BTreeSet<String> = declared.keys().cloned().collect();
+    let undeclared: Vec<&String> = referenced.difference(&known).collect();
+    check(undeclared.is_empty(), || {
+        format!("rows refer to fixtures with no `fixture` row: {undeclared:?}")
+    });
+    let unused: Vec<&String> = known.difference(referenced).collect();
+    check(unused.is_empty(), || {
+        format!("fixtures are declared but no row refers to them: {unused:?}")
+    });
+}
+
+fn referenced_v2(m: &V2) -> BTreeSet<String> {
+    let mut r = BTreeSet::new();
+    r.extend(m.files.iter().map(|x| x.fixture.clone()));
+    r.extend(m.expects.iter().map(|x| x.fixture.clone()));
+    r.extend(m.posts.iter().map(|x| x.fixture.clone()));
+    r.extend(m.recids.iter().map(|x| x.fixture.clone()));
+    r
 }
 
 /// `unchanged` | `deleted` | `truncated:<len>:<sha>` | `created:<len>:<sha>` |
@@ -1230,12 +1355,11 @@ pub fn render_body(sample: &SampleV2) -> Vec<String> {
 
 /// The content column, and the decode's own self-check.
 ///
-/// `payload(id, len)` is invertible from its first byte, so rebuilding it from
-/// the recovered id and comparing is a total check that these really are bytes
-/// this corpus issued — which they cannot be if the entry stream was framed
-/// wrongly. A decoder that read the packed-long continuation bit the wrong way
-/// round lands mid-payload and fails HERE, rather than producing a plausible
-/// file that disagrees with java's for reasons nobody can localise.
+/// Three independent things are asserted before a sha is emitted: the content
+/// length agrees with `lenPlus`, the capacity satisfies the engine's
+/// `cap_valid` rule ([`check_cap`]), and the bytes lie in the payload language
+/// ([`check_payload`]). None of the three is a corpus-membership proof on its
+/// own; together they refuse the streams a mis-framed decode actually produces.
 fn content_sha(e: &Entry, where_: &str) -> String {
     if !e.is_record() || e.len_plus == Some(0) {
         assert!(
@@ -1258,14 +1382,16 @@ fn content_sha(e: &Entry, where_: &str) -> String {
     sha256_hex(c)
 }
 
-/// The witness that these content bytes really are bytes this corpus issued.
+/// The witness that these content bytes lie in the payload LANGUAGE.
 ///
 /// `payload(id, len)[i] == (i*131 + id) & 0xff` is invertible from its first
-/// byte, so rebuilding it from the recovered id and comparing is total. A
-/// decoder that read the packed-long continuation bit the wrong way round
-/// lands mid-payload and fails HERE, rather than producing a plausible file
-/// that disagrees with java's for reasons nobody can localise. Zero-length
-/// content carries no id and is vacuously fine.
+/// byte, so rebuilding it from the recovered id and comparing catches a run
+/// that is not a payload at all — which is what a decoder that read the
+/// packed-long continuation bit the wrong way round produces. It is **not** a
+/// check that this bundle issued this payload: it consults no fixture history,
+/// and since `payload` is an arithmetic progression, every suffix of a payload
+/// is another payload. `lenPlus` and the golden sha column cover that gap.
+/// Zero-length content carries no id and is vacuously fine.
 pub fn check_payload(c: &[u8], where_: &str) {
     if c.is_empty() {
         return;
@@ -1291,14 +1417,23 @@ pub fn check_payload(c: &[u8], where_: &str) {
 /// capacity is 16-aligned and leaves room for the 4-byte header; 0 means
 /// oversize content stored linked.
 pub fn check_cap(cap: i64, len: usize, where_: &str) {
+    let need = 4 + len as i64;
     if cap == 0 {
+        // `cap == 0` is how the writer encodes OVERSIZE content, stored linked.
+        // Accepting it unconditionally — which this did until the C3r review —
+        // blesses a zero capacity on content that fits a plain record, which is
+        // exactly the value recovery refuses.
+        assert!(
+            need > MAX_CAPACITY,
+            "{where_}: cap 0 means content stored linked because it is oversize, but {len} \
+             content bytes need only {need} and the plain-record ceiling is {MAX_CAPACITY}"
+        );
         return;
     }
     assert!(
-        cap >= 4 + len as i64 && cap & 15 == 0,
-        "{where_}: cap {cap} is not a valid capacity for {len} content bytes \
-         (must be 16-aligned and at least {})",
-        4 + len
+        cap >= need && cap <= MAX_CAPACITY && cap & 15 == 0,
+        "{where_}: cap {cap} is not a valid capacity for {len} content bytes (must be \
+         16-aligned, at least {need}, and at most {MAX_CAPACITY})"
     );
 }
 
@@ -1436,6 +1571,12 @@ pub fn assert_reader_contract<S: Store>(s: &S, recids: &[&RecidRow], ctx: &str) 
     );
 }
 
+/// Reads a file a `post` row names, failing with the real error rather than
+/// silently treating "unreadable" as "absent".
+fn read_named(path: &Path, rel: &str, ctx: &str) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|e| panic!("[{ctx}] cannot read {rel}: {e}"))
+}
+
 /// The two-sided D6 post-state rule.
 ///
 /// One side is the obvious one: every file a `post` row names must be in the
@@ -1454,13 +1595,29 @@ pub fn assert_post_state(
     let named: BTreeSet<&str> = posts.iter().map(|p| p.rel.as_str()).collect();
     for p in posts {
         let path = cell.join(&p.rel);
-        let now = std::fs::read(&path).ok();
+        // Presence is decided by `symlink_metadata`, NOT by `read(..).ok()`.
+        // `.ok()` turns a permission error, or the target having been replaced
+        // by a DIRECTORY, into "absent" — so a `deleted` row would pass on a
+        // file that is very much still there in another shape. The C3r review
+        // named that one.
+        let present = match std::fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => panic!("[{ctx}] cannot stat {}: {e}", p.rel),
+        };
+        let was_input = before.contains_key(&p.rel);
         match p.verb.as_str() {
-            "deleted" => assert!(
-                now.is_none(),
-                "[{ctx}] {} must not exist after the cell",
-                p.rel
-            ),
+            "deleted" => {
+                // §2.1: a post row is an explicit OVERRIDE of an input or an
+                // explicit NEW file. `deleted` is an override, so it must name
+                // something the cell actually started with.
+                assert!(
+                    was_input,
+                    "[{ctx}] `deleted` names {}, which was never an input",
+                    p.rel
+                );
+                assert!(!present, "[{ctx}] {} must not exist after the cell", p.rel);
+            }
             "unchanged" => {
                 let was = before.get(&p.rel).unwrap_or_else(|| {
                     panic!(
@@ -1468,24 +1625,31 @@ pub fn assert_post_state(
                         p.rel
                     )
                 });
-                assert_eq!(
-                    now.as_ref(),
-                    Some(was),
-                    "[{ctx}] {} must be byte-unchanged",
-                    p.rel
-                );
+                let now = read_named(&path, &p.rel, ctx);
+                assert_eq!(&now, was, "[{ctx}] {} must be byte-unchanged", p.rel);
             }
             verb => {
-                if verb == "truncated" || verb == "modified" {
+                // The other half of §2.1's split, which was missing: `created`
+                // is the NEW-file verb, so naming an input with it is as wrong
+                // as `modified` naming a non-input. A cell that overwrote a
+                // segment could otherwise describe it as `created` and pass.
+                if verb == "created" {
                     assert!(
-                        before.contains_key(&p.rel),
+                        !was_input,
+                        "[{ctx}] `created` names {}, which WAS an input — an existing file the \
+                         cell rewrote is `modified` or `truncated`",
+                        p.rel
+                    );
+                } else {
+                    assert!(
+                        was_input,
                         "[{ctx}] `{verb}` names {}, which was never an input — only `created` \
                          may name a file the cell did not start with",
                         p.rel
                     );
                 }
-                let now =
-                    now.unwrap_or_else(|| panic!("[{ctx}] {} must exist after the cell", p.rel));
+                assert!(present, "[{ctx}] {} must exist after the cell", p.rel);
+                let now = read_named(&path, &p.rel, ctx);
                 assert_eq!(
                     now.len() as u64,
                     p.len.unwrap(),

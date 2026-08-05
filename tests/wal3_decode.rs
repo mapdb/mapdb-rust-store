@@ -38,53 +38,88 @@ fn be64(v: i64) -> [u8; 8] {
     v.to_be_bytes()
 }
 
-/// Builds a segment the way the writer does: a 36-byte header whose CRC covers
-/// the first 32 bytes, then sections whose two CRCs are taken over the header
-/// bytes followed by `be64(sectionOffset)` followed by the section's own bytes.
+/// Builds a segment the way the writer does — and, unlike a byte-poking
+/// mutator, RESEALS everything from the fields it is given.
+///
+/// That property is the point. The CRC domains chain: the segment header CRC
+/// covers the first 32 bytes, so corrupting the magic or the version breaks it
+/// too; and every section CRC is taken over ALL 36 header bytes followed by
+/// `be64(sectionOffset)`, so corrupting any header byte — including the stored
+/// header CRC itself — breaks every section CRC as well. A test that flips a
+/// magic byte in a finished segment therefore does not test the magic check:
+/// deleting that check outright still leaves the input refused, by a CRC. The
+/// C3r review measured exactly that on four checks here. Building from fields
+/// and resealing is what isolates them.
 struct SegBuilder {
-    buf: Vec<u8>,
+    magic: [u8; 8],
+    version: u32,
+    flags: u32,
+    seq: i64,
+    first_lsn: i64,
+    /// Replaces the computed header CRC, to test the header-CRC check ALONE:
+    /// the sections are then sealed against these header bytes, so they stay
+    /// valid and only the header check can fire.
+    header_crc: Option<u32>,
+    sections: Vec<(u8, i64, Vec<u8>)>,
 }
 
 impl SegBuilder {
     fn new(seq: i64, first_lsn: i64, flags: u32) -> SegBuilder {
-        let mut h = Vec::with_capacity(xfix::SEG_HDR);
-        h.extend_from_slice(xfix::MAGIC);
-        h.extend_from_slice(&be32(xfix::FORMAT_VERSION));
-        h.extend_from_slice(&be32(flags));
-        h.extend_from_slice(&be64(seq));
-        h.extend_from_slice(&be64(first_lsn));
-        h.extend_from_slice(&be32(crc32fast::hash(&h[..xfix::SEG_HDR_CRC_LEN])));
-        assert_eq!(h.len(), xfix::SEG_HDR);
-        SegBuilder { buf: h }
+        SegBuilder {
+            magic: *xfix::MAGIC,
+            version: xfix::FORMAT_VERSION,
+            flags,
+            seq,
+            first_lsn,
+            header_crc: None,
+            sections: Vec::new(),
+        }
     }
 
-    fn domain(&self, off: usize) -> crc32fast::Hasher {
-        let mut c = crc32fast::Hasher::new();
-        c.update(&self.buf[..xfix::SEG_HDR]);
-        c.update(&(off as u64).to_be_bytes());
-        c
+    fn header(&self) -> Vec<u8> {
+        let mut h = Vec::with_capacity(xfix::SEG_HDR);
+        h.extend_from_slice(&self.magic);
+        h.extend_from_slice(&be32(self.version));
+        h.extend_from_slice(&be32(self.flags));
+        h.extend_from_slice(&be64(self.seq));
+        h.extend_from_slice(&be64(self.first_lsn));
+        let crc = self
+            .header_crc
+            .unwrap_or_else(|| crc32fast::hash(&h[..xfix::SEG_HDR_CRC_LEN]));
+        h.extend_from_slice(&be32(crc));
+        assert_eq!(h.len(), xfix::SEG_HDR);
+        h
     }
 
     fn push(&mut self, tag: u8, lsn: i64, body: &[u8]) -> &mut SegBuilder {
-        let off = self.buf.len();
-        let mut hdr = Vec::with_capacity(xfix::SEC_HDR);
-        hdr.push(tag);
-        hdr.extend_from_slice(&be64(lsn));
-        hdr.extend_from_slice(&be64(body.len() as i64));
-        let mut hc = self.domain(off);
-        hc.update(&hdr[..xfix::SEC_HDR_CRC_LEN]);
-        hdr.extend_from_slice(&be32(hc.finalize()));
-        let mut bc = self.domain(off);
-        bc.update(body);
-        hdr.extend_from_slice(&be32(bc.finalize()));
-        assert_eq!(hdr.len(), xfix::SEC_HDR);
-        self.buf.extend_from_slice(&hdr);
-        self.buf.extend_from_slice(body);
+        self.sections.push((tag, lsn, body.to_vec()));
         self
     }
 
     fn bytes(&self) -> Vec<u8> {
-        self.buf.clone()
+        let head = self.header();
+        let mut out = head.clone();
+        for (tag, lsn, body) in &self.sections {
+            let off = out.len();
+            let domain = |extra: &[u8]| {
+                let mut c = crc32fast::Hasher::new();
+                c.update(&head);
+                c.update(&(off as u64).to_be_bytes());
+                c.update(extra);
+                c.finalize()
+            };
+            let mut hdr = Vec::with_capacity(xfix::SEC_HDR);
+            hdr.push(*tag);
+            hdr.extend_from_slice(&be64(*lsn));
+            hdr.extend_from_slice(&be64(body.len() as i64));
+            let hc = domain(&hdr[..xfix::SEC_HDR_CRC_LEN]);
+            hdr.extend_from_slice(&be32(hc));
+            hdr.extend_from_slice(&be32(domain(body)));
+            assert_eq!(hdr.len(), xfix::SEC_HDR);
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(body);
+        }
+        out
     }
 }
 
@@ -276,9 +311,92 @@ fn section_offsets_advance_and_bind_the_section() {
     });
 }
 
-/// A damaged segment is refused, one damage at a time.
+/// Each header/framing check is refused **on an input only that check rejects**.
+///
+/// The C3r review found the previous version of this test unable to fail: it
+/// poked bytes in a finished segment, and because the CRC domains chain, a
+/// flipped magic byte is also a broken header CRC and a broken section CRC.
+/// Deleting the magic check left the input refused anyway. So the cases below
+/// are BUILT, not poked: every one is a fully-sealed segment that differs from
+/// the control in exactly one semantic field, and the only rule that can refuse
+/// it is the rule it is named for.
 #[test]
-fn a_damaged_segment_is_refused() {
+fn each_header_check_is_refused_on_an_input_only_it_rejects() {
+    let entry = record(1, 16, Some(&xfix::payload(1, 9)));
+    let control = {
+        let mut b = SegBuilder::new(1, 1, 0);
+        b.push(xfix::TAG_SECTION, 1, &entry);
+        b.bytes()
+    };
+    xfix::decode(&control, "control");
+
+    // (a) bad magic, everything else sealed around it.
+    let mut b = SegBuilder::new(1, 1, 0);
+    b.magic = *b"MDBS.XXX";
+    b.push(xfix::TAG_SECTION, 1, &entry);
+    let raw = b.bytes();
+    assert_eq!(
+        crc32fast::hash(&raw[..xfix::SEG_HDR_CRC_LEN]),
+        u32::from_be_bytes(raw[32..36].try_into().unwrap()),
+        "the bad-magic case must still carry a VALID header CRC, or it does not isolate"
+    );
+    xfix::assert_refused("bad magic, with every CRC valid", move || {
+        xfix::decode(&raw, "bad-magic");
+    });
+
+    // (b) a future format version, everything else sealed around it.
+    let mut b = SegBuilder::new(1, 1, 0);
+    b.version = xfix::FORMAT_VERSION + 1;
+    b.push(xfix::TAG_SECTION, 1, &entry);
+    let raw = b.bytes();
+    xfix::assert_refused("a future format version, with every CRC valid", move || {
+        xfix::decode(&raw, "future-version");
+    });
+
+    // (c) a wrong header CRC — and the sections resealed against the header
+    // bytes that carry it, so the section CRCs are valid and only the header
+    // check can fire.
+    let mut b = SegBuilder::new(1, 1, 0);
+    b.header_crc = Some(0xDEAD_BEEF);
+    b.push(xfix::TAG_SECTION, 1, &entry);
+    let raw = b.bytes();
+    xfix::assert_refused("a wrong header CRC, with valid section CRCs", move || {
+        xfix::decode(&raw, "bad-header-crc");
+    });
+
+    // (d) an unknown section tag, with its own section-header CRC recomputed
+    // over the new tag. Poking the tag byte alone would break that CRC and be
+    // refused by it instead.
+    let mut b = SegBuilder::new(1, 1, 0);
+    b.push(b'Z', 1, &entry);
+    let raw = b.bytes();
+    xfix::assert_refused("an unknown section tag, correctly sealed", move || {
+        xfix::decode(&raw, "bad-tag");
+    });
+
+    // (e) a 'K' body that is not 16 bytes, correctly sealed.
+    let mut b = SegBuilder::new(7, 4, 0);
+    b.push(xfix::TAG_MARK, 4, &[0u8; 8]);
+    let raw = b.bytes();
+    xfix::assert_refused("a 'K' section whose body is not 16 bytes", move || {
+        xfix::decode(&raw, "short-mark");
+    });
+
+    // (f) shorter than a segment header at all.
+    let raw = control[..35].to_vec();
+    xfix::assert_refused("a file shorter than a segment header", move || {
+        xfix::decode(&raw, "short");
+    });
+}
+
+/// The two stored CRCs are checked, on inputs where nothing else has changed.
+///
+/// These two ARE isolated by byte-poking, and that is not an accident: each
+/// stored CRC field sits OUTSIDE its own domain (the section-header CRC covers
+/// bytes 0..17 of the header, the body CRC covers the body), so overwriting one
+/// invalidates that check and no other.
+#[test]
+fn the_two_section_crcs_are_checked() {
     let good = {
         let mut b = SegBuilder::new(1, 1, 0);
         b.push(
@@ -288,66 +406,42 @@ fn a_damaged_segment_is_refused() {
         );
         b.bytes()
     };
-    xfix::decode(&good, "control"); // the control: undamaged, it decodes
-
-    /// One named single-byte-scale damage applied to a copy of the control.
-    type Damage = Box<dyn Fn(&mut Vec<u8>)>;
-    let cases: Vec<(&str, Damage)> = vec![
-        (
-            "a file shorter than a segment header",
-            Box::new(|r: &mut Vec<u8>| r.truncate(35)),
-        ),
-        ("bad magic", Box::new(|r: &mut Vec<u8>| r[0] ^= 0xFF)),
-        (
-            "a future format version",
-            Box::new(|r: &mut Vec<u8>| r[11] = 4),
-        ),
-        (
-            "a wrong header CRC",
-            Box::new(|r: &mut Vec<u8>| r[32] ^= 0xFF),
-        ),
-        (
-            "an unknown section tag",
-            Box::new(|r: &mut Vec<u8>| r[36] = b'Z'),
-        ),
-        (
-            "a wrong section-header CRC",
-            Box::new(|r: &mut Vec<u8>| r[36 + 17] ^= 0xFF),
-        ),
-        (
-            "a wrong section-body CRC",
-            Box::new(|r: &mut Vec<u8>| r[36 + 21] ^= 0xFF),
-        ),
-        (
-            "a flipped content byte",
-            Box::new(|r: &mut Vec<u8>| {
-                let n = r.len();
-                r[n - 1] ^= 0xFF;
-            }),
-        ),
-    ];
-    for (what, damage) in cases {
+    for (what, at) in [
+        ("a wrong section-header CRC", xfix::SEG_HDR + 17),
+        ("a wrong section-body CRC", xfix::SEG_HDR + 21),
+    ] {
         let mut raw = good.clone();
-        damage(&mut raw);
-        assert_ne!(
-            raw, good,
-            "the {what} case did not actually change anything"
-        );
+        raw[at] ^= 0xFF;
         xfix::assert_refused(what, move || {
             xfix::decode(&raw, "damaged");
         });
     }
+    // ...and any change to the body itself is caught by the body CRC.
+    let mut raw = good.clone();
+    let n = raw.len();
+    raw[n - 1] ^= 0xFF;
+    xfix::assert_refused("a flipped content byte", move || {
+        xfix::decode(&raw, "flipped");
+    });
 }
 
-/// A torn tail is REPORTED, not silently dropped and not refused.
+/// An INCOMPLETE FINAL SECTION is reported, not refused.
 ///
-/// A writer that died mid-append leaves a partial section, and recovery's whole
-/// job is to stop at the last complete one. The decoder therefore hands back
-/// what it could read plus a byte count, and the caller decides — the golden
-/// comparisons require `trailing == 0`, because a published fixture with a torn
-/// tail would be a different bug.
+/// **This is not the engine's torn-tail policy, and the name says so on
+/// purpose.** `wal_recover` decides tornness with context this decoder does not
+/// have: it also treats a damaged final section header or body CRC as a torn
+/// active tail when no valid later section proves mid-log corruption, and it
+/// treats an overrunning body BELOW the highest segment as corruption rather
+/// than tornness. This helper has no segment-position context and refuses on any
+/// CRC failure, so the two disagree in both directions on inputs the published
+/// fixtures do not contain. That is a deliberate scope choice for a
+/// comparison-only decoder — every pinned file is required to have
+/// `trailing == 0` and is separately opened by the real engine — and the C3r
+/// review was right that the earlier wording claimed more than this.
+///
+/// What IS covered: the two shapes where framing simply runs out.
 #[test]
-fn a_torn_tail_is_reported() {
+fn an_incomplete_final_section_is_reported_not_refused() {
     let mut b = SegBuilder::new(1, 1, 0);
     b.push(
         xfix::TAG_SECTION,
@@ -454,27 +548,65 @@ fn image_sections_decode_like_ordinary_ones() {
 /// number would pass both. The C3j review named exactly that hole.
 #[test]
 fn the_cap_witness_accepts_only_real_capacities() {
-    xfix::check_cap(0, 1_000_000, "linked/oversize content is cap 0");
+    // The plain-record ceiling, restated here so the boundary cases below read
+    // as boundaries. `xfix_ro` checks it against the engine's own constant.
+    const MAX: i64 = xfix::MAX_CAPACITY;
+    assert_eq!(MAX, 1_048_528);
+
     xfix::check_cap(16, 0, "the smallest plain capacity");
     xfix::check_cap(128, 121, "4 + 121 = 125, rounded up to 128");
+    xfix::check_cap(MAX, MAX as usize - 4, "the largest plain record");
+    // cap 0 means the content was too big for a plain record and went linked.
+    // The smallest length for which that is true is the one where 4 + len first
+    // exceeds the ceiling.
+    xfix::check_cap(
+        0,
+        MAX as usize - 3,
+        "the smallest genuinely oversize record",
+    );
 
     for (cap, len, what) in [
-        (127i64, 121usize, "a capacity that is not 16-aligned"),
-        (120, 121, "a capacity with no room for the content"),
-        (124, 120, "a capacity with no room for the 4-byte header"),
+        // The case that made the whole witness weaker than the engine: cap 0
+        // claims the content was stored linked, but 1_000_004 fits a plain
+        // record, so recovery rejects precisely what this used to bless.
+        (
+            0i64,
+            1_000_000usize,
+            "a zero cap on content that fits a plain record",
+        ),
+        (
+            0,
+            MAX as usize - 4,
+            "a zero cap on content that exactly fills the ceiling",
+        ),
+        (MAX + 16, 0, "a capacity above the plain-record ceiling"),
+        (127, 121, "a capacity that is not 16-aligned"),
+        (
+            112,
+            121,
+            "a 16-aligned capacity with no room for the content",
+        ),
+        (
+            128,
+            125,
+            "a 16-aligned capacity with no room for the 4-byte header",
+        ),
         (-16, 0, "a negative capacity"),
     ] {
         xfix::assert_refused(what, move || xfix::check_cap(cap, len, what));
     }
 }
 
-/// `check_payload` is the witness that a decoded content run is real.
+/// `check_payload` rejects bytes OUTSIDE the payload function.
 ///
-/// The golden body comparison grades `contentSha256` against a file another
-/// engine wrote, and the engine's replay never shows the bytes to the suite at
-/// all — so a decoder that landed one byte off and produced a self-consistent
-/// stream would be graded only against itself. `payload` is invertible from its
-/// first byte, which turns "these are plausible bytes" into a total check.
+/// It is a language-membership test, not a corpus-membership test, and the
+/// distinction is the C3r review's: it accepts any `(id, len)` pair without
+/// consulting a fixture's history, so it proves these bytes are *a* payload,
+/// not that this bundle issued *this* payload. What it is for is the one thing
+/// nothing else here reaches — the engine's replay never shows content bytes to
+/// the suite, and the golden sha column grades them against a file another
+/// engine wrote — so a decoder that landed on the wrong offset would otherwise
+/// be checked only against itself.
 #[test]
 fn the_payload_witness_rejects_bytes_the_corpus_never_issued() {
     xfix::check_payload(&xfix::payload(0, 32), "id 0");

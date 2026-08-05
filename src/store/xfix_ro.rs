@@ -50,6 +50,7 @@ fn sample_v2_ro_cells_pass() {
 /// the one place both sets of names are in scope at once.
 #[test]
 fn the_transcribed_constants_match_the_engine() {
+    use super::index_val as iv;
     use super::wal_recover as rec;
     use super::wal_segments as seg;
 
@@ -80,4 +81,8 @@ fn the_transcribed_constants_match_the_engine() {
     assert_eq!(xfix::T_RECORD, rec::T_RECORD, "T_RECORD");
     assert_eq!(xfix::T_APPEND, rec::T_APPEND, "T_APPEND");
     assert_eq!(xfix::T_DELETE, rec::T_DELETE, "T_DELETE");
+
+    // Half of `cap_valid`'s rule, and the one the C3r review found missing from
+    // both the transcription and the witness built on it.
+    assert_eq!(xfix::MAX_CAPACITY, iv::MAX_CAPACITY as i64, "MAX_CAPACITY");
 }

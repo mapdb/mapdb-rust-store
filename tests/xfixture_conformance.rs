@@ -218,6 +218,21 @@ fn sample_v2_body_matches_golden_body() {
     let got = xfix::render_body(&sample);
     xfix::assert_rows_equal("GOLDEN-BODY.tsv", &want, &got);
 
+    // The file's own provenance block, which the row comparison drops. Java
+    // compares this file's whole text; rust compares rows, so without this the
+    // header could be rewritten to claim a different author while every test
+    // stayed green — and the authority claim is the reason this port is graded
+    // against this file at all.
+    let comments: Vec<&str> = want_text
+        .lines()
+        .take_while(|l| l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        comments,
+        xfix::GOLDEN_BODY_HEADER,
+        "GOLDEN-BODY.tsv's provenance header is not the one this port was written against"
+    );
+
     // The distinction the whole file exists for must actually be IN it, or the
     // comparison above is a comparison of two files that never disagree about
     // the interesting case. `lenPlus == 0` is NULL content, `lenPlus == 1` is
@@ -280,9 +295,9 @@ fn the_v2_resource_tree_has_nothing_unexplained() {
 /// to be the newest.
 #[test]
 fn the_two_schemas_are_told_apart_by_their_version_line_only() {
-    let v1 = "version\t1\nfixture\tf\tk\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n\
+    let v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n\
               expect\tf\trust\taccept\tdirect\tx.db\tx.db\n";
-    let v2 = "version\t2\nfixture\tf\tk\tjava\tc\nfile\tf\tx\t1\taa\tbb\n\
+    let v2 = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1\taa\tbb\n\
               expect\tf\trust\tro\taccept\twal3\tx\n";
     assert_eq!(xfix::parse(v1).version(), 1);
     assert_eq!(xfix::parse(v2).version(), 2);
@@ -297,7 +312,10 @@ fn the_two_schemas_are_told_apart_by_their_version_line_only() {
     );
 
     xfix::assert_manifest_refused("an unknown schema version", "version\t3\n");
-    xfix::assert_manifest_refused("a manifest with no version line", "fixture\tf\tk\tj\tc\n");
+    xfix::assert_manifest_refused(
+        "a manifest with no version line",
+        "fixture\tf\tdirect\tjava\tc\n",
+    );
     xfix::assert_manifest_refused("a version line with a trailing field", "version\t2\tx\n");
 }
 
@@ -337,6 +355,10 @@ fn unrecognised_and_malformed_rows_are_refused() {
         &format!("{head}{file}expect\tf\trust\trwx\taccept\twal3\tx\n"),
     );
     xfix::assert_manifest_refused(
+        "an unknown verdict on a java row",
+        &format!("{head}{file}expect\tf\tjava\tro\tmaybe\twal3\tx\n"),
+    );
+    xfix::assert_manifest_refused(
         "a duplicate expect row",
         &format!(
             "{head}{file}expect\tf\trust\tro\taccept\twal3\tx\n\
@@ -367,6 +389,145 @@ fn unrecognised_and_malformed_rows_are_refused() {
         &format!("{head}{file}recidrange\tf\tr\t1\t99999999\tlive\t1\t1\n"),
     );
     xfix::assert_manifest_refused("a v2 manifest with no file rows", head);
+
+    // Vocabularies contract §2 makes load-bearing. The C3r review found kind,
+    // generatorEngine and opener stored unchecked — and `opener` in particular
+    // was only ever validated by `run_v2_cells`, AFTER it had filtered to this
+    // engine's rows, so a bad opener on a java or zig row reached nothing. The
+    // cases below are therefore addressed to OTHER engines on purpose: executor
+    // filtering must not be able to masquerade as parser validation.
+    xfix::assert_manifest_refused(
+        "an unknown opener on a java row",
+        &format!("{head}{file}expect\tf\tjava\tro\taccept\twal9\tx\n"),
+    );
+    xfix::assert_manifest_refused(
+        "an unknown opener on a zig row",
+        &format!("{head}{file}expect\tf\tzig\trw\taccept\tdirekt\tx\n"),
+    );
+    xfix::assert_manifest_refused(
+        "an unknown fixture kind",
+        "version\t2\nfixture\tf\twal3-namespaces\tjava\tc\n\
+         file\tf\tx.wal.0000000000000001\t36\taa\tbb\n",
+    );
+    xfix::assert_manifest_refused(
+        "an unknown generatorEngine",
+        "version\t2\nfixture\tf\twal3-namespace\tgo\tc\n\
+         file\tf\tx.wal.0000000000000001\t36\taa\tbb\n",
+    );
+    // `port-wal` and `java-wal-namespace` are RETAINED tokens: no v2 fixture
+    // uses them, and §2 says retiring a family is not a reason for a
+    // version-dispatch parser to reject the token. So they must still parse.
+    for kind in [
+        "direct",
+        "reject",
+        "wal3-namespace",
+        "port-wal",
+        "java-wal-namespace",
+    ] {
+        xfix::parse(&format!(
+            "version\t2\nfixture\tf\t{kind}\tjava\tc\n\
+             file\tf\tx.wal.0000000000000001\t36\taa\tbb\n"
+        ));
+    }
+
+    // §2 amendment 3: `generatorEngine = derived` and a `derived` row imply
+    // each other, exactly once.
+    xfix::assert_manifest_refused(
+        "a derived fixture with no derived row",
+        "version\t2\nfixture\tf\treject\tderived\tc\n\
+         file\tf\tx.wal.0000000000000001\t36\taa\tbb\n",
+    );
+    xfix::assert_manifest_refused(
+        "a derived row on a fixture an engine wrote",
+        &format!("{head}{file}derived\tf\tsrc\t1\trecipe\n"),
+    );
+}
+
+/// A fixture id a row REFERS to must be DECLARED, and vice versa.
+///
+/// Without this the exact-cell-set rule has a coordinated escape: delete a
+/// `fixture` row together with this engine's `expect` rows for it, and both
+/// halves of the executor see a consistently smaller world — the expected set
+/// shrinks by exactly the cell that stopped running. The `file` and `recid` rows
+/// stay behind, the golden comparisons still decode them, and the resource
+/// inventory is unchanged. Found by the C3r review; the fix is to make the
+/// declaration load-bearing for the rows that were NOT deleted.
+#[test]
+fn every_referenced_fixture_must_be_declared_and_every_declared_one_used() {
+    let decl = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n";
+    let file = "file\tf\tx.wal.0000000000000001\t36\taa\tbb\n";
+
+    xfix::parse(&format!("{decl}{file}"));
+
+    xfix::assert_manifest_refused(
+        "a file row naming a fixture with no fixture row",
+        &format!("{decl}{file}file\tg\tx.wal.0000000000000002\t36\tcc\tdd\n"),
+    );
+    xfix::assert_manifest_refused(
+        "an expect row naming a fixture with no fixture row",
+        &format!("{decl}{file}expect\tg\trust\tro\taccept\twal3\tx\n"),
+    );
+    xfix::assert_manifest_refused(
+        "a post row naming a fixture with no fixture row",
+        &format!("{decl}{file}post\tg\trust\tro\tx.lock\tunchanged\n"),
+    );
+    xfix::assert_manifest_refused(
+        "a recid row naming a fixture with no fixture row",
+        &format!("{decl}{file}recid\tg\tr1\t1\tlive\t1\t8\n"),
+    );
+    xfix::assert_manifest_refused(
+        "a declared fixture no row refers to",
+        &format!("{decl}{file}fixture\tg\twal3-namespace\tjava\tc\n"),
+    );
+
+    // The same rule guards the v1 tree, where the live manifest satisfies it.
+    let v1 = "version\t1\nfixture\tf\tdirect\tjava\tc\nfile\tf\tx.db\t1\taa\tbb\n";
+    xfix::parse(v1);
+    xfix::assert_manifest_refused(
+        "a v1 recid row naming a fixture with no fixture row",
+        &format!("{v1}recid\tg\tr1\t1\tlive\t1\t8\n"),
+    );
+}
+
+/// The v1 grammar's own vocabularies, which are NOT the v2 ones.
+///
+/// v1's opener set is `{direct, wal}` where v2's is `{direct, wal3}`, and v1's
+/// kind set is v2's minus `wal3-namespace`. Sharing one reader across two
+/// grammars makes it easy to validate against the wrong set — or, as here
+/// before the C3r review, against no set at all — and the live v1 tree cannot
+/// notice because every value in it is correct.
+#[test]
+fn the_v1_grammar_has_its_own_vocabularies() {
+    let head = "version\t1\nfixture\tf\tport-wal\tjava\tc\n";
+    let file = "file\tf\tx.wal\t1\taa\tbb\n";
+
+    for opener in ["direct", "wal"] {
+        xfix::parse(&format!(
+            "{head}{file}expect\tf\trust\taccept\t{opener}\tx.wal\tx.wal\n"
+        ));
+    }
+    // `wal3` is the V2 opener token and must NOT be accepted under v1.
+    xfix::assert_manifest_refused(
+        "the v2 opener token on a v1 row",
+        &format!("{head}{file}expect\tf\trust\taccept\twal3\tx.wal\tx.wal\n"),
+    );
+    xfix::assert_manifest_refused(
+        "an unknown v1 opener on a zig row",
+        &format!("{head}{file}expect\tf\tzig\taccept\twalrus\tx.wal\tx.wal\n"),
+    );
+    xfix::assert_manifest_refused(
+        "an unknown v1 verdict",
+        &format!("{head}{file}expect\tf\trust\tmaybe\tdirect\tx.wal\tx.wal\n"),
+    );
+    // `wal3-namespace` is the kind v2 ADDED; a v1 manifest must not carry it.
+    xfix::assert_manifest_refused(
+        "the v2-only fixture kind on a v1 row",
+        "version\t1\nfixture\tf\twal3-namespace\tjava\tc\nfile\tf\tx\t1\taa\tbb\n",
+    );
+    xfix::assert_manifest_refused(
+        "an unknown v1 generatorEngine",
+        "version\t1\nfixture\tf\tdirect\tgo\tc\nfile\tf\tx\t1\taa\tbb\n",
+    );
 }
 
 /// A `bytes` row is refused BY NAME, not skipped.
@@ -380,9 +541,14 @@ fn unrecognised_and_malformed_rows_are_refused() {
 fn a_bytes_row_is_refused_until_c4_can_execute_it() {
     xfix::assert_manifest_refused(
         "a v2 `bytes` row",
+        // The row must be GRAMMATICALLY VALID, or the test proves only that a
+        // malformed row is refused — which the arity and vocabulary rules
+        // already do, and which is not what the name claims. The first version
+        // of this case supplied an unknown engine, an unknown mode and a
+        // relName of `0`, and the unconditional `bytes` panic masked all three.
         "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n\
          file\tf\tx.wal.0000000000000001\t36\taa\tbb\n\
-         bytes\tf\tsrc\tx\t0\t36\taa\n",
+         bytes\tf\trust\tro\tx.wal.0000000000000001\t0\taa\n",
     );
 }
 
@@ -483,6 +649,30 @@ fn the_post_state_rule_fails_in_both_directions() {
             vec!["new\tmodified:1:S"],
             false,
         ),
+        // §2.1's split has TWO sides: a post row is an explicit override of an
+        // input, or an explicit NEW file. The three cases below are the ones the
+        // C3r review found missing, and each was green under the old rule.
+        (
+            "`created` naming a file that WAS an input",
+            vec![("seg", b"q")],
+            vec![("seg", b"q")],
+            vec!["seg\tcreated:1:S"],
+            false,
+        ),
+        (
+            "`deleted` naming a file that was never an input",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc")],
+            vec!["ghost\tdeleted"],
+            false,
+        ),
+        (
+            "a `deleted` file replaced by a directory of the same name",
+            vec![("seg", b"abc")],
+            vec![],
+            vec!["seg\tdeleted"],
+            false,
+        ),
     ];
 
     for (what, inputs, after, posts, want_ok) in cases {
@@ -495,6 +685,9 @@ fn the_post_state_rule_fails_in_both_directions() {
         }
         for (name, bytes) in &after {
             std::fs::write(cell.join(name), bytes).unwrap();
+        }
+        if what.contains("replaced by a directory") {
+            std::fs::create_dir(cell.join("seg")).unwrap();
         }
 
         // The post rows are written as manifest text and parsed by the real
@@ -521,6 +714,6 @@ fn the_post_state_rule_fails_in_both_directions() {
         }
         std::fs::remove_dir_all(&cell).unwrap();
     }
-    assert_eq!(n, 10, "the post-state battery lost a case");
+    assert_eq!(n, 13, "the post-state battery lost a case");
     let _ = std::fs::remove_dir_all(&session);
 }
