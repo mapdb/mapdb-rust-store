@@ -1218,8 +1218,9 @@ fn probe_variant(variant: &str, dir: &Path) {
         // the adopted workload with only the FIRST half of shape_rotate: the
         // commit that crosses `segment_bytes`, without the one that lands alone
         // in the segment it opens. This is the case the pair exists for, and it
-        // ends in the WRONG final state (A holds the oversized payload), so it
-        // is measured for shape only and must not assert §5.3's state.
+        // ends in a DIFFERENT final state (A holds the oversized payload), so it
+        // must not assert §5.3's state — it asserts the state it does reach
+        // instead, which is every §5.2 row plus the recid set, A's moved.
         "shaped-half-rotate" => {
             t1(&s, &mut r, CLEANED_BASE);
             t2(&s, &mut r);
