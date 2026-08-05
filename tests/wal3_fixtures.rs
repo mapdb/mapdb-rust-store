@@ -260,12 +260,23 @@ fn cleaned_workload(base: &Path, r: &mut Recids) {
 
 /// The final logical state §5.2 pins, which §5.3 shares verbatim.
 fn assert_final_state(s: &StoreWAL, r: &Recids, ctx: &str, base: u64) {
+    assert_state_with_a(s, r, ctx, base, &payload(base + 5, 120));
+}
+
+/// §5.2's final logical state with A's content named by the caller.
+///
+/// Every adopted workload ends with A holding `p(base+5, 120)`; the one probe
+/// variant that deliberately stops mid-pair ends with A holding the oversized
+/// payload instead. Naming A's expectation rather than skipping the check is
+/// what keeps that variant's exception scoped to the ONE record it is about —
+/// an unrelated state defect in it would otherwise be exempt too.
+fn assert_state_with_a(s: &StoreWAL, r: &Recids, ctx: &str, base: u64, a_expect: &[u8]) {
     s.verify()
         .unwrap_or_else(|e| panic!("{ctx}: verify(): {e:?}"));
     assert_eq!(
-        s.get(r.a(), &R).unwrap(),
-        Some(payload(base + 5, 120)),
-        "{ctx}: A content (updated in T4)"
+        s.get(r.a(), &R).unwrap().as_deref(),
+        Some(a_expect),
+        "{ctx}: A content"
     );
     assert_eq!(
         s.get(Recid::new(r.b).unwrap(), &R).unwrap(),
@@ -649,16 +660,19 @@ fn check_cleaned(segs: &[Seg]) -> Vec<(&'static str, i64)> {
     );
 
     let retained: Vec<&Seg> = segs.iter().filter(|g| g.seq > through).collect();
-    assert!(
-        retained[0].seq > 1,
-        "{CLEANED_ID}: the retained floor must be above segment 1 (§5.3)"
-    );
+    // Cardinality BEFORE indexing: an image retaining nothing is refused for row 1,
+    // which is what is wrong with it, and not for an index that happened to be out
+    // of bounds on the way to saying so.
     assert_eq!(
         retained.len(),
         3,
         "{CLEANED_ID}: §5.3.1 row 1 requires exactly three retained segments; \
          this bundle retains {}",
         retained.len()
+    );
+    assert!(
+        retained[0].seq > 1,
+        "{CLEANED_ID}: the retained floor must be above segment 1 (§5.3)"
     );
     let (lowest, middle, active) = (retained[0], retained[1], retained[2]);
     assert_eq!(
@@ -1137,8 +1151,10 @@ fn write_wal3_fixtures() {
 /// logical state §5.3 pins and asserts it before closing, so a variant that
 /// reaches the shape by changing what the fixture MEANS fails here rather than
 /// in review. The one exception is `shaped-half-rotate`, which exists precisely
-/// to show that half of a state-preserving PAIR is not state-preserving; it
-/// returns before the assertion and says so in place.
+/// to show that half of a state-preserving PAIR is not state-preserving. It
+/// asserts the state it DOES reach — A holding the oversized payload, the rest
+/// of §5.2 unchanged — rather than skipping the check, so the exception covers
+/// the one record it is about and nothing else.
 fn probe_variant(variant: &str, dir: &Path) {
     wipe(dir);
     std::fs::create_dir_all(dir).expect("create the probe namespace");
@@ -1221,6 +1237,17 @@ fn probe_variant(variant: &str, dir: &Path) {
             assert!(
                 s.cleaner_bytes().0 > 0,
                 "{variant}: the checkpoint wrote no image"
+            );
+            // Not §5.3's final state — that is the POINT of this variant — but
+            // not unchecked either: A holds the oversized payload and every
+            // other record is where §5.2 leaves it. The exception this variant
+            // is granted is exactly one record wide.
+            assert_state_with_a(
+                &s,
+                &r,
+                variant,
+                CLEANED_BASE,
+                &payload(CLEANED_BASE + 7, SEGMENT_BYTES as usize),
             );
             s.close().unwrap();
             drop_lock(dir);
