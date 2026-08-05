@@ -1254,18 +1254,31 @@ fn content_sha(e: &Entry, where_: &str) -> String {
         "{where_}: content length disagrees with lenPlus"
     );
     check_cap(e.cap.unwrap(), c.len(), where_);
-    if !c.is_empty() {
-        let id = c[0] as u64;
-        assert_eq!(
-            *c,
-            payload(id, c.len()),
-            "{where_}: the {} content bytes are not payload({id}, {}) — this entry stream was \
-             not framed the way the writer wrote it",
-            c.len(),
-            c.len()
-        );
-    }
+    check_payload(c, where_);
     sha256_hex(c)
+}
+
+/// The witness that these content bytes really are bytes this corpus issued.
+///
+/// `payload(id, len)[i] == (i*131 + id) & 0xff` is invertible from its first
+/// byte, so rebuilding it from the recovered id and comparing is total. A
+/// decoder that read the packed-long continuation bit the wrong way round
+/// lands mid-payload and fails HERE, rather than producing a plausible file
+/// that disagrees with java's for reasons nobody can localise. Zero-length
+/// content carries no id and is vacuously fine.
+pub fn check_payload(c: &[u8], where_: &str) {
+    if c.is_empty() {
+        return;
+    }
+    let id = c[0] as u64;
+    assert_eq!(
+        c,
+        payload(id, c.len()),
+        "{where_}: the {} content bytes are not payload({id}, {}) — this entry stream was \
+         not framed the way the writer wrote it",
+        c.len(),
+        c.len()
+    );
 }
 
 /// The independent witness for the emitted `cap` column.
@@ -1320,7 +1333,7 @@ pub fn check_mark(mark: (i64, i64), seg_seq: i64, lsn: i64, where_: &str) {
 /// `wal3-java-tail` already carries recids beyond the ones §5.2 describes. Set
 /// equality would quietly assert the forbidden direction and pass only because
 /// these three bundles happen to have equal sets.
-fn check_recids_against_manifest(m: &V2, fixture: &str, seen: &BTreeSet<u64>) {
+pub fn check_recids_against_manifest(m: &V2, fixture: &str, seen: &BTreeSet<u64>) {
     let rows = m.recids_of(fixture);
     assert!(
         !rows.is_empty(),

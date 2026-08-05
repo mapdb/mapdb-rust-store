@@ -344,6 +344,13 @@ fn unrecognised_and_malformed_rows_are_refused() {
         ),
     );
     xfix::assert_manifest_refused(
+        "a duplicate post row",
+        &format!(
+            "{head}{file}post\tf\trust\tro\tx.lock\tunchanged\n\
+             post\tf\trust\tro\tx.lock\tdeleted\n"
+        ),
+    );
+    xfix::assert_manifest_refused(
         "an unknown post disposition",
         &format!("{head}{file}post\tf\trust\tro\tx.lock\tvanished\n"),
     );
@@ -377,4 +384,143 @@ fn a_bytes_row_is_refused_until_c4_can_execute_it() {
          file\tf\tx.wal.0000000000000001\t36\taa\tbb\n\
          bytes\tf\tsrc\tx\t0\t36\taa\n",
     );
+}
+
+// ---------------------------------------------------------------------------
+// the D6 post-state rule, exercised directly
+// ---------------------------------------------------------------------------
+
+/// Both sides of the post-state rule, on inputs the sample cannot supply.
+///
+/// The sample's `rw` and `ro` cells leave every segment untouched and create
+/// one `x.lock`, so the corpus is CONSTANT in everything the rule's second side
+/// checks: removing "an unnamed input must still be there byte for byte" and
+/// "a file that is neither an input nor named must not exist" leaves the whole
+/// suite green — measured, both mutants survived the first campaign. That is
+/// lesson (g) again, and the answer is the same: an input built to vary. These
+/// directories are built by hand.
+#[test]
+fn the_post_state_rule_fails_in_both_directions() {
+    let session = xfix::session_dir("xfix_post");
+    let mut n = 0usize;
+
+    /// `(what, inputs placed, files present afterwards, post rows, accepted?)`
+    type Case = (
+        &'static str,
+        Vec<(&'static str, &'static [u8])>,
+        Vec<(&'static str, &'static [u8])>,
+        Vec<&'static str>,
+        bool,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "an untouched input named by nothing",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc")],
+            vec![],
+            true,
+        ),
+        (
+            "an unnamed input rewritten behind the rule's back",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abd")],
+            vec![],
+            false,
+        ),
+        (
+            "an unnamed input deleted behind the rule's back",
+            vec![("seg", b"abc")],
+            vec![],
+            vec![],
+            false,
+        ),
+        (
+            "a file that is neither an input nor named",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc"), ("surprise", b"x")],
+            vec![],
+            false,
+        ),
+        (
+            "a lock file the post rows do declare",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc"), ("x.lock", b"")],
+            vec!["x.lock\tcreated:0:E"],
+            true,
+        ),
+        (
+            "a `created` file whose sha does not match",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc"), ("x.lock", b"z")],
+            vec!["x.lock\tcreated:0:E"],
+            false,
+        ),
+        (
+            "a `deleted` file that is still there",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc")],
+            vec!["seg\tdeleted"],
+            false,
+        ),
+        (
+            "a `deleted` file that really is gone",
+            vec![("seg", b"abc")],
+            vec![],
+            vec!["seg\tdeleted"],
+            true,
+        ),
+        (
+            "an `unchanged` file that changed",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abd")],
+            vec!["seg\tunchanged"],
+            false,
+        ),
+        (
+            "`modified` naming a file that was never an input",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc"), ("new", b"q")],
+            vec!["new\tmodified:1:S"],
+            false,
+        ),
+    ];
+
+    for (what, inputs, after, posts, want_ok) in cases {
+        n += 1;
+        let cell = session.join(format!("post-{n}"));
+        std::fs::create_dir_all(&cell).unwrap();
+        let mut before = std::collections::BTreeMap::new();
+        for (name, bytes) in &inputs {
+            before.insert((*name).to_string(), bytes.to_vec());
+        }
+        for (name, bytes) in &after {
+            std::fs::write(cell.join(name), bytes).unwrap();
+        }
+
+        // The post rows are written as manifest text and parsed by the real
+        // reader, so the disposition grammar under test is the shipped one.
+        let mut text = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n\
+                        file\tf\tseg\t3\taa\tbb\n"
+            .to_string();
+        for row in &posts {
+            let row = row
+                .replace('E', xfix::EMPTY_SHA)
+                .replace('S', &xfix::sha256_hex(b"q"));
+            text.push_str(&format!("post\tf\trust\tro\t{row}\n"));
+        }
+        let loaded = xfix::parse(&text);
+        let m = loaded.v2();
+        let rows = m.posts_of("f", "rust", "ro");
+
+        let cell2 = cell.clone();
+        let run = move || xfix::assert_post_state(&cell2, &before, &rows, what);
+        if want_ok {
+            run();
+        } else {
+            xfix::assert_refused(what, run);
+        }
+        std::fs::remove_dir_all(&cell).unwrap();
+    }
+    assert_eq!(n, 10, "the post-state battery lost a case");
+    let _ = std::fs::remove_dir_all(&session);
 }

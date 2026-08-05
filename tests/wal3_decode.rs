@@ -468,6 +468,96 @@ fn the_cap_witness_accepts_only_real_capacities() {
     }
 }
 
+/// `check_payload` is the witness that a decoded content run is real.
+///
+/// The golden body comparison grades `contentSha256` against a file another
+/// engine wrote, and the engine's replay never shows the bytes to the suite at
+/// all — so a decoder that landed one byte off and produced a self-consistent
+/// stream would be graded only against itself. `payload` is invertible from its
+/// first byte, which turns "these are plausible bytes" into a total check.
+#[test]
+fn the_payload_witness_rejects_bytes_the_corpus_never_issued() {
+    xfix::check_payload(&xfix::payload(0, 32), "id 0");
+    xfix::check_payload(&xfix::payload(255, 700), "the largest id");
+    xfix::check_payload(&[], "zero-length content carries no id");
+
+    let mut off_by_one = xfix::payload(103, 120);
+    off_by_one[7] ^= 0x01;
+    xfix::assert_refused("a single corrupted content byte", move || {
+        xfix::check_payload(&off_by_one, "corrupted");
+    });
+
+    // The shape a mis-framed entry stream actually produces: a run that begins
+    // on the entry's varint bytes and only then reaches the payload.
+    let mut framed = vec![0x81u8, 0x90, 0x02];
+    framed.extend(xfix::payload(103, 20));
+    xfix::assert_refused(
+        "content read starting on an entry's varint bytes",
+        move || {
+            xfix::check_payload(&framed, "framed");
+        },
+    );
+
+    // ...and a run that spans the boundary between two records' payloads.
+    let mut spliced = xfix::payload(50, 10);
+    spliced.extend(xfix::payload(60, 10));
+    xfix::assert_refused("content spanning two records' payloads", move || {
+        xfix::check_payload(&spliced, "spliced");
+    });
+
+    // WHAT THIS WITNESS DOES NOT CATCH, measured rather than assumed.
+    // `payload` is an arithmetic progression in i, so EVERY suffix of a payload
+    // is itself a payload under a different id: payload(id, n)[k..] ==
+    // payload((id + 131k) & 0xff, n - k). A decode shifted by k bytes WITHIN one
+    // record's content is therefore invisible here — it is caught instead by the
+    // `lenPlus` length check next to the call, and by the sha column of
+    // GOLDEN-BODY.tsv. This is a property of the corpus's payload function, so
+    // it is the same in all three ports; stating it is cheaper than each of them
+    // rediscovering it.
+    let k = 3usize;
+    assert_eq!(
+        xfix::payload(103, 120)[k..],
+        xfix::payload((103 + 131 * k as u64) & 0xff, 120 - k)[..]
+    );
+}
+
+/// The recid cross-check is ONE-WAY, and it fires.
+///
+/// Every recid the manifest names must be witnessed in the decoded history;
+/// never the reverse. Plan §5 forbids the reverse — a rolled-back put need only
+/// be invisible through the API, and `wal3-java-tail` already carries recids
+/// beyond the six §5.2 describes — so set equality would be a violation waiting
+/// for the first legal fixture. Both halves are asserted here: the surplus
+/// direction must be TOLERATED, the missing direction must be REFUSED.
+#[test]
+fn the_recid_cross_check_is_one_way_and_can_fail() {
+    let text = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n\
+                file\tf\tx.wal.0000000000000001\t36\taa\tbb\n\
+                recid\tf\tr1\t1\tlive\t1\t8\n\
+                recid\tf\tr2\t2\tnull\t0\t0\n";
+    let loaded = xfix::parse(text);
+    let m = loaded.v2();
+
+    // exactly the named recids, and a superset: both fine.
+    xfix::check_recids_against_manifest(m, "f", &[1u64, 2].into_iter().collect());
+    xfix::check_recids_against_manifest(m, "f", &[1u64, 2, 7, 99].into_iter().collect());
+
+    for (seen, what) in [
+        (vec![1u64], "a decode that never mentions recid 2"),
+        (vec![], "a decode that mentions no recid at all"),
+        (vec![3u64, 4], "a decode whose recids are all shifted"),
+    ] {
+        let set: std::collections::BTreeSet<u64> = seen.into_iter().collect();
+        xfix::assert_refused(what, || {
+            xfix::check_recids_against_manifest(m, "f", &set);
+        });
+    }
+
+    xfix::assert_refused("a fixture with no recid rows to check against", || {
+        xfix::check_recids_against_manifest(m, "nonexistent", &Default::default());
+    });
+}
+
 /// `check_mark` is the only thing that observes the mark longs' MEANING.
 ///
 /// Both fields are longs, so the decoder cannot tell a swap from a legal pair
