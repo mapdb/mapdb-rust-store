@@ -1569,6 +1569,7 @@ pub fn run_v2_cells(
                     .unwrap_or_else(|err| panic!("[{ctx}] accept cell failed to open: {err}"));
                 let recids = m.recids_of(&e.fixture);
                 assert_reader_contract(&s, &recids, &ctx);
+                assert_every_logged_recid_is_classified(&s, sample, &e.fixture, &recids, &ctx);
                 s.close().unwrap();
             }
             "reject" => match open(&base) {
@@ -1593,6 +1594,54 @@ pub fn run_v2_cells(
         ran, want,
         "the {ENGINE}/{mode} cells that ran are not the ones the fixture rows call for"
     );
+}
+
+/// The completeness half of the recid oracle: every recid the LOG mentions is
+/// either named by the manifest or void according to the engine.
+///
+/// Without this, deleting a `prealloc` (or `deleted`) recid row from the
+/// manifest is invisible — measured, not assumed. `assert_reader_contract`
+/// derives its `get_all_recids` set from the manifest's own live+null rows, so
+/// dropping a row that is excluded from that set by construction removes an
+/// assertion and adds none; and [`check_recids_against_manifest`] is one-way,
+/// so a shorter manifest satisfies it more easily. Both directions of the
+/// existing pair get WEAKER when a row disappears, which is the shape a
+/// completeness rule has to fix from outside.
+///
+/// **This is not the direction plan §5 forbids.** §5 forbids asserting that a
+/// log contains only the recids the manifest names, because §5.2's rolled-back
+/// put need only be invisible through the API. That case is exactly what the
+/// escape hatch here admits: a rolled-back recid was never committed, so the
+/// engine answers `GetVoid` for it, and the row stays legal without being
+/// named. What is refused is the other thing — a recid the log mentions that
+/// the engine still ANSWERS for, and that the manifest describes nowhere.
+fn assert_every_logged_recid_is_classified<S: Store>(
+    s: &S,
+    sample: &SampleV2,
+    fixture: &str,
+    named_rows: &[&RecidRow],
+    ctx: &str,
+) {
+    let named: BTreeSet<u64> = named_rows.iter().map(|r| r.recid).collect();
+    let mut mentioned: BTreeSet<u64> = BTreeSet::new();
+    for f in sample.manifest.files_of(fixture) {
+        let where_ = format!("{}/{}", f.fixture, f.rel);
+        for sec in decode(sample.bytes_of(f), &where_).sections {
+            if sec.tag == TAG_MARK {
+                continue;
+            }
+            for e in entries(&sec, &where_) {
+                mentioned.insert(e.recid as u64);
+            }
+        }
+    }
+    for recid in mentioned.difference(&named) {
+        assert!(
+            matches!(s.get(nz(*recid), &R), Err(DbError::GetVoid(x)) if x == *recid),
+            "[{ctx}] recid {recid} appears in the log, the store still answers for it, and no \
+             manifest recid row says what it is"
+        );
+    }
 }
 
 /// A fresh per-process scratch directory for one test.
