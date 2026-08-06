@@ -2082,6 +2082,15 @@ pub fn assert_post_state(
                         // form left `posttrunc_len` a survivor. Same shape as
                         // `assert_family`'s S2 arm and the read-only probe, and
                         // the same reason.
+                        //
+                        // **And the collapse is not free**, which round 4
+                        // measured: deleting one statement proves that SOME
+                        // part of the conjunction matters, never which. `<`
+                        // regressed to `<=` with the whole gate and the whole
+                        // campaign green, because no input had equal bytes.
+                        // Collapsing removes the masking BETWEEN the halves; it
+                        // does not give either of them a red. The inputs have
+                        // to, and there is now one per half.
                         let was = was.expect("checked above");
                         assert!(
                             now.len() < was.len() && was[..now.len()] == now[..],

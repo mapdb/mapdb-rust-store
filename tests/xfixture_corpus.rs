@@ -131,6 +131,15 @@
 //! C5t's torn-tail engine images; the reviewer falsified that deferral in six
 //! lines of the existing synthetic battery, because the rule is about two byte
 //! strings and needs no engine to produce them.
+//!
+//! **Round 4 reviewed that repair and found the collapse had hidden a missing
+//! input.** Writing the truncation rule as one statement removed the masking
+//! between "it shrank" and "it is a prefix" — but the campaign's single
+//! deletion mutant then proves only that SOME part of the conjunction matters.
+//! `<` regressed to `<=` with the whole gate and all 46 mutants green, because
+//! no battery case had equal bytes. **A collapse buys freedom from masking, not
+//! coverage: each half still owes an input.** There is one per half now, and a
+//! strictness-specific mutant beside the whole-statement one.
 
 #[path = "../src/store/xfix.rs"]
 mod xfix;

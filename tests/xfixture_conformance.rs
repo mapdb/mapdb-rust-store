@@ -772,6 +772,19 @@ fn the_post_state_rule_fails_in_both_directions() {
             vec!["seg\ttruncated:1:S"],
             false,
         ),
+        // The PROPER half of "proper prefix", which round 4 found had no input:
+        // with only a growth and a non-prefix to fail on, `<` could regress to
+        // `<=` and the whole gate stayed green. A one-statement conjunction
+        // removes the masking between its halves and does NOT prove them —
+        // deleting it shows that some part matters, never which. The inputs
+        // have to cover each half.
+        (
+            "a `truncated` file whose bytes are exactly the input",
+            vec![("seg", b"q")],
+            vec![("seg", b"q")],
+            vec!["seg\ttruncated:1:S"],
+            false,
+        ),
         (
             "a `truncated` file that shrank but is not a PREFIX of the input",
             vec![("seg", b"zq")],
@@ -862,6 +875,6 @@ fn the_post_state_rule_fails_in_both_directions() {
         }
         std::fs::remove_dir_all(&cell).unwrap();
     }
-    assert_eq!(n, 19, "the post-state battery lost a case");
+    assert_eq!(n, 20, "the post-state battery lost a case");
     let _ = std::fs::remove_dir_all(&session);
 }
