@@ -752,6 +752,25 @@ fn the_post_state_rule_fails_in_both_directions() {
         // `capture`'s assertion leaves `read_named` refusing it too. So this
         // case still measures the hazard its name claims; what it no longer
         // isolates is which of the two statements catches it.
+        // The two quadrants round 5 found had no input. Both are false rows the
+        // checker exists to reject, and a defective executor accepting either
+        // passed the complete gate: `None == None`, so equality alone cannot
+        // establish that an `unchanged` row names a file that was there, and
+        // every `created` case had a post file, so nothing required one.
+        (
+            "an `unchanged` row naming a file absent before and after",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc")],
+            vec!["ghost\tunchanged"],
+            false,
+        ),
+        (
+            "a `created` file that is missing after the cell",
+            vec![("seg", b"abc")],
+            vec![("seg", b"abc")],
+            vec!["x.lock\tcreated:0:E"],
+            false,
+        ),
         // The two verbs whose RELATION to the input was never asserted, both
         // directions each. Round 3 of review found the shared arm made both
         // decorative — a file that grew satisfied `truncated`, an unchanged
@@ -875,6 +894,6 @@ fn the_post_state_rule_fails_in_both_directions() {
         }
         std::fs::remove_dir_all(&cell).unwrap();
     }
-    assert_eq!(n, 20, "the post-state battery lost a case");
+    assert_eq!(n, 22, "the post-state battery lost a case");
     let _ = std::fs::remove_dir_all(&session);
 }
