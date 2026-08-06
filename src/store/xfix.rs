@@ -2843,9 +2843,14 @@ pub fn assert_refused(what: &str, f: impl FnOnce() + std::panic::UnwindSafe) {
 /// delegating to the default hook otherwise.
 pub fn red_of(f: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
     install_quiet_hook();
-    EXPECTING.with(|e| e.set(true));
+    // SAVE and restore, rather than set true / set false. A `red_of` inside a
+    // `red_of` would otherwise clear the outer call's quiet state on its way
+    // out, and the outer call's expected panic would print. Nothing nests today
+    // and this is what stops the first thing that does from being a puzzle —
+    // round 1's reviewer named it as the next thing they would attack.
+    let outer = EXPECTING.with(|e| e.replace(true));
     let outcome = std::panic::catch_unwind(f);
-    EXPECTING.with(|e| e.set(false));
+    EXPECTING.with(|e| e.set(outer));
     match outcome {
         Ok(()) => None,
         Err(e) => Some(
