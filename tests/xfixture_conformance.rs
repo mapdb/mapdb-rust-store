@@ -743,6 +743,15 @@ fn the_post_state_rule_fails_in_both_directions() {
             vec!["ghost\tdeleted"],
             false,
         ),
+        // Refused, and C5r moved WHERE. The rule used to decide presence with
+        // `symlink_metadata` itself; now `capture` does, one step earlier, and
+        // refuses a name that is present but is not a regular file. Both
+        // refuse this input for the same reason — `read(..).ok()` would call a
+        // directory "absent" and let a `deleted` row pass on something very
+        // much still there — and the campaign measured that deleting
+        // `capture`'s assertion leaves `read_named` refusing it too. So this
+        // case still measures the hazard its name claims; what it no longer
+        // isolates is which of the two statements catches it.
         (
             "a `deleted` file replaced by a directory of the same name",
             vec![("seg", b"abc")],
