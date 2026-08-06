@@ -84,19 +84,34 @@
 //!   deleting it leaves `read_named` failing on the same input with a worse
 //!   message, so what the assertion buys is the diagnosis, not the refusal.
 //!
-//! Six more sites are killed only by the WEAKER signal "it failed for another
+//! **Two** sites are killed only by the WEAKER signal "it failed for another
 //! reason" — the doctored case's own check noticing that a DIFFERENT rule
 //! fired. They are the "a wal3 cell with no post rows" guard, whose input also
-//! trips the file-set rule one step later, and `run_action`'s five refusals,
-//! whose inputs all let the action run and change the segment. The runner names
-//! the exact replacement red so those cases stay falsifiable.
+//! trips the file-set rule one step later, and the `bytes` range check, whose
+//! input then panics in the slice instead. The runner names the exact
+//! replacement red so both stay falsifiable, and
+//! `grep -c 'it failed for another reason'` on it is the count.
 //!
-//! **Round 1 of review found one survivor this section did not admit**, and it
-//! is the reason the section is worth its length: `run_action` asserts `op` and
-//! `serializer` separately, only `op` had a doctored input, and deleting the
-//! `serializer` assertion left the whole gate green. One case per METHOD is not
-//! one case per BRANCH. Every argument branch now has its own input and its own
-//! mutant.
+//! # Two rounds of review, and what each cost
+//!
+//! **Round 1** found a survivor this section did not admit: `run_action`
+//! asserts `op` and `serializer` separately, only `op` had a doctored input,
+//! and deleting the `serializer` assertion left the whole gate green. One case
+//! per METHOD is not one case per BRANCH.
+//!
+//! **Round 2 found the repair making the same mistake one level down.** The
+//! four cases it added were not all the branches: `payload_id` and
+//! `payload_len` each go through a `parse` the argument grammar can fail, and
+//! the five per-key `need` reads are separate call sites that one mutation of
+//! the shared closure does not cover — replacing three of them with the
+//! constants the positive case uses left the whole gate green. Eleven branches
+//! now, eleven inputs, and a mutant per SITE.
+//!
+//! It also caught this section claiming six weaker-signal cases while the
+//! runner held seven. The number was fixed by making the claim smaller rather
+//! than by correcting it: every `run_action` case now carries the matching
+//! `post` row, so a deleted refusal produces a PASSING cell and an isolating
+//! red instead of a red about the unnamed-input rule.
 
 #[path = "../src/store/xfix.rs"]
 mod xfix;
@@ -369,65 +384,122 @@ fn the_action_row_is_executed() {
         "input x.wal.0000000000000004 changed and no post row says so",
     );
 
-    // The verb and EVERY argument branch is refused when this engine cannot
-    // honour it — contract §2.3's "skipping it is forbidden". Each refusal
-    // comes from `run_action`, so a row it cannot execute stops the cell
-    // instead of authoring a post state for behaviour that did not run.
-    //
-    // **One case per BRANCH, not one case per method.** The round-1 review
-    // found the first version treating the `op=delete` case as covering
-    // `run_action`'s argument handling generally: `serializer` is a separate
-    // assertion, nothing supplied it an input, and deleting it left the whole
-    // gate green. Four independent branches, four inputs.
-    let action = |args: &str| -> xfix::SampleV2 {
-        let args = args.to_string();
+    the_action_rows_refusals_each_have_an_input();
+}
+
+/// Every refusal branch of `run_action`, one doctored input each.
+///
+/// **One case per BRANCH, not one case per method** — and round 2 of review
+/// showed the first attempt at that rule failing one level down. Round 1 found
+/// `serializer` had no input; the repair added four cases and claimed those were
+/// all the branches. They were not: `payload_id` and `payload_len` each go
+/// through a `parse` whose failure the grammar permits, and the four per-key
+/// `need` reads are separate call sites that one mutation of the shared closure
+/// does not cover. Replacing three of those reads with the constants the
+/// positive case uses left the whole gate green. Eleven branches, eleven inputs,
+/// and a mutant per SITE rather than per helper.
+///
+/// **Every case here carries the matching `post` row**, which is what makes its
+/// red ISOLATING. Without it, deleting a refusal lets the action run, the
+/// segment grows, and the two-sided unnamed-input rule fires — so the case goes
+/// red for a rule it is not about (lesson h) and the campaign can only pin the
+/// weaker "it failed for another reason". With the post row, a deleted refusal
+/// produces exactly the pinned post state, the cell PASSES, and the red is
+/// "the cell accepted &lt;this branch&gt;". That is the difference between a
+/// mutant that dies and a mutant that dies for the right reason.
+fn the_action_rows_refusals_each_have_an_input() {
+    // The post row is present in every case, so a deleted refusal produces a
+    // PASSING cell rather than a differently-red one.
+    let row = |verb: &str, args: &str| -> xfix::SampleV2 {
+        let (verb, args) = (verb.to_string(), args.to_string());
         doctored(move |t| {
             format!(
-                "{}action\twal3-java-cleaned\trust\trw\tcommit_one_record\t{args}\n",
-                drop_rows(t, "recid\twal3-java-cleaned\t")
+                "{}action\twal3-java-cleaned\trust\trw\t{verb}\t{args}\n{}",
+                drop_rows(t, "recid\twal3-java-cleaned\t"),
+                action_post_row()
             )
         })
     };
-    refuses_cell(
+    let refuses = |what: &str, verb: &str, args: &str, because: &str| {
+        refuses_cell(what, &row(verb, args), "wal3-java-cleaned", "rw", because);
+    };
+    const OK: &str = "op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw";
+
+    refuses(
         "an action verb this engine does not implement",
-        &doctored(|t| {
-            format!(
-                "{}action\twal3-java-cleaned\trust\trw\tcompact\t\
-                 op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw\n",
-                drop_rows(t, "recid\twal3-java-cleaned\t")
-            )
-        }),
-        "wal3-java-cleaned",
-        "rw",
+        "compact",
+        OK,
         "unknown action verb",
     );
-    refuses_cell(
+    refuses(
+        "an action row carrying an argument the verb does not take",
+        "commit_one_record",
+        "op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw,zzz=1",
+        "unknown argument zzz",
+    );
+
+    // The two VALUE branches: an op and a serializer this engine does not
+    // implement. Separate assertions, separate inputs — round 1's finding.
+    refuses(
         "an op this engine does not implement",
-        &action("op=delete,payload_id=161,payload_len=64,recid_label=Q,serializer=raw"),
-        "wal3-java-cleaned",
-        "rw",
+        "commit_one_record",
+        "op=delete,payload_id=161,payload_len=64,recid_label=Q,serializer=raw",
         "unimplemented op",
     );
-    refuses_cell(
+    refuses(
         "a serializer this engine does not implement",
-        &action("op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=cbor"),
-        "wal3-java-cleaned",
-        "rw",
+        "commit_one_record",
+        "op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=cbor",
         "unimplemented serializer",
     );
-    refuses_cell(
-        "an action row missing a required argument",
-        &action("op=put,payload_id=161,payload_len=64,recid_label=Q"),
-        "wal3-java-cleaned",
-        "rw",
-        "action argument serializer is required",
+
+    // The five REQUIRED-KEY reads. Each is its own `need` call site, so each
+    // owes its own input — round 2's finding, and the reason the shared
+    // closure's mutant is not proof for any of them.
+    for (key, rest) in [
+        (
+            "op",
+            "payload_id=161,payload_len=64,recid_label=Q,serializer=raw",
+        ),
+        (
+            "payload_id",
+            "op=put,payload_len=64,recid_label=Q,serializer=raw",
+        ),
+        (
+            "payload_len",
+            "op=put,payload_id=161,recid_label=Q,serializer=raw",
+        ),
+        (
+            "recid_label",
+            "op=put,payload_id=161,payload_len=64,serializer=raw",
+        ),
+        (
+            "serializer",
+            "op=put,payload_id=161,payload_len=64,recid_label=Q",
+        ),
+    ] {
+        refuses(
+            &format!("an action row missing the required argument {key}"),
+            "commit_one_record",
+            rest,
+            &format!("action argument {key} is required"),
+        );
+    }
+
+    // The two INTEGER parses. The argument grammar's character class admits
+    // letters, so these are reachable rather than parser-dead: `nat()` guards
+    // manifest integers, and an action argument's VALUE is not one.
+    refuses(
+        "an action row whose payload_id is not an integer",
+        "commit_one_record",
+        "op=put,payload_id=abc,payload_len=64,recid_label=Q,serializer=raw",
+        "payload_id: invalid digit",
     );
-    refuses_cell(
-        "an action row carrying an argument the verb does not take",
-        &action("op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw,zzz=1"),
-        "wal3-java-cleaned",
-        "rw",
-        "unknown argument zzz",
+    refuses(
+        "an action row whose payload_len is not an integer",
+        "commit_one_record",
+        "op=put,payload_id=161,payload_len=abc,recid_label=Q,serializer=raw",
+        "payload_len: invalid digit",
     );
 }
 
