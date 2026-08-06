@@ -1777,9 +1777,22 @@ pub const R: RawSer = RawSer;
 /// it is forbidden: an oracle silently not run is a green cell that checked
 /// nothing."*
 ///
+/// **Every argument means one INDEPENDENT branch, and each owes its own input.**
+/// The round-1 review found the cost of treating one doctored case as covering
+/// several: `op` and `serializer` are two separate value checks, only `op` had a
+/// doctored input, and deleting the `serializer` assertion left the entire gate
+/// green. Every branch below now has a production-path case in
+/// `the_action_row_is_executed` and a named mutant beside it.
+///
 /// Returns the one-line machine-readable description java's `Wal3Actions.run`
 /// returns, in the same shape, so a future cross-engine comparison of what an
 /// action DID has something to compare.
+///
+/// **`recid_label` is required, present-checked, and its VALUE is unobserved.**
+/// It reaches only that returned description, which every caller here discards,
+/// and no corpus cell varies it. Java is in the same position. Recorded rather
+/// than dressed up: a required argument nothing reads is a branch a future
+/// reviewer should not have to rediscover.
 pub fn run_action(s: &StoreWAL, verb: &str, arg_spec: &str) -> String {
     assert_eq!(verb, "commit_one_record", "unknown action verb: {verb}");
     let known = [
@@ -2535,28 +2548,40 @@ fn s2_matches(msg: &str) -> bool {
 /// by nothing.
 pub fn assert_family(where_: &str, family: &str, t: &DbError) {
     if family == "S2" {
-        // ONE statement, not a variant check and a message check.
+        // ONE statement for a claim with two halves: the refusal is a
+        // corruption verdict AND its payload is the S2 rule's message. The
+        // message is read from the PAYLOAD, not from the rendered error, because
+        // `Display for DbError` prefixes `"data corruption: "`.
         //
-        // The message is a property OF the corruption payload — `Display for
-        // DbError` prefixes `"data corruption: "` — so this reads the payload
-        // rather than the rendered error. And in this engine EVERY other
-        // variant's `Display` carries a prefix of its own (`"verify failed: "`,
-        // `"unsupported operation: "`, `"store full"`), so no non-corruption
-        // error can render the S2 rule's message whole. A separate variant
-        // assertion would therefore be a check no input can reach: the message
-        // predicate refuses the same input first. That is one check masking
-        // another on the same input — lesson (h), and precisely the defect
-        // C5j's round 3 found in java's form of this predicate, where the
-        // negative input omitted the `WAL segment <name>: ` prefix and the
-        // message half rejected it before the class half could. The claim here
-        // is a conjunction and it is written as one statement with one red.
+        // **Why one statement.** Written as two, the variant assertion could be
+        // DELETED with the suite green: every currently constructible
+        // non-corruption `DbError` renders with a prefix of its own
+        // (`"verify failed: "`, `"unsupported operation: "`, `"store full"`), so
+        // the message half refuses the same input the variant half was there to
+        // catch. That is one check masked by another — lesson (h), the same
+        // shape C5j's round 3 found in java's form of this predicate from the
+        // opposite direction.
+        //
+        // **The round-1 review corrected me on the mechanism, and the
+        // correction matters.** I first wrote that the old variant check "could
+        // not be reached". It was reached, and it fired: the old code
+        // destructured `DataCorruption` FIRST and panicked on anything else, so
+        // the `VerifyFailed` probe died there. What was true is narrower — its
+        // DELETION was invisible, because the next predicate refused the same
+        // input. Reachable-and-masked, not unreachable. C5z should look for the
+        // masking, not for an unreached branch.
+        //
+        // The conjunction is expressed structurally rather than by leaning on
+        // those `Display` prefixes: a future `DbError` variant that rendered
+        // bare would otherwise silently satisfy this predicate.
         let payload = match t {
-            DbError::DataCorruption(c) => c.to_string(),
-            other => other.to_string(),
+            DbError::DataCorruption(c) => Some(c.to_string()),
+            _ => None,
         };
         assert!(
-            s2_matches(&payload),
-            "{where_}: not the S2 rule's refusal: {t}"
+            payload.as_deref().is_some_and(s2_matches),
+            "{where_}: not the S2 rule's refusal — it must be a corruption verdict whose payload \
+             is the S2 message, and this is: {t}"
         );
         return;
     }

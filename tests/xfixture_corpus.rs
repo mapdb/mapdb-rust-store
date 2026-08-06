@@ -84,12 +84,19 @@
 //!   deleting it leaves `read_named` failing on the same input with a worse
 //!   message, so what the assertion buys is the diagnosis, not the refusal.
 //!
-//! Three more sites are killed only by the WEAKER signal "it failed for another
+//! Six more sites are killed only by the WEAKER signal "it failed for another
 //! reason" — the doctored case's own check noticing that a DIFFERENT rule
 //! fired. They are the "a wal3 cell with no post rows" guard, whose input also
-//! trips the file-set rule one step later, and `run_action`'s two refusals,
-//! whose inputs also change the segment. The runner names the exact replacement
-//! red so those cases stay falsifiable.
+//! trips the file-set rule one step later, and `run_action`'s five refusals,
+//! whose inputs all let the action run and change the segment. The runner names
+//! the exact replacement red so those cases stay falsifiable.
+//!
+//! **Round 1 of review found one survivor this section did not admit**, and it
+//! is the reason the section is worth its length: `run_action` asserts `op` and
+//! `serializer` separately, only `op` had a doctored input, and deleting the
+//! `serializer` assertion left the whole gate green. One case per METHOD is not
+//! one case per BRANCH. Every argument branch now has its own input and its own
+//! mutant.
 
 #[path = "../src/store/xfix.rs"]
 mod xfix;
@@ -362,10 +369,25 @@ fn the_action_row_is_executed() {
         "input x.wal.0000000000000004 changed and no post row says so",
     );
 
-    // The verb and its arguments are refused when this engine cannot honour
-    // them — contract §2.3's "skipping it is forbidden". Both refusals come
-    // from `run_action`, so a row it cannot execute stops the cell instead of
-    // authoring a post state for behaviour that did not run.
+    // The verb and EVERY argument branch is refused when this engine cannot
+    // honour it — contract §2.3's "skipping it is forbidden". Each refusal
+    // comes from `run_action`, so a row it cannot execute stops the cell
+    // instead of authoring a post state for behaviour that did not run.
+    //
+    // **One case per BRANCH, not one case per method.** The round-1 review
+    // found the first version treating the `op=delete` case as covering
+    // `run_action`'s argument handling generally: `serializer` is a separate
+    // assertion, nothing supplied it an input, and deleting it left the whole
+    // gate green. Four independent branches, four inputs.
+    let action = |args: &str| -> xfix::SampleV2 {
+        let args = args.to_string();
+        doctored(move |t| {
+            format!(
+                "{}action\twal3-java-cleaned\trust\trw\tcommit_one_record\t{args}\n",
+                drop_rows(t, "recid\twal3-java-cleaned\t")
+            )
+        })
+    };
     refuses_cell(
         "an action verb this engine does not implement",
         &doctored(|t| {
@@ -380,17 +402,32 @@ fn the_action_row_is_executed() {
         "unknown action verb",
     );
     refuses_cell(
-        "an action argument this engine does not implement",
-        &doctored(|t| {
-            format!(
-                "{}action\twal3-java-cleaned\trust\trw\tcommit_one_record\t\
-                 op=delete,payload_id=161,payload_len=64,recid_label=Q,serializer=raw\n",
-                drop_rows(t, "recid\twal3-java-cleaned\t")
-            )
-        }),
+        "an op this engine does not implement",
+        &action("op=delete,payload_id=161,payload_len=64,recid_label=Q,serializer=raw"),
         "wal3-java-cleaned",
         "rw",
         "unimplemented op",
+    );
+    refuses_cell(
+        "a serializer this engine does not implement",
+        &action("op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=cbor"),
+        "wal3-java-cleaned",
+        "rw",
+        "unimplemented serializer",
+    );
+    refuses_cell(
+        "an action row missing a required argument",
+        &action("op=put,payload_id=161,payload_len=64,recid_label=Q"),
+        "wal3-java-cleaned",
+        "rw",
+        "action argument serializer is required",
+    );
+    refuses_cell(
+        "an action row carrying an argument the verb does not take",
+        &action("op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw,zzz=1"),
+        "wal3-java-cleaned",
+        "rw",
+        "unknown argument zzz",
     );
 }
 
