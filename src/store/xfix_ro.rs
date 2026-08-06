@@ -17,7 +17,8 @@
 
 use super::wal::{StoreWAL, WalOptions};
 use super::xfix;
-use std::path::Path;
+use super::Store;
+use std::path::{Path, PathBuf};
 
 /// Opens read-only through the crate-internal seam. `read_only: true` is the
 /// whole point of the module; everything else is the default configuration, so
@@ -38,6 +39,194 @@ fn sample_v2_ro_cells_pass() {
     let session = xfix::session_dir("xfix_v2_ro");
     xfix::run_v2_cells(&sample, "ro", &session, &open_ro);
     let _ = std::fs::remove_dir_all(&session);
+}
+
+// ---------------------------------------------------------------------------
+// the preflight corpus, `ro` half — slice C5r
+// ---------------------------------------------------------------------------
+
+/// Every `applies` row addressed to rust in `ro`, run, and exactly those.
+///
+/// The `rw` half is `tests/xfixture_corpus.rs`, which also carries the doctored
+/// cases: they exercise rules that are not mode-specific, and running each of
+/// them twice would double the suite to grade the same statement. What must run
+/// HERE is everything the read-only opener is the only way to reach — this
+/// cell set, the write probe, and the probe's own firing.
+#[test]
+fn corpus_ro_cells_conform() {
+    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
+    let session = xfix::session_dir("xfix_corpus_ro");
+    xfix::run_v2_corpus_cells(&sample, "ro", &session, &open_ro);
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// The read-only refusal is not vacuous: the same write, on the same fixture,
+/// through the two handles, with opposite outcomes.
+///
+/// C3z's review found the general shape this closes — `mode` was parsed,
+/// vocabulary-checked and used to pick an opener, and then nothing observed the
+/// difference, so every `ro` cell in java and rust was a writable open wearing
+/// a label. Asserting only the refusal would leave the same hole one step
+/// along: a `put` that failed for an unrelated reason in BOTH modes would
+/// satisfy it. So the `rw` half runs here too, and it is the same call.
+///
+/// This runs outside the cell executor deliberately — the `rw` write mutates
+/// the directory, and doing it inside a cell would author a post state no
+/// manifest row describes.
+#[test]
+fn the_read_only_write_refusal_discriminates() {
+    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
+    let session = xfix::session_dir("xfix_corpus_ro_disc");
+    let fid = "wal3-java-cleaned";
+
+    let rw_dir = stage(&sample, fid, &session, "rw");
+    let recid = {
+        let s = StoreWAL::open(&rw_dir.join("x")).expect("the rw handle must open");
+        let r = s.put(&vec![1u8, 2, 3], &xfix::R);
+        s.close().unwrap();
+        r
+    };
+    assert!(
+        recid.is_ok(),
+        "the writable handle refused the write ({recid:?}), so the read-only half below proves \
+         nothing about the mode"
+    );
+
+    let ro_dir = stage(&sample, fid, &session, "ro");
+    let refusal = {
+        let s = open_ro(&ro_dir.join("x")).expect("the ro handle must open");
+        let r = s.put(&vec![1u8, 2, 3], &xfix::R);
+        s.close().unwrap();
+        r
+    };
+    let err = refusal.expect_err("the read-only handle ACCEPTED the write");
+    assert!(
+        err.to_string().contains("read-only"),
+        "the refusal does not name the mode: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// The read-only probe's assertion FIRES — which no corpus input can show.
+///
+/// A conforming engine refuses the write, so the red side is unreachable from
+/// the corpus and the assertion could be deleted with the whole gate green
+/// while `Cells::ro_probed` still attested the probe "ran". So the method is
+/// handed the two inputs the corpus cannot produce: a WRITABLE handle, and a
+/// handle that refuses for the wrong reason.
+///
+/// **The reds are COLLECTED and compared as an ordered list, not asserted one
+/// at a time.** A statement that no other statement depends on is invisible to
+/// deletion, however many assertions it contains; comparing the collected
+/// outcomes makes each INPUT observable too — drop either call and the list is
+/// short. The order is what binds `ACCEPTED` to the writable handle and
+/// `WRONG-REASON` to the closed one, which a set would lose.
+#[test]
+fn the_read_only_write_probe_fires() {
+    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
+    let session = xfix::session_dir("xfix_corpus_ro_fire");
+    let fid = "wal3-java-cleaned";
+    let e = sample
+        .manifest
+        .expects
+        .iter()
+        .find(|e| e.fixture == fid && e.engine == xfix::ENGINE && e.mode == "ro")
+        .expect("the corpus has no rust ro cell for wal3-java-cleaned")
+        .clone();
+
+    let mut cells = xfix::Cells::new(&sample);
+    let mut reds = Vec::new();
+
+    let writable = StoreWAL::open(&stage(&sample, fid, &session, "w").join("x")).unwrap();
+    reds.push(classify(&mut cells, &e, &writable));
+    writable.close().unwrap();
+
+    // A handle that refuses for a DIFFERENT reason: closed, and not read-only,
+    // so the refusal is `StoreClosed` and its message cannot name the mode.
+    let closed = StoreWAL::open(&stage(&sample, fid, &session, "c").join("x")).unwrap();
+    closed.close().unwrap();
+    reds.push(classify(&mut cells, &e, &closed));
+
+    assert_eq!(
+        reds,
+        vec!["ACCEPTED".to_string(), "WRONG-REASON".to_string()],
+        "the probe's two inputs and the red each must produce"
+    );
+    assert!(
+        cells.ro_probed.is_empty(),
+        "the probe recorded a cell it had just refused — the recording must stay downstream of \
+         the assertion"
+    );
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// Classifies the red one probe input produced, so the two can be compared as
+/// an ordered list.
+///
+/// Classification is by substring, so an unrelated panic carrying either phrase
+/// would be labelled as the wanted red. Sound for the two inputs here — the
+/// closure calls only `assert_write_refused`, and the store's own failures are
+/// `DbError`s it catches — and stated rather than left implied, because it is a
+/// claim about the message and not about where it came from.
+fn classify(cells: &mut xfix::Cells<'_>, e: &xfix::V2Expect, s: &StoreWAL) -> String {
+    let mut probe = std::panic::AssertUnwindSafe((cells, e, s));
+    match xfix::red_of(move || {
+        let (cells, e, s) = &mut *probe;
+        cells.assert_write_refused("probe", e, s);
+    }) {
+        None => "NO-RED".to_string(),
+        Some(msg) if msg.contains("the write was ACCEPTED") => "ACCEPTED".to_string(),
+        Some(msg) if msg.contains("refused with:") => "WRONG-REASON".to_string(),
+        Some(msg) => format!("OTHER: {msg}"),
+    }
+}
+
+/// The `ro` half of `require_some_oracle`'s disjunction.
+///
+/// `tests/xfixture_corpus.rs` proves the `rw` direction: strip
+/// `wal3-java-cleaned`'s recid rows and the writable accept cell is refused,
+/// because it now asserts nothing. The SAME stripped fixture must PASS in `ro`,
+/// where the read-only write refusal is the claim. Without the pair, "an accept
+/// cell must assert something" and "ro is exempt from everything" would be
+/// indistinguishable.
+#[test]
+fn a_bare_accept_cell_passes_in_ro_where_the_write_probe_is_the_claim() {
+    let root = xfix::v2_corpus_root();
+    let text = xfix::read_root_text(&root, "MANIFEST.tsv");
+    let stripped: Vec<&str> = text
+        .split('\n')
+        .filter(|l| !l.starts_with("recid\twal3-java-cleaned\t"))
+        .collect();
+    let stripped = stripped.join("\n");
+    assert_ne!(
+        stripped, text,
+        "the corpus has no wal3-java-cleaned recid rows"
+    );
+    let sample = xfix::load_sample_v2_text(&root, &stripped);
+
+    let e = sample
+        .manifest
+        .expects
+        .iter()
+        .find(|e| e.fixture == "wal3-java-cleaned" && e.engine == xfix::ENGINE && e.mode == "ro")
+        .expect("no rust ro cell")
+        .clone();
+    let session = xfix::session_dir("xfix_corpus_ro_bare");
+    let cell = session.join("cell");
+    std::fs::create_dir_all(&cell).unwrap();
+    xfix::Cells::new(&sample).run_cell(&e, &cell, &open_ro, xfix::Dispatch::ByManifest);
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// Copies one fixture's inputs into a fresh directory under `session`.
+fn stage(sample: &xfix::SampleV2, fid: &str, session: &Path, tag: &str) -> PathBuf {
+    let dir = session.join(tag);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in sample.manifest.files_of(fid) {
+        std::fs::write(dir.join(&f.rel), sample.bytes_of(f)).unwrap();
+    }
+    dir
 }
 
 /// The transcription check that can only live in-crate.

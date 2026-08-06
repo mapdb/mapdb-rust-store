@@ -39,7 +39,7 @@ use flate2::read::GzDecoder;
 use mapdb_rust_store::error::{DbError, Result};
 use mapdb_rust_store::io::{DataInput2, DataOutput2};
 use mapdb_rust_store::ser::Serializer;
-use mapdb_rust_store::store::{Recid, Store, StoreWAL};
+use mapdb_rust_store::store::{Recid, Store, StoreDirect, StoreWAL};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -716,18 +716,92 @@ pub struct V2Post {
     pub sha: Option<String>,
 }
 
+/// `applies <fid> <engine> <mode>` — a cell this corpus actually contains
+/// (contract §2.3, slice C5).
+///
+/// The corpus's cell set is legitimately partial, so "every fixture × every
+/// mode" is the wrong cardinality rule for it; `applies` says which cells
+/// exist, and the executor's rule becomes "the cells I ran are exactly the
+/// `applies` rows addressed to me".
+#[derive(Clone, Debug)]
+pub struct V2Applies {
+    pub fixture: String,
+    pub engine: String,
+    pub mode: String,
+}
+
+/// `action <fid> <engine> <mode> <verb> <args>` — a post-open executor step.
+#[derive(Clone, Debug)]
+pub struct V2Action {
+    pub fixture: String,
+    pub engine: String,
+    pub mode: String,
+    pub verb: String,
+    /// The rendered `k=v,…` spec, kept as the STRING the row carried: it is
+    /// compared against `catalogue.render_action_args`'s single rendering in
+    /// todo's gate, so re-rendering it here would author a second authority.
+    pub arg_spec: String,
+}
+
+/// `bytes <fid> <engine> <mode> <relName> <offset> <hex>` — an assertion
+/// against the CAPTURED POST bytes, never a pre-open patch (contract §2.3).
+#[derive(Clone, Debug)]
+pub struct V2Bytes {
+    pub fixture: String,
+    pub engine: String,
+    pub mode: String,
+    pub rel: String,
+    pub offset: u64,
+    pub hex: String,
+}
+
+/// `reopen <fid> <engine> <mode> <family>` — after the cell's actions have run
+/// and the store has been closed, a SECOND open must fail with this family.
+#[derive(Clone, Debug)]
+pub struct V2Reopen {
+    pub fixture: String,
+    pub engine: String,
+    pub mode: String,
+    pub family: String,
+}
+
 #[derive(Default, Debug)]
 pub struct V2 {
     pub fixture_kinds: BTreeMap<String, String>,
     pub files: Vec<V2File>,
+    pub applies: Vec<V2Applies>,
     pub expects: Vec<V2Expect>,
     pub posts: Vec<V2Post>,
+    pub actions: Vec<V2Action>,
+    pub bytes: Vec<V2Bytes>,
+    pub reopens: Vec<V2Reopen>,
     pub recids: Vec<RecidRow>,
 }
 
 impl V2 {
     pub fn files_of(&self, fixture: &str) -> Vec<&V2File> {
         self.files.iter().filter(|f| f.fixture == fixture).collect()
+    }
+
+    pub fn actions_of(&self, fixture: &str, engine: &str, mode: &str) -> Vec<&V2Action> {
+        self.actions
+            .iter()
+            .filter(|a| a.fixture == fixture && a.engine == engine && a.mode == mode)
+            .collect()
+    }
+
+    pub fn bytes_of(&self, fixture: &str, engine: &str, mode: &str) -> Vec<&V2Bytes> {
+        self.bytes
+            .iter()
+            .filter(|b| b.fixture == fixture && b.engine == engine && b.mode == mode)
+            .collect()
+    }
+
+    pub fn reopens_of(&self, fixture: &str, engine: &str, mode: &str) -> Vec<&V2Reopen> {
+        self.reopens
+            .iter()
+            .filter(|r| r.fixture == fixture && r.engine == engine && r.mode == mode)
+            .collect()
     }
 
     pub fn recids_of(&self, fixture: &str) -> Vec<&RecidRow> {
@@ -982,6 +1056,24 @@ fn parse_v2(lines: &[&str]) -> V2 {
                 }
                 m.files.push(f);
             }
+            "applies" => {
+                arity(&t, 4, line);
+                let ap = V2Applies {
+                    fixture: t[1].to_string(),
+                    engine: one_of(t[2], &ENGINES, "engine", line),
+                    mode: one_of(t[3], &MODES, "mode", line),
+                };
+                for prior in &m.applies {
+                    check(
+                        !cell_eq(
+                            (&prior.fixture, &prior.engine, &prior.mode),
+                            (&ap.fixture, &ap.engine, &ap.mode),
+                        ),
+                        || format!("duplicate applies row: {line}"),
+                    );
+                }
+                m.applies.push(ap);
+            }
             "expect" => {
                 arity(&t, 7, line);
                 let e = V2Expect {
@@ -1058,16 +1150,82 @@ fn parse_v2(lines: &[&str]) -> V2 {
             "edit" => {
                 arity(&t, 6, line);
             }
+            "action" => {
+                arity(&t, 6, line);
+                let a = V2Action {
+                    fixture: t[1].to_string(),
+                    engine: one_of(t[2], &ENGINES, "engine", line),
+                    mode: one_of(t[3], &MODES, "mode", line),
+                    // The VERB is not vocabulary-checked here, for the reason
+                    // the `reopen` family is not: `catalogue.ACTION_VERBS` is
+                    // the authority, this engine implements a subset, and a
+                    // parser list would accept a verb the executor then cannot
+                    // run while going stale on its own. `run_action` refuses an
+                    // unimplemented verb, which is both stricter and the
+                    // refusal that matters.
+                    verb: t[4].to_string(),
+                    arg_spec: action_args(t[5], line),
+                };
+                // One row per cell per VERB, not per cell: `catalogue.actions`
+                // holds a list, so a second verb on one cell is a legal future
+                // shape and refusing it would refuse the corpus, not a defect.
+                for prior in &m.actions {
+                    check(
+                        !(cell_eq(
+                            (&prior.fixture, &prior.engine, &prior.mode),
+                            (&a.fixture, &a.engine, &a.mode),
+                        ) && prior.verb == a.verb),
+                        || format!("duplicate action row: {line}"),
+                    );
+                }
+                m.actions.push(a);
+            }
+            "reopen" => {
+                arity(&t, 5, line);
+                let r = V2Reopen {
+                    fixture: t[1].to_string(),
+                    engine: one_of(t[2], &ENGINES, "engine", line),
+                    mode: one_of(t[3], &MODES, "mode", line),
+                    // Not vocabulary-checked: `catalogue.FAMILIES` has eighteen
+                    // members and this engine has a predicate for a handful, so
+                    // a list here would accept a family `assert_family` then
+                    // refuses — two lists, one of which goes stale.
+                    family: t[4].to_string(),
+                };
+                for prior in &m.reopens {
+                    check(
+                        !cell_eq(
+                            (&prior.fixture, &prior.engine, &prior.mode),
+                            (&r.fixture, &r.engine, &r.mode),
+                        ),
+                        || format!("duplicate reopen row: {line}"),
+                    );
+                }
+                m.reopens.push(r);
+            }
             "bytes" => {
                 arity(&t, 7, line);
-                one_of(t[2], &ENGINES, "engine", line);
-                one_of(t[3], &MODES, "mode", line);
-                rel_name(t[4], line);
-                nat(t[5], line);
-                panic!(
-                    "a v2 `bytes` row, which this reader does not execute yet (C4 introduces \
-                     the derived fixtures it describes): {line}"
-                );
+                let b = V2Bytes {
+                    fixture: t[1].to_string(),
+                    engine: one_of(t[2], &ENGINES, "engine", line),
+                    mode: one_of(t[3], &MODES, "mode", line),
+                    rel: rel_name(t[4], line),
+                    offset: nat(t[5], line),
+                    hex: hex_blob(t[6], line),
+                };
+                // Keyed by cell AND (file, offset): a cell may assert several
+                // ranges, and two rows for the same range are a contradiction.
+                for prior in &m.bytes {
+                    check(
+                        !(cell_eq(
+                            (&prior.fixture, &prior.engine, &prior.mode),
+                            (&b.fixture, &b.engine, &b.mode),
+                        ) && prior.rel == b.rel
+                            && prior.offset == b.offset),
+                        || format!("duplicate bytes row: {line}"),
+                    );
+                }
+                m.bytes.push(b);
             }
             other => panic!("unknown v2 manifest row type {other:?}: {line}"),
         }
@@ -1110,10 +1268,79 @@ fn referential_integrity(declared: &BTreeMap<String, String>, referenced: &BTree
 fn referenced_v2(m: &V2) -> BTreeSet<String> {
     let mut r = BTreeSet::new();
     r.extend(m.files.iter().map(|x| x.fixture.clone()));
+    r.extend(m.applies.iter().map(|x| x.fixture.clone()));
     r.extend(m.expects.iter().map(|x| x.fixture.clone()));
     r.extend(m.posts.iter().map(|x| x.fixture.clone()));
+    r.extend(m.actions.iter().map(|x| x.fixture.clone()));
+    r.extend(m.bytes.iter().map(|x| x.fixture.clone()));
+    r.extend(m.reopens.iter().map(|x| x.fixture.clone()));
     r.extend(m.recids.iter().map(|x| x.fixture.clone()));
     r
+}
+
+/// The five cell-keyed v2 row types share one identity — `(fixture, engine,
+/// mode)` — and it is written once so five copies cannot drift.
+fn cell_eq(a: (&str, &str, &str), b: (&str, &str, &str)) -> bool {
+    a == b
+}
+
+/// `catalogue.ARG_VALUE_CHARS`, transcribed. TAB, `,` and `=` are absent by
+/// construction: they are the three separators the row is re-split on.
+const ARG_VALUE_CHARS: &str =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._@:/+-";
+
+/// An `action` row's argument spec, matching `catalogue.render_action_args`:
+/// `k=v` pairs joined by `,`, **keys in sorted order**, each key
+/// `[a-z][a-z0-9_]*`, each value nonempty and drawn from [`ARG_VALUE_CHARS`].
+///
+/// The sort order is CHECKED rather than normalised. The spec travels to
+/// `run_action` as a string and is compared, in todo's gate, against one
+/// rendering authority; a reader that accepted any order would accept a
+/// manifest python refuses, and the two roots would then disagree about what
+/// the same cell says.
+fn action_args(s: &str, line: &str) -> String {
+    let mut prev: Option<&str> = None;
+    for pair in s.split(',') {
+        let eq = pair.find('=');
+        check(
+            eq.is_some_and(|i| i > 0) && pair.matches('=').count() == 1,
+            || format!("action argument {pair:?} is not one k=v pair in: {line}"),
+        );
+        let (k, v) = pair.split_at(eq.unwrap());
+        let v = &v[1..];
+        check(
+            k.starts_with(|c: char| c.is_ascii_lowercase())
+                && k.bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'),
+            || format!("action argument key {k:?} is not [a-z][a-z0-9_]* in: {line}"),
+        );
+        check(prev.is_none_or(|p| p < k), || {
+            format!("action argument keys must be sorted and distinct: {k:?} follows {prev:?} in: {line}")
+        });
+        prev = Some(k);
+        check(
+            !v.is_empty() && v.chars().all(|c| ARG_VALUE_CHARS.contains(c)),
+            || {
+                format!(
+                    "action argument {k}={v}: the value must be nonempty and drawn from the \
+                     pinned character class in: {line}"
+                )
+            },
+        );
+    }
+    s.to_string()
+}
+
+/// A `bytes` row's asserted value: a nonempty, even-length run of lowercase hex.
+fn hex_blob(s: &str, line: &str) -> String {
+    check(
+        !s.is_empty()
+            && s.len().is_multiple_of(2)
+            && s.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        || format!("not a nonempty even-length lowercase hex blob: {s:?} in: {line}"),
+    );
+    s.to_string()
 }
 
 /// `unchanged` | `deleted` | `truncated:<len>:<sha>` | `created:<len>:<sha>` |
@@ -1177,6 +1404,13 @@ pub fn v2_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/xfixtures-v2")
 }
 
+/// The schema-v2 **preflight corpus** root — a byte-identical copy of the
+/// `root`-marked files of `todo/store-cross/preflight-v2/`, pinned by
+/// `freeze_v2.PREFLIGHT_DIST_SEALS["rust"]` (slice C5r).
+pub fn v2_corpus_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/xfixtures-v2-corpus")
+}
+
 pub fn v1_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/xfixtures")
 }
@@ -1199,7 +1433,18 @@ pub fn read_root_text(root: &Path, name: &str) -> String {
 /// BEFORE anything decodes or opens it. A dump taken from bytes that were
 /// never checked against their pins describes whatever happened to be on disk.
 pub fn load_sample_v2(root: &Path) -> SampleV2 {
-    let loaded = parse(&read_root_text(root, "MANIFEST.tsv"));
+    load_sample_v2_text(root, &read_root_text(root, "MANIFEST.tsv"))
+}
+
+/// [`load_sample_v2`] over manifest text supplied by the caller, so a DOCTORED
+/// manifest runs against the root's real bytes through the production path.
+///
+/// Doctoring the text rather than the parsed structure is deliberate: every
+/// case then exercises the shipped parser, and a case that meant to add a row
+/// the grammar refuses fails loudly instead of constructing something the
+/// reader would never have accepted.
+pub fn load_sample_v2_text(root: &Path, text: &str) -> SampleV2 {
+    let loaded = parse(text);
     let manifest = match loaded {
         Loaded::V2(m) => m,
         Loaded::V1(_) => panic!("{} is schema v1, not v2", root.display()),
@@ -1514,6 +1759,83 @@ impl Serializer<Vec<u8>> for RawSer {
 
 pub const R: RawSer = RawSer;
 
+// ---------------------------------------------------------------------------
+// the `action` verbs
+// ---------------------------------------------------------------------------
+
+/// Runs one catalogue `action` against an OPEN store — this engine's side of
+/// contract §2.3's post-open oracle step.
+///
+/// **Every argument the catalogue pins is required and is checked.** An unknown
+/// verb, a missing argument, an unrecognised argument, or an argument whose
+/// value this engine does not implement is a hard failure. Not defensiveness:
+/// the caller passes the catalogue's arguments through verbatim, so a catalogue
+/// edit this function cannot honour must STOP the run rather than silently
+/// execute the old behaviour and author a post state for it. Contract §2.3 says
+/// so in one line — *"an executor MUST refuse an action row whose verb it does
+/// not implement, and MUST refuse an argument it does not implement. Skipping
+/// it is forbidden: an oracle silently not run is a green cell that checked
+/// nothing."*
+///
+/// Returns the one-line machine-readable description java's `Wal3Actions.run`
+/// returns, in the same shape, so a future cross-engine comparison of what an
+/// action DID has something to compare.
+pub fn run_action(s: &StoreWAL, verb: &str, arg_spec: &str) -> String {
+    assert_eq!(verb, "commit_one_record", "unknown action verb: {verb}");
+    let known = [
+        "op",
+        "payload_id",
+        "payload_len",
+        "recid_label",
+        "serializer",
+    ];
+    let mut args: BTreeMap<&str, &str> = BTreeMap::new();
+    for pair in arg_spec.split(',') {
+        let (k, v) = pair
+            .split_once('=')
+            .unwrap_or_else(|| panic!("action argument is not k=v: {pair}"));
+        assert!(args.insert(k, v).is_none(), "action argument repeated: {k}");
+    }
+    for k in args.keys() {
+        assert!(
+            known.contains(k),
+            "unknown argument {k} for {verb}; it takes {known:?}"
+        );
+    }
+    let need = |k: &str| -> &str {
+        args.get(k).copied().unwrap_or_else(|| {
+            panic!(
+                "action argument {k} is required; got {:?}, the verb takes {known:?}",
+                args.keys().collect::<Vec<_>>()
+            )
+        })
+    };
+    let op = need("op");
+    let label = need("recid_label");
+    let payload_id: u64 = need("payload_id")
+        .parse()
+        .unwrap_or_else(|e| panic!("payload_id: {e}"));
+    let payload_len: usize = need("payload_len")
+        .parse()
+        .unwrap_or_else(|e| panic!("payload_len: {e}"));
+    let ser = need("serializer");
+    assert_eq!(op, "put", "commit_one_record: unimplemented op {op}");
+    assert_eq!(
+        ser, "raw",
+        "commit_one_record: unimplemented serializer {ser}"
+    );
+
+    let recid = s
+        .put(&payload(payload_id, payload_len), &R)
+        .unwrap_or_else(|e| panic!("commit_one_record: put failed: {e}"));
+    s.commit()
+        .unwrap_or_else(|e| panic!("commit_one_record: commit failed: {e}"));
+    format!(
+        "RESULT action={verb} label={label} recid={recid} payloadId={payload_id} \
+         payloadLen={payload_len}"
+    )
+}
+
 fn nz(recid: u64) -> Recid {
     NonZeroU64::new(recid).expect("manifest recid must be nonzero")
 }
@@ -1577,7 +1899,78 @@ fn read_named(path: &Path, rel: &str, ctx: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("[{ctx}] cannot read {rel}: {e}"))
 }
 
-/// The two-sided D6 post-state rule.
+/// The oracle rows one cell owes, and which of them a handler actually ran.
+///
+/// Separately unit-tested, because it is the ONE mechanism standing between
+/// "executes" and "parses and drops" for three of the four addressed oracle row
+/// types — every one except `action`, which has a failure of its own. The
+/// whole-file `post` hash subsumes a byte-at-offset assertion, the two-sided
+/// unnamed-input rule silently re-verifies a file whose **`unchanged`** row was
+/// dropped, and *nothing at all* observes a dropped `reopen`.
+///
+/// A row is identified by a key AND by its ADDRESS: consuming the right key
+/// with a different row is how a handler that grades the wrong object still
+/// reports its debt paid.
+pub struct Consumption {
+    ctx: String,
+    owed: Vec<(String, usize)>,
+    done: BTreeSet<String>,
+}
+
+impl Consumption {
+    pub fn new(ctx: &str) -> Consumption {
+        Consumption {
+            ctx: ctx.to_string(),
+            owed: Vec::new(),
+            done: BTreeSet::new(),
+        }
+    }
+
+    pub fn owe<T>(&mut self, key: &str, row: &T) {
+        assert!(
+            !self.owed.iter().any(|(k, _)| k == key),
+            "[{}] two oracle rows share the key {key}",
+            self.ctx
+        );
+        self.owed.push((key.to_string(), row as *const T as usize));
+    }
+
+    pub fn consume<T>(&mut self, key: &str, row: &T) {
+        let at = self
+            .owed
+            .iter()
+            .find(|(k, _)| k == key)
+            .unwrap_or_else(|| panic!("[{}] consumed {key}, which was never owed", self.ctx))
+            .1;
+        assert_eq!(
+            at, row as *const T as usize,
+            "[{}] consumed {key} with a different row",
+            self.ctx
+        );
+        assert!(
+            self.done.insert(key.to_string()),
+            "[{}] consumed {key} twice",
+            self.ctx
+        );
+    }
+
+    pub fn require_all_consumed(&self) {
+        let dropped: Vec<&str> = self
+            .owed
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| !self.done.contains(*k))
+            .collect();
+        assert!(
+            dropped.is_empty(),
+            "[{}] no handler consumed: {dropped:?}. A parsed-and-dropped assertion is a green \
+             cell that checked nothing",
+            self.ctx
+        );
+    }
+}
+
+/// The two-sided D6 post-state rule, graded against a CAPTURE.
 ///
 /// One side is the obvious one: every file a `post` row names must be in the
 /// state that row declares. The other side is the amendment that makes the
@@ -1586,110 +1979,614 @@ fn read_named(path: &Path, rel: &str, ctx: &str) -> Vec<u8> {
 /// neither an input nor named must not exist at all. Without the second side a
 /// cell that deleted a segment and wrote three new ones would pass by saying
 /// nothing about them.
+///
+/// It reads the CAPTURE rather than the directory because the cell's `reopen`
+/// step is an open: it happens not to rewrite a segment today, and "happens
+/// not to" is not a property to hash a corpus against.
+///
+/// **Presence is decided by the capture's key set, and the capture is built by
+/// `symlink_metadata`,** not by `read(..).ok()` — `.ok()` turns a permission
+/// error, or the target having been replaced by a DIRECTORY, into "absent", so
+/// a `deleted` row would pass on a file that is very much still there in
+/// another shape. The C3r review named that one.
 pub fn assert_post_state(
-    cell: &Path,
-    before: &BTreeMap<String, Vec<u8>>,
     posts: &[&V2Post],
+    before: &BTreeMap<String, Vec<u8>>,
+    after: &BTreeMap<String, Vec<u8>>,
     ctx: &str,
+    owed: &mut Consumption,
 ) {
-    let named: BTreeSet<&str> = posts.iter().map(|p| p.rel.as_str()).collect();
+    let mut named: BTreeSet<&str> = BTreeSet::new();
     for p in posts {
-        let path = cell.join(&p.rel);
-        // Presence is decided by `symlink_metadata`, NOT by `read(..).ok()`.
-        // `.ok()` turns a permission error, or the target having been replaced
-        // by a DIRECTORY, into "absent" — so a `deleted` row would pass on a
-        // file that is very much still there in another shape. The C3r review
-        // named that one.
-        let present = match std::fs::symlink_metadata(&path) {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => panic!("[{ctx}] cannot stat {}: {e}", p.rel),
-        };
-        let was_input = before.contains_key(&p.rel);
+        let where_ = format!("{ctx} post[{} {}]", p.rel, p.verb);
+        assert!(
+            named.insert(p.rel.as_str()),
+            "{where_}: two post rows for one file"
+        );
+        let was = before.get(&p.rel);
+        let now = after.get(&p.rel);
         match p.verb.as_str() {
-            "deleted" => {
-                // §2.1: a post row is an explicit OVERRIDE of an input or an
-                // explicit NEW file. `deleted` is an override, so it must name
-                // something the cell actually started with.
-                assert!(
-                    was_input,
-                    "[{ctx}] `deleted` names {}, which was never an input",
-                    p.rel
-                );
-                assert!(!present, "[{ctx}] {} must not exist after the cell", p.rel);
-            }
+            // §2.1: a post row is an explicit OVERRIDE of an input or an
+            // explicit NEW file, so each verb says which side it is on.
             "unchanged" => {
-                let was = before.get(&p.rel).unwrap_or_else(|| {
-                    panic!(
-                        "[{ctx}] `unchanged` names {}, which was never an input",
-                        p.rel
-                    )
-                });
-                let now = read_named(&path, &p.rel, ctx);
-                assert_eq!(&now, was, "[{ctx}] {} must be byte-unchanged", p.rel);
+                assert!(
+                    was.is_some(),
+                    "{where_}: names a file that was not an input"
+                );
+                assert!(now.is_some(), "{where_}: file is gone");
+                assert_eq!(was, now, "{where_}: bytes changed");
             }
-            verb => {
-                // The other half of §2.1's split, which was missing: `created`
-                // is the NEW-file verb, so naming an input with it is as wrong
-                // as `modified` naming a non-input. A cell that overwrote a
-                // segment could otherwise describe it as `created` and pass.
-                if verb == "created" {
+            "deleted" => {
+                assert!(
+                    was.is_some(),
+                    "{where_}: names a file that was not an input"
+                );
+                assert!(now.is_none(), "{where_}: file is still there");
+            }
+            "created" | "truncated" | "modified" => {
+                if p.verb == "created" {
                     assert!(
-                        !was_input,
-                        "[{ctx}] `created` names {}, which WAS an input — an existing file the \
-                         cell rewrote is `modified` or `truncated`",
-                        p.rel
+                        was.is_none(),
+                        "{where_}: names a file that already existed as an input — an existing \
+                         file the cell rewrote is `modified` or `truncated`"
                     );
                 } else {
                     assert!(
-                        was_input,
-                        "[{ctx}] `{verb}` names {}, which was never an input — only `created` \
-                         may name a file the cell did not start with",
-                        p.rel
+                        was.is_some(),
+                        "{where_}: names a file that was not an input — only `created` may name a \
+                         file the cell did not start with"
                     );
                 }
-                assert!(present, "[{ctx}] {} must exist after the cell", p.rel);
-                let now = read_named(&path, &p.rel, ctx);
+                let now = now.unwrap_or_else(|| panic!("{where_}: file is missing"));
+                assert_eq!(now.len() as u64, p.len.unwrap(), "{where_}: length");
                 assert_eq!(
-                    now.len() as u64,
-                    p.len.unwrap(),
-                    "[{ctx}] {} length after the cell",
-                    p.rel
-                );
-                assert_eq!(
-                    sha256_hex(&now),
+                    sha256_hex(now),
                     *p.sha.as_ref().unwrap(),
-                    "[{ctx}] {} content after the cell",
-                    p.rel
+                    "{where_}: SHA-256"
                 );
             }
+            other => panic!("{where_}: unknown disposition verb {other}"),
         }
+        // AFTER the disposition was asserted, never before: a row consumed on
+        // entry would be accounted for by a handler that had not yet graded it.
+        owed.consume(&format!("post {}", p.rel), *p);
     }
     for (rel, was) in before {
         if named.contains(rel.as_str()) {
             continue;
         }
-        let now = std::fs::read(cell.join(rel)).unwrap_or_else(|e| {
-            panic!("[{ctx}] {rel} is named by no post row, so it must still be there: {e}")
-        });
-        assert_eq!(&now, was, "[{ctx}] unnamed input {rel} changed");
-    }
-    for name in dir_entries(cell) {
-        assert!(
-            before.contains_key(&name) || named.contains(name.as_str()),
-            "[{ctx}] {name} is neither an input nor named by a post row"
+        let now = after
+            .get(rel)
+            .unwrap_or_else(|| panic!("{ctx}: input {rel} is gone and no post row says so"));
+        assert_eq!(
+            was, now,
+            "{ctx}: input {rel} changed and no post row says so"
         );
     }
+    for name in after.keys() {
+        assert!(
+            before.contains_key(name) || named.contains(name.as_str()),
+            "{ctx}: unexpected new file {name}"
+        );
+    }
+}
+
+/// How a cell chooses its opener.
+///
+/// [`Dispatch::ByManifest`] is the only value production uses;
+/// [`Dispatch::AlwaysWal3`] exists so the C5 plan §3.11 mutant can be RUN
+/// rather than described — a deletion that merely restored an
+/// `opener == "wal3"` refusal would prove parser branching and nothing about
+/// this engine.
+///
+/// **§3.11's mechanism is the one this engine actually has, and C5r measured
+/// both halves of it** (java's flip found both false for java, so neither was
+/// inherited). `StoreDirect::open_file` refuses the bare segment with
+/// `not a MapDB StoreDirect file (bad magic)` and leaves the directory holding
+/// `{x}`; `StoreWAL::open` on the same path refuses it as D1 — a regular file
+/// at the WAL base path — but takes `<base>.lock` BEFORE the check and leaves
+/// `{x, x.lock}`. Both openers reject, so the verdict discriminates nothing;
+/// the stray lock does, against the two-sided file-set rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dispatch {
+    ByManifest,
+    AlwaysWal3,
+}
+
+/// Runs schema-v2 cells against this engine — the single executor for BOTH v2
+/// roots.
+///
+/// **Why one type and not two.** `tests/xfixtures-v2/` is the static `v2-core`
+/// sample and `tests/xfixtures-v2-corpus/` is the `v2-oracle` preflight root;
+/// they differ in which rows they carry, not in what a cell means. Two
+/// executors would be two implementations of the post-state rule, the opener
+/// dispatch and the reader contract, and this workstream has already shipped
+/// the consequence twice — a fix applied to one of two copies is a fix that did
+/// not happen (C2j's B-finding). What legitimately differs between the roots is
+/// the CARDINALITY rule, and that lives in the callers: the sample owes one
+/// cell per fixture per mode, the corpus owes exactly its `applies` rows.
+pub struct Cells<'a> {
+    sample: &'a SampleV2,
+    /// The `fixtureId/mode` of every `ro` accept cell whose read-only handle
+    /// was actually probed with a write.
+    ///
+    /// This exists so the probe is not a LEAF. Deleting
+    /// `if ro { assert_write_refused(..) }` leaves nothing to observe: the
+    /// standalone discriminating test opens the read-only handle itself, so it
+    /// cannot see the executor skipping the call. A set the caller compares
+    /// against the cells it ran turns the deletion into an empty set and a red
+    /// gate. It is bookkeeping, and it is the cheapest honest answer to lesson
+    /// (i) — a rule can be correct, directly tested, and never called.
+    pub ro_probed: BTreeSet<String>,
+}
+
+impl<'a> Cells<'a> {
+    pub fn new(sample: &'a SampleV2) -> Cells<'a> {
+        Cells {
+            sample,
+            ro_probed: BTreeSet::new(),
+        }
+    }
+
+    /// Every `action`/`bytes`/`reopen`/`post` row addressed to this engine in
+    /// `mode` must name a cell the engine actually runs.
+    ///
+    /// **Per-cell consumption cannot see this**, and both C5j reviewers proved
+    /// it independently: the accountant is built from the rows addressed to the
+    /// cell BEING RUN, so a row addressed to a `(fixture, mode)` with no
+    /// `expect` row is owed by nobody, consumed by nobody and graded by nobody.
+    /// Contract §2.3 says an addressed row no handler consumed is a failure,
+    /// and this is the half of that sentence per-cell accounting cannot reach.
+    ///
+    /// It is scoped to ONE mode because this engine's two halves run in two
+    /// binaries — `rw` cells through the public opener in `tests/`, `ro` cells
+    /// through the crate-internal one (decision C-D3). Each half grades the
+    /// rows addressed to its own mode; `MODES` has exactly two members and the
+    /// parser refuses any third, so between them the two halves cover every
+    /// row addressed to this engine.
+    pub fn require_every_oracle_row_addresses_a_run_cell(
+        &self,
+        mode: &str,
+        ran: &BTreeSet<String>,
+    ) {
+        let m = &self.sample.manifest;
+        let mut orphans: BTreeSet<String> = BTreeSet::new();
+        let addressed = |engine: &str, m2: &str, fixture: &str| -> bool {
+            engine == ENGINE && m2 == mode && !ran.contains(&format!("{fixture}/{m2}"))
+        };
+        for a in &m.actions {
+            if addressed(&a.engine, &a.mode, &a.fixture) {
+                orphans.insert(format!("action {}/{} {}", a.fixture, a.mode, a.verb));
+            }
+        }
+        for b in &m.bytes {
+            if addressed(&b.engine, &b.mode, &b.fixture) {
+                orphans.insert(format!("bytes {}/{} {}", b.fixture, b.mode, b.rel));
+            }
+        }
+        for r in &m.reopens {
+            if addressed(&r.engine, &r.mode, &r.fixture) {
+                orphans.insert(format!("reopen {}/{} {}", r.fixture, r.mode, r.family));
+            }
+        }
+        // `post` is the FOURTH addressed row type. C5j's round 2 found that
+        // nothing on either side of the fence caught one addressed to a cell no
+        // engine runs; §2.3 names it now, and it has a per-cell debt as well.
+        for p in &m.posts {
+            if addressed(&p.engine, &p.mode, &p.fixture) {
+                orphans.insert(format!("post {}/{} {}", p.fixture, p.mode, p.rel));
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "oracle rows addressed to {ENGINE} whose cell this engine never ran, so no accountant \
+             could ever owe them: {orphans:?}"
+        );
+    }
+
+    /// Runs ONE cell: stage the inputs, open through the opener the `expect`
+    /// row names, grade every oracle row addressed here, and account for all of
+    /// them.
+    ///
+    /// The `open` closure is the one thing the two halves do not share: the
+    /// integration test opens read-write through the public `StoreWAL::open`,
+    /// and the in-crate module opens read-only through `open_cfg`, which is
+    /// `pub(crate)` and stays that way (C-D3).
+    pub fn run_cell(
+        &mut self,
+        e: &V2Expect,
+        cell: &Path,
+        open: &dyn Fn(&Path) -> Result<StoreWAL>,
+        dispatch: Dispatch,
+    ) {
+        let m = &self.sample.manifest;
+        let ctx = format!(
+            "v2 cell[{} {ENGINE} {} {} {}]",
+            e.fixture, e.mode, e.verdict, e.opener
+        );
+
+        // Every oracle row addressed to this cell, and nothing else. Rows are
+        // struck off as they are consumed; what is left at the end is a claim
+        // the executor was handed and dropped.
+        let mut owed = Consumption::new(&ctx);
+        for a in m.actions_of(&e.fixture, ENGINE, &e.mode) {
+            owed.owe(&format!("action {}", a.verb), a);
+        }
+        for b in m.bytes_of(&e.fixture, ENGINE, &e.mode) {
+            owed.owe(&format!("bytes {}@{}", b.rel, b.offset), b);
+        }
+        for r in m.reopens_of(&e.fixture, ENGINE, &e.mode) {
+            owed.owe(&format!("reopen {}", r.family), r);
+        }
+        for p in m.posts_of(&e.fixture, ENGINE, &e.mode) {
+            owed.owe(&format!("post {}", p.rel), p);
+        }
+
+        let files = m.files_of(&e.fixture);
+        assert!(!files.is_empty(), "[{ctx}] fixture has no file rows");
+        let mut before: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for f in &files {
+            let bytes = self.sample.bytes_of(f).to_vec();
+            std::fs::write(cell.join(&f.rel), &bytes).unwrap();
+            before.insert(f.rel.clone(), bytes);
+        }
+
+        let opener = match dispatch {
+            Dispatch::AlwaysWal3 => "wal3",
+            Dispatch::ByManifest => e.opener.as_str(),
+        };
+        let target = cell.join(&e.open_arg);
+        match e.verdict.as_str() {
+            "accept" => self.run_accept(&ctx, e, opener, &target, open, &mut owed),
+            // A `reject` cell asserts that the open FAILED. It does not assert
+            // WHICH failure, and that is a transport hole rather than a
+            // widening someone chose here.
+            //
+            // C5r measured it: this engine's four reject cells refuse in TWO
+            // families. `reject-wal3-d1-barebase` and
+            // `reject-wal3-segment-at-direct` are corruption verdicts;
+            // `div-wal3-lsn-exhausted` is `StoreFull`, and contract §10.1 pins
+            // that — *"rust, zig, rw and ro: reject, error family StoreFull
+            // exactly — not the corruption family"*. The family lives in
+            // `catalogue.Cell.family` and the v2 `expect` row has **no column
+            // to carry it** (L15), so no engine can grade what the catalogue
+            // already knows. Requiring `DataCorruption` here refuses the
+            // corpus; requiring nothing accepts a store that refused Q8 for a
+            // bug reason.
+            //
+            // The grammar already has the row type that would close it — a
+            // `reopen` row carries a family and a reject cell's reopen refuses
+            // the same way its open did — and adding those rows regenerates the
+            // preflight root and both its seals, which is C5t's to do, not a
+            // reader flip's. **Recorded as an open hole rather than argued
+            // away**; `assert_family` implements both families the corpus
+            // actually produces, so the day the rows arrive there is nothing
+            // else to write.
+            "reject" => {
+                let refusal = refusal_of(&ctx, opener, &e.mode, &target, open);
+                if refusal.is_none() {
+                    panic!("[{ctx}] expected a refusal, but the store opened");
+                }
+            }
+            v => panic!("[{ctx}] unsupported verdict {v}"),
+        }
+
+        // THE CAPTURE, taken before the reopen — see `assert_post_state`.
+        let after = capture(cell, &ctx);
+        assert_bytes_rows(m, e, &after, &ctx, &mut owed);
+        // The post-cardinality guard runs BEFORE the rule it guards, not after:
+        // a cell whose post rows were all removed also loses the row naming the
+        // lock it creates, so the two-sided file-set rule fires first and this
+        // guard would report a red it did not produce (lesson h — an input that
+        // trips several checks measures the first).
+        //
+        // It keys on the MANIFEST's opener
+        // rather than the dispatched one. Plan §5.3 item 5's second relaxation
+        // is what this engine needs and java did not: `StoreDirect` here takes
+        // no `<base>.lock`, so the direct cell legitimately leaves the
+        // directory as it found it and carries no post row. The two-sided
+        // unnamed-input rule above still runs and is what carries the check —
+        // it is exactly what the §3.11 mutant trips. Keying on the DISPATCHED
+        // opener would make this guard fire first under `AlwaysWal3` and the
+        // mutant would report red for the wrong rule (lesson h).
+        assert!(
+            !m.posts_of(&e.fixture, ENGINE, &e.mode).is_empty() || e.opener != "wal3",
+            "[{ctx}] a wal3 cell with no post rows asserts nothing about the directory it just \
+             opened, which is not a check"
+        );
+        assert_post_state(
+            &m.posts_of(&e.fixture, ENGINE, &e.mode),
+            &before,
+            &after,
+            &ctx,
+            &mut owed,
+        );
+        assert_reopen(m, e, &target, &ctx, open, &mut owed);
+        owed.require_all_consumed();
+    }
+
+    fn run_accept(
+        &mut self,
+        ctx: &str,
+        e: &V2Expect,
+        opener: &str,
+        target: &Path,
+        open: &dyn Fn(&Path) -> Result<StoreWAL>,
+        owed: &mut Consumption,
+    ) {
+        assert_eq!(
+            opener, "wal3",
+            "[{ctx}] an accept cell through a non-wal3 opener is a shape no corpus has and no \
+             executor here implements"
+        );
+        let m = &self.sample.manifest;
+        let s =
+            open(target).unwrap_or_else(|err| panic!("[{ctx}] accept cell failed to open: {err}"));
+        for a in m.actions_of(&e.fixture, ENGINE, &e.mode) {
+            // Deliberately not caught: a store that opened and then failed its
+            // action is a different fact from one that refused to open, and
+            // collapsing the two lets a broken action be read as the verdict.
+            run_action(&s, &a.verb, &a.arg_spec);
+            owed.consume(&format!("action {}", a.verb), a);
+        }
+        let recids = m.recids_of(&e.fixture);
+        self.require_some_oracle(ctx, e, !recids.is_empty());
+        if !recids.is_empty() {
+            assert_reader_contract(&s, &recids, ctx);
+            assert_every_logged_recid_is_classified(&s, self.sample, &e.fixture, &recids, ctx);
+        }
+        if e.mode == "ro" {
+            self.assert_write_refused(ctx, e, &s);
+        }
+        s.close().unwrap();
+    }
+
+    /// An accept cell must assert SOMETHING about the store it just opened —
+    /// the C3j guard, as the disjunction plan §5.3 item 5 asked for.
+    ///
+    /// C5j's first draft deleted this guard for the sealed root and offered the
+    /// distribution seal as its replacement. Both reviewers refused, and proving
+    /// them right took one doctored manifest: strip a fixture's recid rows and
+    /// its accept cell passes on nothing but the universal `x.lock` post row.
+    /// **The seal proves copy fidelity and the guard proves assertion
+    /// adequacy**; artifact identity cannot buy a semantic property.
+    ///
+    /// The disjunction admits every cell either root has: recid rows, an
+    /// `action` row whose result a post oracle grades, a `reopen` row whose
+    /// claim is the store's permanent unopenability, or `mode == ro`, where the
+    /// read-only write refusal below is the executable claim.
+    fn require_some_oracle(&self, ctx: &str, e: &V2Expect, has_recids: bool) {
+        let m = &self.sample.manifest;
+        let any = has_recids
+            || !m.actions_of(&e.fixture, ENGINE, &e.mode).is_empty()
+            || !m.reopens_of(&e.fixture, ENGINE, &e.mode).is_empty()
+            || e.mode == "ro";
+        assert!(
+            any,
+            "[{ctx}] an accept cell with no recid rows, no action, no reopen and a writable handle \
+             asserts nothing about the store it opened, which is not a check"
+        );
+    }
+
+    /// D7's read-only mode is observable, in the direction that matters: a
+    /// write through the `ro` handle must be refused.
+    ///
+    /// C3z's review found the general shape this closes — `mode` was parsed,
+    /// vocabulary-checked and used to select an opener, and then NOTHING
+    /// observed the difference, so every `ro` cell in java and rust was an
+    /// ordinary writable open wearing a label.
+    ///
+    /// ONE assertion, not two. On a writable handle there is no refusal to
+    /// inspect, so "it was refused" and "the refusal names the mode" as two
+    /// statements are a pair that can only ever be killed by each other. The
+    /// claim is a conjunction and it is written as one.
+    pub fn assert_write_refused(&mut self, ctx: &str, e: &V2Expect, s: &StoreWAL) {
+        let outcome = match s.put(&vec![1u8, 2, 3], &R) {
+            Ok(_) => "the write was ACCEPTED".to_string(),
+            Err(err) => format!("refused with: {err}"),
+        };
+        assert!(
+            outcome.contains("read-only"),
+            "[{ctx}] the probe accepted a writable handle or a refusal that does not name the \
+             read-only mode — {outcome}"
+        );
+        // LAST, and inside this method rather than beside its call: with the
+        // recording at the call site, deleting the call and keeping the `add`
+        // leaves the gate green — the set then observes that the bookkeeping
+        // ran, not that the probe did.
+        self.ro_probed.insert(format!("{}/{}", e.fixture, e.mode));
+    }
+}
+
+/// Opens and returns the refusal, or `None` if the store opened (and closed).
+fn refusal_of(
+    ctx: &str,
+    opener: &str,
+    mode: &str,
+    target: &Path,
+    open: &dyn Fn(&Path) -> Result<StoreWAL>,
+) -> Option<DbError> {
+    let r: Result<()> = if opener == "direct" {
+        assert_eq!(
+            mode, "rw",
+            "[{ctx}] the direct opener has no read-only mode here"
+        );
+        StoreDirect::open_file(target).and_then(|s| s.close())
+    } else {
+        open(target).and_then(|s| s.close())
+    };
+    r.err()
+}
+
+/// Everything in the cell directory, by name, after the cell has run.
+///
+/// A name that is present but is not a REGULAR file is refused here rather than
+/// read as absent: `read(..).ok()` turns a permission error, or a file replaced
+/// by a directory of the same name, into "the file is gone", so a `deleted` row
+/// would pass on something that is very much still there in another shape. The
+/// C3r review named that one.
+pub fn capture(cell: &Path, ctx: &str) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for name in dir_entries(cell) {
+        let p = cell.join(&name);
+        let md = std::fs::symlink_metadata(&p)
+            .unwrap_or_else(|e| panic!("[{ctx}] cannot stat {name}: {e}"));
+        assert!(md.is_file(), "[{ctx}] {name} is not a regular file");
+        out.insert(name.clone(), read_named(&p, &name, ctx));
+    }
+    out
+}
+
+/// Grades every `bytes` row against the CAPTURED post bytes (contract §2.3).
+///
+/// It is never a pre-open patch: Q8's input segment is 186 bytes and its
+/// assertion is at offset 187, so a pre-open reading is not merely wrong, it is
+/// out of range. An assertion whose range cannot be reached is a failure, never
+/// a skip.
+fn assert_bytes_rows(
+    m: &V2,
+    e: &V2Expect,
+    after: &BTreeMap<String, Vec<u8>>,
+    ctx: &str,
+    owed: &mut Consumption,
+) {
+    for b in m.bytes_of(&e.fixture, ENGINE, &e.mode) {
+        let where_ = format!("{ctx} bytes[{}@{}]", b.rel, b.offset);
+        let now = after
+            .get(&b.rel)
+            .unwrap_or_else(|| panic!("{where_}: names a file the cell directory does not hold"));
+        let len = b.hex.len() / 2;
+        let end = b.offset as usize + len;
+        assert!(
+            end <= now.len(),
+            "{where_}: the range ends at {end} and the post state is {} bytes",
+            now.len()
+        );
+        let got: String = now[b.offset as usize..end]
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        assert_eq!(got, b.hex, "{where_}: the asserted bytes");
+        owed.consume(&format!("bytes {}@{}", b.rel, b.offset), b);
+    }
+}
+
+fn assert_reopen(
+    m: &V2,
+    e: &V2Expect,
+    target: &Path,
+    ctx: &str,
+    _open: &dyn Fn(&Path) -> Result<StoreWAL>,
+    owed: &mut Consumption,
+) {
+    for r in m.reopens_of(&e.fixture, ENGINE, &e.mode) {
+        let where_ = format!("{ctx} reopen[{}]", r.family);
+        // A reopen is a WRITABLE open whatever the cell's own mode was: the
+        // claim is that the store is permanently unopenable, and a read-only
+        // probe would be a weaker one.
+        let refusal = refusal_of(&where_, "wal3", "rw", target, &|p| StoreWAL::open(p));
+        let t = refusal.unwrap_or_else(|| panic!("{where_}: the store opened again"));
+        assert_family(&where_, &r.family, &t);
+        owed.consume(&format!("reopen {}", r.family), r);
+    }
+}
+
+/// S2 is the section-header `lsn <= seg.last_lsn` rule, wrapped by the WAL
+/// segment prefix the recovery scan puts on every per-segment refusal.
+///
+/// Matched WHOLE, with `is_match` over an anchored pattern built by hand: the
+/// refusal this grades is one line of the engine and its whole form is
+/// knowable, so matching the whole form is what the check should say. An
+/// unanchored substring test would accept the S2 wording embedded in unrelated
+/// text.
+fn s2_matches(msg: &str) -> bool {
+    // `WAL segment <name>: section LSN <n> at offset <n> does not follow <n>`
+    let Some(rest) = msg.strip_prefix("WAL segment ") else {
+        return false;
+    };
+    let Some((name, rest)) = rest.split_once(": ") else {
+        return false;
+    };
+    if name.is_empty() || name.contains(':') {
+        return false;
+    }
+    let Some(rest) = rest.strip_prefix("section LSN ") else {
+        return false;
+    };
+    let Some((lsn, rest)) = rest.split_once(" at offset ") else {
+        return false;
+    };
+    let Some((off, prev)) = rest.split_once(" does not follow ") else {
+        return false;
+    };
+    let int = |s: &str| {
+        let s = s.strip_prefix('-').unwrap_or(s);
+        !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())
+    };
+    int(lsn) && int(off) && int(prev)
+}
+
+/// Asserts a refusal belongs to the named contract family.
+///
+/// The family is read from the manifest row, never hard-coded, so editing
+/// `catalogue.reopen` stops the run instead of being graded against a constant
+/// this file happens to agree with. A family this engine has no predicate for
+/// is a **failure**: the alternative is a green cell whose reopen was checked
+/// by nothing.
+pub fn assert_family(where_: &str, family: &str, t: &DbError) {
+    if family == "S2" {
+        // The variant and the message are graded together, in that order,
+        // because the message is a property OF the corruption payload: this
+        // engine's `Display for DbError` prefixes `"data corruption: "`, so
+        // testing the rendered error would compare the S2 wording against a
+        // string no rule produces. Destructuring is the variant check and it is
+        // reachable — an operational failure carrying the S2 words is refused
+        // here, by the `else`, which is the input the java form of this check
+        // could not construct.
+        let DbError::DataCorruption(c) = t else {
+            panic!("{where_}: S2 is a corruption verdict, got {t}");
+        };
+        assert!(
+            s2_matches(&c.to_string()),
+            "{where_}: not the S2 rule's refusal: {c}"
+        );
+        return;
+    }
+    if family == "StoreFull" {
+        // Q8's family in this engine, and the one the corpus's own reject
+        // verdict for `div-wal3-lsn-exhausted` produces: a WAL segment
+        // namespace with no sequence number left is a capacity ceiling with
+        // nothing damaged, so the port refuses to call an intact store corrupt.
+        // A separate variant, so this predicate needs no message at all — and
+        // it is what makes the family reading DISCRIMINATE rather than agree
+        // with itself: the corpus has exactly one family per engine, and a
+        // predicate with one member cannot be shown to read the row.
+        assert!(
+            matches!(t, DbError::StoreFull),
+            "{where_}: StoreFull is a capacity verdict, got {t}"
+        );
+        return;
+    }
+    panic!(
+        "{where_}: error family {family} has no predicate in this engine. Refusing rather than \
+         accepting any refusal at all — an unimplemented family graded as 'it threw something' is \
+         the check not running"
+    );
 }
 
 /// Runs every schema-v2 cell addressed to this engine in `mode`, and asserts
 /// the set that ran is **exactly** the set the `fixture` rows call for.
 ///
-/// `open` receives the cell's base path. The caller supplies it because that is
-/// the one thing the two halves do not share: the integration test opens
-/// read-write through the public `StoreWAL::open`, and the in-crate module
-/// opens read-only through `open_cfg`, which is `pub(crate)` and stays that
-/// way (C-D3).
+/// This is the STATIC SAMPLE's cardinality rule. It derives what should run
+/// from a different row type than the one that says what will: a count, or the
+/// set of modes actually seen, is a projection of the already-truncated input,
+/// and the C3j review measured the consequence — deleting one `expect` row left
+/// the suite green because another fixture still supplied that mode. Every
+/// declared fixture owes one cell per mode, so a missing `expect` row now
+/// contradicts the `fixture` row still sitting next to it.
+///
+/// The preflight corpus cannot use this rule — its cell set is legitimately
+/// partial — which is what [`run_v2_corpus_cells`] and `applies` are for.
 pub fn run_v2_cells(
     sample: &SampleV2,
     mode: &str,
@@ -1697,67 +2594,130 @@ pub fn run_v2_cells(
     open: &dyn Fn(&Path) -> Result<StoreWAL>,
 ) {
     let m = &sample.manifest;
-    let want: BTreeSet<String> = m.declared_fixtures();
+    // The sample is `v2-core`, in BOTH directions. A root that grew an oracle
+    // row would be running assertions this rule never bought, and since C5 moved
+    // the profile split into the grammar that is a refusal, not a widening.
+    assert!(
+        m.applies.is_empty() && m.actions.is_empty() && m.bytes.is_empty() && m.reopens.is_empty(),
+        "the static sample carries an oracle row; it is v2-core through C7"
+    );
+    let want: BTreeSet<String> = m
+        .declared_fixtures()
+        .into_iter()
+        .map(|f| format!("{f}/{mode}"))
+        .collect();
     assert!(!want.is_empty(), "the v2 sample declares no fixtures");
-
-    let mut ran: BTreeSet<String> = BTreeSet::new();
-    for (i, e) in m.expects.iter().enumerate() {
-        if e.engine != ENGINE || e.mode != mode {
-            continue;
-        }
-        let ctx = format!(
-            "v2 cell {i}: fixture={} mode={} verdict={} opener={} openArg={}",
-            e.fixture, e.mode, e.verdict, e.opener, e.open_arg
-        );
-        assert_eq!(
-            e.opener, "wal3",
-            "[{ctx}] the only v2 opener this reader executes is `wal3`"
-        );
-        let files = m.files_of(&e.fixture);
-        assert!(!files.is_empty(), "[{ctx}] fixture has no file rows");
-
-        let cell = session.join(format!("v2-{mode}-{i}"));
-        let _ = std::fs::remove_dir_all(&cell);
-        std::fs::create_dir_all(&cell).unwrap();
-        let mut before: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for f in &files {
-            let bytes = sample.bytes_of(f).to_vec();
-            std::fs::write(cell.join(&f.rel), &bytes).unwrap();
-            before.insert(f.rel.clone(), bytes);
-        }
-
-        let base = cell.join(&e.open_arg);
-        match e.verdict.as_str() {
-            "accept" => {
-                let s = open(&base)
-                    .unwrap_or_else(|err| panic!("[{ctx}] accept cell failed to open: {err}"));
-                let recids = m.recids_of(&e.fixture);
-                assert_reader_contract(&s, &recids, &ctx);
-                assert_every_logged_recid_is_classified(&s, sample, &e.fixture, &recids, &ctx);
-                s.close().unwrap();
-            }
-            "reject" => match open(&base) {
-                Err(DbError::DataCorruption(_)) => {}
-                Err(other) => panic!("[{ctx}] expected DataCorruption, got: {other}"),
-                Ok(s) => {
-                    let _ = s.close();
-                    panic!("[{ctx}] reject cell opened successfully");
-                }
-            },
-            v => panic!("[{ctx}] unsupported verdict {v}"),
-        }
-
-        assert_post_state(&cell, &before, &m.posts_of(&e.fixture, ENGINE, mode), &ctx);
-        assert!(
-            ran.insert(e.fixture.clone()),
-            "[{ctx}] two {mode} cells for the same fixture"
-        );
-        std::fs::remove_dir_all(&cell).unwrap();
-    }
+    let mut cells = Cells::new(sample);
+    let ran = run_cells(&mut cells, mode, session, open);
     assert_eq!(
         ran, want,
         "the {ENGINE}/{mode} cells that ran are not the ones the fixture rows call for"
     );
+}
+
+/// Runs the preflight CORPUS's cells for this engine in `mode`, under the
+/// cardinality rule its partial cell set needs, and applies every rule that is
+/// about the SET of cells rather than about one of them.
+///
+/// Two row types emitted from one catalogue is a pair that moves together, so
+/// this also requires `applies == expect` per cell, in both directions. That
+/// check is deliberately absent from `manifest_v2.py` — there both sets are
+/// compared to the catalogue a few lines apart, so a third comparison could
+/// only fire after one of those already had. An engine has no catalogue, so for
+/// an engine the disagreement is the only detectable inconsistency, and without
+/// it a manifest could have this suite run a cell it holds no verdict for.
+///
+/// Every doctored-manifest case enters HERE rather than calling the rules
+/// directly. That distinction is the entire finding both C5j reviewers made: a
+/// test that calls the suite-wide check itself proves the METHOD and leaves its
+/// CALL unobserved, so deleting the call from the suite stays green.
+pub fn run_v2_corpus_cells(
+    sample: &SampleV2,
+    mode: &str,
+    session: &Path,
+    open: &dyn Fn(&Path) -> Result<StoreWAL>,
+) {
+    let m = &sample.manifest;
+    let want: BTreeSet<String> = m
+        .applies
+        .iter()
+        .filter(|a| a.engine == ENGINE && a.mode == mode)
+        .map(|a| format!("{}/{}", a.fixture, a.mode))
+        .collect();
+    assert!(
+        !want.is_empty(),
+        "the corpus declares no {ENGINE} applies rows for mode {mode}"
+    );
+    let expects: BTreeSet<String> = m
+        .expects
+        .iter()
+        .filter(|e| e.engine == ENGINE && e.mode == mode)
+        .map(|e| format!("{}/{}", e.fixture, e.mode))
+        .collect();
+    assert_eq!(
+        want, expects,
+        "the {ENGINE}/{mode} `applies` rows and `expect` rows are different sets"
+    );
+
+    let mut cells = Cells::new(sample);
+    let ran = run_cells(&mut cells, mode, session, open);
+    assert_eq!(
+        ran, want,
+        "the {ENGINE}/{mode} cells that ran are not the ones `applies` calls for"
+    );
+
+    // The other half of contract §2.3's consumption rule.
+    cells.require_every_oracle_row_addresses_a_run_cell(mode, &ran);
+
+    // …and the ro write probe really ran on every ro accept cell. Deleting the
+    // call inside the executor leaves this set empty, which is the red that
+    // call did not have.
+    // In `rw` the expected set is empty, and comparing it is not decoration:
+    // a probe that fired on a writable handle would land here.
+    let ro_cells: BTreeSet<String> = m
+        .expects
+        .iter()
+        .filter(|e| e.engine == ENGINE && e.mode == mode && mode == "ro" && e.verdict == "accept")
+        .map(|e| format!("{}/{}", e.fixture, e.mode))
+        .collect();
+    assert!(
+        mode != "ro" || !ro_cells.is_empty(),
+        "the corpus has no {ENGINE} ro accept cell, so the read-only probe has no input"
+    );
+    assert_eq!(
+        ro_cells, cells.ro_probed,
+        "the ro cells whose read-only handle was probed with a write"
+    );
+}
+
+fn run_cells(
+    cells: &mut Cells<'_>,
+    mode: &str,
+    session: &Path,
+    open: &dyn Fn(&Path) -> Result<StoreWAL>,
+) -> BTreeSet<String> {
+    let expects: Vec<V2Expect> = cells
+        .sample
+        .manifest
+        .expects
+        .iter()
+        .filter(|e| e.engine == ENGINE && e.mode == mode)
+        .cloned()
+        .collect();
+    let mut ran: BTreeSet<String> = BTreeSet::new();
+    for (i, e) in expects.iter().enumerate() {
+        let cell = session.join(format!("v2-{mode}-{i}"));
+        let _ = std::fs::remove_dir_all(&cell);
+        std::fs::create_dir_all(&cell).unwrap();
+        cells.run_cell(e, &cell, open, Dispatch::ByManifest);
+        assert!(
+            ran.insert(format!("{}/{}", e.fixture, e.mode)),
+            "two {mode} cells for {}",
+            e.fixture
+        );
+        std::fs::remove_dir_all(&cell).unwrap();
+    }
+    ran
 }
 
 /// The completeness half of the recid oracle: every recid the LOG mentions is
@@ -1826,22 +2786,31 @@ pub fn session_dir(tag: &str) -> PathBuf {
 /// `assert!(cond)` with no message would satisfy a bare "it panicked" check
 /// while telling a future reader nothing.
 pub fn assert_refused(what: &str, f: impl FnOnce() + std::panic::UnwindSafe) {
+    match red_of(f) {
+        None => panic!("accepted {what}"),
+        Some(msg) => assert!(!msg.is_empty(), "the refusal of {what} carried no message"),
+    }
+}
+
+/// The panic message `f` produced, or `None` if it returned.
+///
+/// The panic hook is silenced for the duration, for the reason
+/// [`assert_refused`] gives: `catch_unwind` still prints a "thread panicked"
+/// line by default, and a suite whose passing output is full of them trains the
+/// reader to ignore exactly the lines that matter.
+pub fn red_of(f: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let outcome = std::panic::catch_unwind(f);
     std::panic::set_hook(prev);
     match outcome {
-        Ok(()) => panic!("accepted {what}"),
-        Err(e) => {
-            let msg = e
-                .downcast_ref::<String>()
+        Ok(()) => None,
+        Err(e) => Some(
+            e.downcast_ref::<String>()
                 .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()));
-            assert!(
-                msg.is_some_and(|m| !m.is_empty()),
-                "the refusal of {what} carried no message"
-            );
-        }
+                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "<a panic with no message>".to_string()),
+        ),
     }
 }
 

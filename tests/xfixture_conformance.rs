@@ -537,19 +537,96 @@ fn the_v1_grammar_has_its_own_vocabularies() {
 /// the fixtures. Until then the honest thing for a reader to do is stop: a
 /// `bytes` row silently ignored is a fixture that the manifest says exists and
 /// that nothing ever opens.
+/// The four `v2-oracle` row types C5 added — parsed, and their own rules
+/// enforced.
+///
+/// Until C5r this reader refused a `bytes` row outright. That refusal was the
+/// honest state of the world (C4 introduced the derived fixtures the row
+/// describes and no engine could execute it), and it is now a defect: the
+/// preflight corpus carries all four types, and a reader that refuses one
+/// refuses the corpus.
+///
+/// The rows below are GRAMMATICALLY VALID except in the one place each case
+/// names. That distinction is not pedantry — the first version of the old
+/// `bytes` case supplied an unknown engine, an unknown mode AND a relName of
+/// `0`, and the unconditional panic masked all three, so the test proved only
+/// that a malformed row is refused.
 #[test]
-fn a_bytes_row_is_refused_until_c4_can_execute_it() {
-    xfix::assert_manifest_refused(
-        "a v2 `bytes` row",
-        // The row must be GRAMMATICALLY VALID, or the test proves only that a
-        // malformed row is refused — which the arity and vocabulary rules
-        // already do, and which is not what the name claims. The first version
-        // of this case supplied an unknown engine, an unknown mode and a
-        // relName of `0`, and the unconditional `bytes` panic masked all three.
-        "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n\
-         file\tf\tx.wal.0000000000000001\t36\taa\tbb\n\
-         bytes\tf\trust\tro\tx.wal.0000000000000001\t0\taa\n",
+fn the_c5_oracle_rows_parse_and_are_checked() {
+    let head = "version\t2\nfixture\tf\twal3-namespace\tjava\tc\n\
+                file\tf\tx.wal.0000000000000001\t36\taa\tbb\n";
+    let good = format!(
+        "{head}applies\tf\trust\tro\n\
+         expect\tf\trust\tro\taccept\twal3\tx\n\
+         action\tf\trust\tro\tcommit_one_record\top=put,payload_id=1,payload_len=2,\
+         recid_label=Z,serializer=raw\n\
+         bytes\tf\trust\tro\tx.wal.0000000000000001\t0\taabb\n\
+         reopen\tf\trust\tro\tS2\n"
     );
+    let m = xfix::parse(&good);
+    let m = m.v2();
+    assert_eq!(m.applies.len(), 1, "the applies row parsed");
+    assert_eq!(m.actions_of("f", "rust", "ro").len(), 1);
+    assert_eq!(m.bytes_of("f", "rust", "ro").len(), 1);
+    assert_eq!(m.reopens_of("f", "rust", "ro").len(), 1);
+    assert_eq!(m.actions[0].verb, "commit_one_record");
+    assert_eq!(m.bytes[0].offset, 0);
+    assert_eq!(m.bytes[0].hex, "aabb");
+    assert_eq!(m.reopens[0].family, "S2");
+
+    let cases: [(&str, String); 12] = [
+        (
+            "a duplicate applies row",
+            format!("{head}applies\tf\trust\tro\napplies\tf\trust\tro\n"),
+        ),
+        (
+            "an out-of-vocabulary engine on an applies row",
+            format!("{head}applies\tf\tgo\tro\n"),
+        ),
+        (
+            "an out-of-vocabulary mode on a reopen row",
+            format!("{head}reopen\tf\trust\trwx\tS2\n"),
+        ),
+        (
+            "a second reopen row for one cell",
+            format!("{head}reopen\tf\trust\tro\tS2\nreopen\tf\trust\tro\tS9\n"),
+        ),
+        (
+            "a second action row for one cell and verb",
+            format!("{head}action\tf\trust\tro\tv\ta=1\naction\tf\trust\tro\tv\ta=2\n"),
+        ),
+        (
+            "action argument keys out of sorted order",
+            format!("{head}action\tf\trust\tro\tv\tb=1,a=2\n"),
+        ),
+        (
+            "a repeated action argument key",
+            format!("{head}action\tf\trust\tro\tv\ta=1,a=2\n"),
+        ),
+        (
+            "an action argument key outside [a-z][a-z0-9_]*",
+            format!("{head}action\tf\trust\tro\tv\tA=1\n"),
+        ),
+        (
+            "an action argument value outside the pinned character class",
+            format!("{head}action\tf\trust\tro\tv\ta=one two\n"),
+        ),
+        (
+            "an action argument that is not a k=v pair",
+            format!("{head}action\tf\trust\tro\tv\tab\n"),
+        ),
+        (
+            "a bytes row whose value is odd-length hex",
+            format!("{head}bytes\tf\trust\tro\tx.wal.0000000000000001\t0\taab\n"),
+        ),
+        (
+            "a bytes row whose value is uppercase hex",
+            format!("{head}bytes\tf\trust\tro\tx.wal.0000000000000001\t0\tAA\n"),
+        ),
+    ];
+    for (what, text) in &cases {
+        xfix::assert_manifest_refused(what, text);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,8 +782,22 @@ fn the_post_state_rule_fails_in_both_directions() {
         let m = loaded.v2();
         let rows = m.posts_of("f", "rust", "ro");
 
+        // The capture is taken the way a real cell takes it, so this battery
+        // grades the shipped pairing rather than a second reading of the
+        // directory: `capture` is where a name that is not a regular file is
+        // refused, and the "replaced by a directory" case reaches it there.
         let cell2 = cell.clone();
-        let run = move || xfix::assert_post_state(&cell2, &before, &rows, what);
+        let run = move || {
+            let mut owed = xfix::Consumption::new(what);
+            for p in &rows {
+                owed.owe(&format!("post {}", p.rel), *p);
+            }
+            let after = xfix::capture(&cell2, what);
+            xfix::assert_post_state(&rows, &before, &after, what, &mut owed);
+            // Every row this battery hands the rule must come back consumed:
+            // otherwise a `want_ok` case could pass by the rule skipping it.
+            owed.require_all_consumed();
+        };
         if want_ok {
             run();
         } else {
