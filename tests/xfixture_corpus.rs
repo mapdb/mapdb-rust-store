@@ -37,9 +37,11 @@
 //!
 //! # The mutation campaign
 //!
-//! A set of NAMED cases in `scratchpad/mut_r.py` + `mutants_r.sh`. Each case
-//! mutates one named site — deleting, replacing or moving it — or a named
-//! combination, and the suite must then go red for the reason that case names.
+//! A set of NAMED cases in `todo/store-wal3/campaigns/mut_r.py` +
+//! `mutants_r.sh`, with the run that produced this slice's result beside them
+//! in `campaign_r.log`. Each case mutates one named site — deleting, replacing
+//! or moving it — and the suite must then go red for the reason that case
+//! names.
 //! The runner exits non-zero if any case survives, mis-kills or fails to apply,
 //! so the count and the result are read from a run rather than asserted here.
 //!
@@ -82,10 +84,10 @@
 //!   deleting it leaves `read_named` failing on the same input with a worse
 //!   message, so what the assertion buys is the diagnosis, not the refusal.
 //!
-//! Two more sites are killed only by the WEAKER signal "it failed for another
-//! reason" — the doctored case's own check noticing that a different rule
+//! Three more sites are killed only by the WEAKER signal "it failed for another
+//! reason" — the doctored case's own check noticing that a DIFFERENT rule
 //! fired. They are the "a wal3 cell with no post rows" guard, whose input also
-//! trips the file-set rule one step later, and the two `run_action` refusals,
+//! trips the file-set rule one step later, and `run_action`'s two refusals,
 //! whose inputs also change the segment. The runner names the exact replacement
 //! red so those cases stay falsifiable.
 
