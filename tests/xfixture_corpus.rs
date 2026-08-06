@@ -58,6 +58,36 @@
 //! is pushed DOWN rather than eliminated, by collecting outcomes and comparing
 //! them once per group — so one comparison per group is unobserved rather than
 //! every statement in it.
+//!
+//! # What the campaign measured and could NOT kill
+//!
+//! Named, because a campaign that reports only its kills is a campaign whose
+//! coverage claim nothing checks. Each of these was applied and the whole suite
+//! stayed green:
+//!
+//! - `ran == want` in `run_v2_corpus_cells`. `applies == expect` fires first on
+//!   every input that separates them, and `run_cells` runs one cell per
+//!   `expect` row by construction, so the two can disagree only if the executor
+//!   itself is broken. Deleting `applies == expect` IS killed — by this
+//!   equality — so the pair guards each other in one direction only.
+//! - the `ro_probed` comparison, the corpus-root file-set comparison, and the
+//!   distribution-seal comparison. Each is the last statement in its group:
+//!   they are what give the probe call, the root inventory and the copy its
+//!   reds, and nothing observes THEM. This is the leaf pushed down, not
+//!   removed.
+//! - the `v2-core` profile assertion in `run_v2_cells`. The static sample
+//!   carries no oracle row, so no input reaches it; it exists for the day one
+//!   appears.
+//! - `capture`'s "not a regular file" assertion. Not a leaf but SUBSUMED:
+//!   deleting it leaves `read_named` failing on the same input with a worse
+//!   message, so what the assertion buys is the diagnosis, not the refusal.
+//!
+//! Two more sites are killed only by the WEAKER signal "it failed for another
+//! reason" — the doctored case's own check noticing that a different rule
+//! fired. They are the "a wal3 cell with no post rows" guard, whose input also
+//! trips the file-set rule one step later, and the two `run_action` refusals,
+//! whose inputs also change the segment. The runner names the exact replacement
+//! red so those cases stay falsifiable.
 
 #[path = "../src/store/xfix.rs"]
 mod xfix;
@@ -338,7 +368,8 @@ fn the_action_row_is_executed() {
         "an action verb this engine does not implement",
         &doctored(|t| {
             format!(
-                "{}action\twal3-java-cleaned\trust\trw\tcompact\ta=1\n",
+                "{}action\twal3-java-cleaned\trust\trw\tcompact\t\
+                 op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw\n",
                 drop_rows(t, "recid\twal3-java-cleaned\t")
             )
         }),
@@ -453,7 +484,7 @@ fn the_reopen_row_is_graded() {
         &doctored(|t| format!("{t}{}", row("S2"))),
         "div-wal3-lsn-exhausted",
         "rw",
-        "S2 is a corruption verdict",
+        "not the S2 rule's refusal",
     );
     refuses_cell(
         "a reopen family this engine has no predicate for",
@@ -499,12 +530,13 @@ fn the_reopen_family_predicate_discriminates() {
         "S2",
         DbError::corrupt("WAL file x.wal is not a v3 segment"),
     );
-    // The WHOLE S2 message on a non-corruption variant, so the variant
-    // predicate is the only thing that can refuse it. An input that trips
-    // several checks measures the first (lesson h), and the earlier java form
-    // of this case omitted the `WAL segment <name>: ` prefix — which meant the
-    // message predicate rejected it and the variant predicate could be deleted
-    // with the gate green.
+    // The WHOLE S2 message on a non-corruption variant. In java this input
+    // isolates the CLASS predicate; here it does not, and saying so is the
+    // point: `Display for DbError` gives every non-corruption variant a prefix
+    // of its own, so the rendered error is `verify failed: WAL segment …` and
+    // the MESSAGE predicate refuses it. There is no rust input that reaches a
+    // separate variant check, which is why `assert_family` states the S2 arm
+    // as one claim rather than two (lesson h, from the inside).
     refused(
         "an operational failure wearing the right words",
         "S2",

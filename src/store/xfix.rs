@@ -2280,8 +2280,8 @@ impl<'a> Cells<'a> {
         // guard would report a red it did not produce (lesson h — an input that
         // trips several checks measures the first).
         //
-        // It keys on the MANIFEST's opener
-        // rather than the dispatched one. Plan §5.3 item 5's second relaxation
+        // It keys on the MANIFEST's opener rather than the dispatched one.
+        // Plan §5.3 item 5's second relaxation
         // is what this engine needs and java did not: `StoreDirect` here takes
         // no `<base>.lock`, so the direct cell legitimately leaves the
         // directory as it found it and carries no post row. The two-sided
@@ -2535,20 +2535,28 @@ fn s2_matches(msg: &str) -> bool {
 /// by nothing.
 pub fn assert_family(where_: &str, family: &str, t: &DbError) {
     if family == "S2" {
-        // The variant and the message are graded together, in that order,
-        // because the message is a property OF the corruption payload: this
-        // engine's `Display for DbError` prefixes `"data corruption: "`, so
-        // testing the rendered error would compare the S2 wording against a
-        // string no rule produces. Destructuring is the variant check and it is
-        // reachable — an operational failure carrying the S2 words is refused
-        // here, by the `else`, which is the input the java form of this check
-        // could not construct.
-        let DbError::DataCorruption(c) = t else {
-            panic!("{where_}: S2 is a corruption verdict, got {t}");
+        // ONE statement, not a variant check and a message check.
+        //
+        // The message is a property OF the corruption payload — `Display for
+        // DbError` prefixes `"data corruption: "` — so this reads the payload
+        // rather than the rendered error. And in this engine EVERY other
+        // variant's `Display` carries a prefix of its own (`"verify failed: "`,
+        // `"unsupported operation: "`, `"store full"`), so no non-corruption
+        // error can render the S2 rule's message whole. A separate variant
+        // assertion would therefore be a check no input can reach: the message
+        // predicate refuses the same input first. That is one check masking
+        // another on the same input — lesson (h), and precisely the defect
+        // C5j's round 3 found in java's form of this predicate, where the
+        // negative input omitted the `WAL segment <name>: ` prefix and the
+        // message half rejected it before the class half could. The claim here
+        // is a conjunction and it is written as one statement with one red.
+        let payload = match t {
+            DbError::DataCorruption(c) => c.to_string(),
+            other => other.to_string(),
         };
         assert!(
-            s2_matches(&c.to_string()),
-            "{where_}: not the S2 rule's refusal: {c}"
+            s2_matches(&payload),
+            "{where_}: not the S2 rule's refusal: {t}"
         );
         return;
     }
@@ -2794,15 +2802,25 @@ pub fn assert_refused(what: &str, f: impl FnOnce() + std::panic::UnwindSafe) {
 
 /// The panic message `f` produced, or `None` if it returned.
 ///
-/// The panic hook is silenced for the duration, for the reason
-/// [`assert_refused`] gives: `catch_unwind` still prints a "thread panicked"
-/// line by default, and a suite whose passing output is full of them trains the
-/// reader to ignore exactly the lines that matter.
+/// A refusal this harness EXPECTS prints nothing: `catch_unwind` still emits a
+/// "thread panicked" line by default, and a suite whose passing output is full
+/// of them trains the reader to ignore exactly the lines that matter.
+///
+/// **The silencing is per THREAD, not per call, and that is a defect this slice
+/// found by tripping over it.** The obvious implementation — `take_hook`,
+/// install a no-op, run, put the old one back — swaps a hook that is
+/// PROCESS-GLOBAL while cargo runs the cases in one binary concurrently. So one
+/// test's expected refusal silences another test's genuine failure, and the
+/// second reports as a bare `test ... FAILED` with no message at all. C5r's
+/// mutation campaign is what surfaced it: twenty mutants were killed for
+/// reasons the runner could not read, which is a campaign that cannot check its
+/// own claim. One hook, installed once, consulting a thread-local flag and
+/// delegating to the default hook otherwise.
 pub fn red_of(f: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    install_quiet_hook();
+    EXPECTING.with(|e| e.set(true));
     let outcome = std::panic::catch_unwind(f);
-    std::panic::set_hook(prev);
+    EXPECTING.with(|e| e.set(false));
     match outcome {
         Ok(()) => None,
         Err(e) => Some(
@@ -2812,6 +2830,24 @@ pub fn red_of(f: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
                 .unwrap_or_else(|| "<a panic with no message>".to_string()),
         ),
     }
+}
+
+thread_local! {
+    /// Whether THIS thread is inside a [`red_of`] and expects the panic it is
+    /// about to see.
+    static EXPECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn install_quiet_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !EXPECTING.with(|e| e.get()) {
+                default(info);
+            }
+        }));
+    });
 }
 
 /// [`assert_refused`] specialised to the manifest reader.
