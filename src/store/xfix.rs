@@ -2057,6 +2057,60 @@ pub fn assert_post_state(
                     *p.sha.as_ref().unwrap(),
                     "{where_}: SHA-256"
                 );
+                // …and the VERB's own relation to the input, which the three
+                // verbs shared this arm without ever asserting. Round 3 of
+                // review measured the consequence: the length and the hash are
+                // self-consistent whatever the verb says, so a file that GREW
+                // satisfied `truncated` and a file that did not change at all
+                // satisfied `modified`. The verb was decoration.
+                //
+                // I had recorded this as needing C5t's torn-tail images. That
+                // was wrong and the reviewer falsified it in six lines of the
+                // existing synthetic battery — the rule is about the relation
+                // between two byte strings and needs no engine to produce them.
+                match p.verb.as_str() {
+                    // "the active segment is `truncated:<len>:<sha>` back to
+                    // its last valid section end" (contract §10.1): a prefix,
+                    // and strictly shorter. Both halves, or a rewrite that
+                    // happens to be shorter would pass as a truncation.
+                    "truncated" => {
+                        // ONE statement: a truncation is a PROPER PREFIX of the
+                        // input. Written as two — "it shrank" and "it is a
+                        // prefix" — the shrink half has no red of its own,
+                        // because a file that grew fails the prefix comparison
+                        // too. The campaign measured that: the two-assertion
+                        // form left `posttrunc_len` a survivor. Same shape as
+                        // `assert_family`'s S2 arm and the read-only probe, and
+                        // the same reason.
+                        let was = was.expect("checked above");
+                        assert!(
+                            now.len() < was.len() && was[..now.len()] == now[..],
+                            "{where_}: `truncated` must name a PROPER PREFIX of the input — it \
+                             was {} bytes and is now {}, and the contract's truncation is the \
+                             active segment cut back to its last valid section end",
+                            was.len(),
+                            now.len()
+                        );
+                    }
+                    // `modified` exists because Q8's segment GREW, which no
+                    // other disposition can describe. It must therefore mean
+                    // the file changed — and must not be usable for the shape
+                    // that has its own verb, or the two are interchangeable and
+                    // neither is a claim.
+                    "modified" => {
+                        let was = was.expect("checked above");
+                        assert_ne!(
+                            &was[..],
+                            &now[..],
+                            "{where_}: `modified` names a file whose bytes did not change"
+                        );
+                        assert!(
+                            !(now.len() < was.len() && was[..now.len()] == now[..]),
+                            "{where_}: `modified` names a pure truncation, which is `truncated`"
+                        );
+                    }
+                    _ => {}
+                }
             }
             other => panic!("{where_}: unknown disposition verb {other}"),
         }

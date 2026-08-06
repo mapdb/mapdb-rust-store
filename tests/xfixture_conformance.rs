@@ -752,6 +752,54 @@ fn the_post_state_rule_fails_in_both_directions() {
         // `capture`'s assertion leaves `read_named` refusing it too. So this
         // case still measures the hazard its name claims; what it no longer
         // isolates is which of the two statements catches it.
+        // The two verbs whose RELATION to the input was never asserted, both
+        // directions each. Round 3 of review found the shared arm made both
+        // decorative — a file that grew satisfied `truncated`, an unchanged
+        // file satisfied `modified` — and constructed these inputs to prove it.
+        // The disposition I had written said this needed C5t's torn-tail
+        // images; it needed six lines here.
+        (
+            "a `truncated` file that really shrank",
+            vec![("seg", b"qx")],
+            vec![("seg", b"q")],
+            vec!["seg\ttruncated:1:S"],
+            true,
+        ),
+        (
+            "a `truncated` file that grew",
+            vec![("seg", b"")],
+            vec![("seg", b"q")],
+            vec!["seg\ttruncated:1:S"],
+            false,
+        ),
+        (
+            "a `truncated` file that shrank but is not a PREFIX of the input",
+            vec![("seg", b"zq")],
+            vec![("seg", b"q")],
+            vec!["seg\ttruncated:1:S"],
+            false,
+        ),
+        (
+            "a `modified` file that really changed",
+            vec![("seg", b"z")],
+            vec![("seg", b"q")],
+            vec!["seg\tmodified:1:S"],
+            true,
+        ),
+        (
+            "a `modified` file whose bytes are unchanged",
+            vec![("seg", b"q")],
+            vec![("seg", b"q")],
+            vec!["seg\tmodified:1:S"],
+            false,
+        ),
+        (
+            "a `modified` row describing what is really a truncation",
+            vec![("seg", b"qx")],
+            vec![("seg", b"q")],
+            vec!["seg\tmodified:1:S"],
+            false,
+        ),
         (
             "a `deleted` file replaced by a directory of the same name",
             vec![("seg", b"abc")],
@@ -814,6 +862,6 @@ fn the_post_state_rule_fails_in_both_directions() {
         }
         std::fs::remove_dir_all(&cell).unwrap();
     }
-    assert_eq!(n, 13, "the post-state battery lost a case");
+    assert_eq!(n, 19, "the post-state battery lost a case");
     let _ = std::fs::remove_dir_all(&session);
 }

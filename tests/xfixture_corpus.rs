@@ -90,7 +90,15 @@
 //! trips the file-set rule one step later, and the `bytes` range check, whose
 //! input then panics in the slice instead. The runner names the exact
 //! replacement red so both stay falsifiable, and
-//! `grep -c 'it failed for another reason'` on it is the count.
+//! `grep -c "^case_ .*it failed for another reason"` on it is the count. **The
+//! anchor is load-bearing** — the unanchored form counts the runner's own
+//! explanatory header and returns three, which round 3 caught.
+//!
+//! Round 3 also showed the `postguard` residue is not inherent: a doctored cell
+//! with a pre-existing `x.lock` INPUT reaches the guard without the file-set
+//! rule behind it, and deleting the guard then lets that cell pass. C5z can
+//! take the residue from two to one; it is recorded rather than taken here
+//! because it is a coverage improvement and not a defect.
 //!
 //! # Two rounds of review, and what each cost
 //!
@@ -112,6 +120,17 @@
 //! than by correcting it: every `run_action` case now carries the matching
 //! `post` row, so a deleted refusal produces a PASSING cell and an isolating
 //! red instead of a red about the unnamed-input rule.
+//!
+//! **Round 3 closed both of round 2's by re-test and found a production defect
+//! in the executor itself** — the first finding in three rounds that was not
+//! about test coverage. `assert_post_state`'s `created | truncated | modified`
+//! arm checked only that the length and hash matched the row, never that the
+//! post bytes stood in the verb's RELATION to the input: a file that grew
+//! satisfied `truncated`, and a file that did not change at all satisfied
+//! `modified`. Both verbs were decoration. I had recorded this as needing
+//! C5t's torn-tail engine images; the reviewer falsified that deferral in six
+//! lines of the existing synthetic battery, because the rule is about two byte
+//! strings and needs no engine to produce them.
 
 #[path = "../src/store/xfix.rs"]
 mod xfix;
