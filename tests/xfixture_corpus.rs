@@ -1,13 +1,14 @@
-//! The schema-v2 **preflight corpus** against this engine — Stage C, slice
-//! **C5r**.
+//! The schema-v2 **frozen corpus** against this engine — Stage C, slice
+//! **C6r**.
 //!
 //! `tests/xfixtures-v2-corpus/` is a byte-identical copy of the `root`-marked
-//! files of `todo/store-cross/preflight-v2/` — twelve files: `MANIFEST.tsv` and
-//! one blob per `file` row, and nothing else (C5 plan §4c). It is the
+//! files of `todo/store-cross/corpus-v2/` — eighty-nine files: `MANIFEST.tsv`
+//! and one blob per `file` row, and nothing else (C5 plan §4c). It is the
 //! `v2-oracle` profile: it carries `applies`, `action`, `bytes` and `reopen`
 //! rows. The static `tests/xfixtures-v2/` sample stays `v2-core` and is
-//! untouched by C5; [`xfixture_conformance`] still owns it, through the same
-//! executor.
+//! untouched by C6; [`xfixture_conformance`] still owns it, through the same
+//! executor. The dual reader (v1 sample + v2 sample + this corpus root) is
+//! what keeps the cutover a data commit.
 //!
 //! # What this engine executes, and what it accounts for
 //!
@@ -21,18 +22,12 @@
 //!
 //! **`reopen` IS addressed to rust, and C5t is what changed that** (plan §3.12).
 //! Every eligible reject arm now carries one, derived in `catalogue.py` from the
-//! error family already pinned there. THIS ROOT carries three of the five
-//! families `catalogue.REOPEN_FAMILIES` transports — `D1` for the bare-base
-//! cell, `direct-magic` for the direct one, `StoreFull` for Q8's port arms; the
-//! other two, `DataCorruption` and `S2`, reach cells this root does not hold and
-//! are graded by the same `assert_family` when the frozen corpus is staged. So
-//! this engine grades
-//! WHICH failure a reject cell produced and that the refusal is STABLE. Until
-//! then the reject arm could only assert that the open failed, and a store that
-//! refused Q8 because a bug made it refuse everything passed. The sentence above
-//! said "or `reopen`" for three slices; it was true when written and C5t made it
-//! false, which is why it is corrected here rather than left to a reader to
-//! notice.
+//! error family already pinned there. THIS ROOT — the full frozen corpus after
+//! C6 — carries all five families `catalogue.REOPEN_FAMILIES` transports
+//! (`D1`, `DataCorruption`, `S2`, `StoreFull`, `direct-magic`). So this engine
+//! grades WHICH failure a reject cell produced and that the refusal is STABLE.
+//! Until C5t the reject arm could only assert that the open failed, and a store
+//! that refused Q8 because a bug made it refuse everything passed.
 //!
 //! So plan §5.3 item 2 splits the flip: rust **accepts and accounts**, and its
 //! execution paths get their inputs from SYNTHETIC manifests here — where a row
@@ -233,13 +228,15 @@ fn the_session_guard_removes_its_directory_when_the_test_panics() {
     );
 }
 
-/// `freeze_v2.PREFLIGHT_DIST_SEALS["rust"]`, and the referent is
-/// `todo/store-cross/preflight-v2/` — never this directory. A constant
+/// `freeze_v2.CORPUS_DIST_SEALS["rust"]`, and the referent is
+/// `todo/store-cross/corpus-v2/` — never this directory. A constant
 /// regenerated from the tree it grades certifies that the tree equals itself.
+/// Pinning the corpus digest in this repository (C6) is the trust upgrade over
+/// C5t's disposable staged worktree: four repositories must move together.
 ///
-/// Regenerate with `python3 todo/store-cross/freeze_v2.py --preflight
+/// Regenerate with `python3 todo/store-cross/freeze_v2.py --corpus
 /// --dist-seals`.
-pub const DIST_SEAL: &str = "83260fc8819b979de0c50a236a0e82f362e5d48e0c40a60990e14f03a85109e0";
+pub const DIST_SEAL: &str = "e1f8ae52d856e6c04cfa302365a8a47bdf980b5f1737f7297d7568cc5e6df969";
 
 fn open_rw(base: &Path) -> mapdb_rust_store::error::Result<StoreWAL> {
     StoreWAL::open(base)
@@ -1307,7 +1304,7 @@ fn the_corpus_root_has_nothing_unexplained() {
 ///
 /// What it does not certify, stated because the whole-artifact seal does
 /// certify it: provenance. The four repo commits and `sync_v2.py`'s digest are
-/// in `PREFLIGHT_SEAL`'s preimage and not in this one — they are not properties
+/// in `CORPUS_SEAL`'s preimage and not in this one — they are not properties
 /// of the distributed bytes and this repository has no way to check them.
 #[test]
 fn the_corpus_root_matches_todos_sealed_tree() {
@@ -1326,8 +1323,8 @@ fn the_corpus_root_matches_todos_sealed_tree() {
     assert_eq!(
         DIST_SEAL,
         xfix::sha256_hex(pre.as_bytes()),
-        "this root is not todo/store-cross/preflight-v2/'s `root` slice. Regenerate with \
-         `freeze_v2.py --preflight --dist-seals`, and copy the TREE too — a constant updated \
+        "this root is not todo/store-cross/corpus-v2/'s `root` slice. Regenerate with \
+         `freeze_v2.py --corpus --dist-seals`, and copy the TREE too — a constant updated \
          alone certifies whatever is here"
     );
 }
