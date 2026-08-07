@@ -3028,12 +3028,49 @@ fn assert_every_logged_recid_is_classified<S: Store>(
     }
 }
 
-/// A fresh per-process scratch directory for one test.
-pub fn session_dir(tag: &str) -> PathBuf {
+/// A scratch directory that removes itself, INCLUDING when the test panics.
+///
+/// The cleanup is a `Drop` and not a line at the end of each test, because a
+/// line at the end of each test is exactly what a panic skips — and this suite's
+/// mutation campaign makes every case panic on purpose, as does every
+/// `assert_refused` in the batteries. Measured the hard way: three campaign runs
+/// left **53,141** session directories in a 61 GB tmpfs and filled it, which
+/// stopped being a tidiness question and became an outage that took the shell
+/// down with it.
+///
+/// `Drop` runs during unwinding, so the guard cleans up on the panicking path
+/// and the normal one alike. A test that wants the directory kept for diagnosis
+/// can `std::mem::forget` it, which is a deliberate act and reads as one. The
+/// explicit `remove_dir_all` at the end of each test is left where it stands:
+/// it is now an early release rather than the only one, and deleting it would
+/// be removing a line that is correct.
+pub struct Session(PathBuf);
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for Session {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Session {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// A fresh per-process scratch directory for one test, removed when it drops.
+pub fn session_dir(tag: &str) -> Session {
     let d = std::env::temp_dir().join(format!("mapdb5_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("create session dir");
-    d
+    Session(d)
 }
 
 /// Asserts `f` REFUSES its input, and that the refusal carries a message.

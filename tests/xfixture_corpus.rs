@@ -182,7 +182,7 @@ use xfix::red_of;
 /// failures read as engine defects ("input x is gone and no post row says
 /// so"), which is a good reminder that a harness bug wears the harness's own
 /// vocabulary.
-fn fresh_session(tag: &str) -> PathBuf {
+fn fresh_session(tag: &str) -> xfix::Session {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     xfix::session_dir(&format!("{tag}_{}", SEQ.fetch_add(1, Ordering::SeqCst)))
 }
