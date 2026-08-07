@@ -2312,11 +2312,13 @@ impl<'a> Cells<'a> {
             Dispatch::ByManifest => e.opener.as_str(),
         };
         let target = cell.join(&e.open_arg);
+        // The cell's OWN refusal, on a reject cell. `None` on an accept cell,
+        // where there is none and the reopen row (Q8's) is graded alone.
+        let mut first_refusal: Option<DbError> = None;
         match e.verdict.as_str() {
             "accept" => self.run_accept(&ctx, e, opener, &target, open, &mut owed),
-            // A `reject` cell asserts that the open FAILED, and this line still
-            // does not assert WHICH failure — but since C5t that is no longer
-            // the whole story, and the difference is plan §3.12's point.
+            // A `reject` cell asserts that the open FAILED. Since C5t it can
+            // also assert WHICH failure, and that is plan §3.12's point.
             //
             // C5r measured the families: this engine's reject cells refuse as
             // corruption verdicts except `div-wal3-lsn-exhausted`, which is
@@ -2325,19 +2327,34 @@ impl<'a> Cells<'a> {
             // family"*. The v2 `expect` row still has no column to carry a
             // family. What it has now is a `reopen` row per eligible reject
             // arm, derived in `catalogue.py` from the family already pinned
-            // there; `assert_reopen` below opens the same tree again and hands
-            // the family to `assert_family`. So the family reaches this engine,
-            // and the refusal is additionally graded as STABLE — a store that
-            // refuses once and opens on the retry now fails, and passed before.
+            // there, and the family is graded HERE, on this arm's own refusal.
+            // `assert_reopen` then opens again and grades the same family a
+            // second time, which is the STABILITY half — a store that refuses
+            // once and opens on the retry now fails, and passed before.
             //
-            // What is NOT covered: the eleven WAL-recovery families outside
+            // Grading here rather than only on the reopen is codex round 1
+            // finding 2: the reopen is a WRITABLE open, so every `mode=ro` row
+            // was graded on a retry in the other mode, and a store that refuses
+            // read-only for one reason and writable for another passed. The arm
+            // the corpus names is this one.
+            //
+            // What is NOT covered: the thirteen families outside
             // `catalogue.REOPEN_FAMILIES`, still graded by "it refused" alone.
             // That is L15's remainder and its owner is C8.
+            //
+            // The refusal is HELD rather than graded here. `assert_reopen`
+            // grades it, after the capture and the post-state rules, because
+            // §3.11's mutant — the direct cell dispatched to the wal3 opener —
+            // trips both this family check and the post-row rule it was written
+            // to prove, and lesson (h) says such an input measures whichever
+            // fires first. Grading here made §3.11's mutant report the family,
+            // and §3.11's own rule went unmeasured.
             "reject" => {
-                let refusal = refusal_of(&ctx, opener, &e.mode, &target, open);
-                if refusal.is_none() {
-                    panic!("[{ctx}] expected a refusal, but the store opened");
-                }
+                first_refusal = Some(
+                    refusal_of(&ctx, opener, &e.mode, &target, open).unwrap_or_else(|| {
+                        panic!("[{ctx}] expected a refusal, but the store opened")
+                    }),
+                );
             }
             v => panic!("[{ctx}] unsupported verdict {v}"),
         }
@@ -2372,7 +2389,15 @@ impl<'a> Cells<'a> {
             &ctx,
             &mut owed,
         );
-        assert_reopen(m, e, opener, &target, &ctx, &mut owed);
+        assert_reopen(
+            m,
+            e,
+            opener,
+            &target,
+            &ctx,
+            &mut owed,
+            first_refusal.as_ref(),
+        );
         owed.require_all_consumed();
     }
 
@@ -2549,9 +2574,24 @@ fn assert_reopen(
     target: &Path,
     ctx: &str,
     owed: &mut Consumption,
+    first: Option<&DbError>,
 ) {
     for r in m.reopens_of(&e.fixture, ENGINE, &e.mode) {
         let where_ = format!("{ctx} reopen[{}]", r.family);
+        // THE CELL'S OWN REFUSAL FIRST, where there was one. C5t's first draft
+        // graded the family on the reopen alone and threw the first refusal
+        // away; codex round 1 finding 2 is why it does not. The reopen is a
+        // WRITABLE open whatever the cell's mode was, so every `mode=ro` row was
+        // graded on a retry in the OTHER mode — a store that refuses read-only
+        // for one reason and writable for another passed, and so did a stateful
+        // one that got it wrong once and right on retry. The arm the corpus
+        // names is the first open; the second is the stability check.
+        //
+        // On an ACCEPT cell — Q8 — `first` is None and the reopen is the only
+        // grading there is, because the cell's own open succeeded.
+        if let Some(f) = first {
+            assert_family(&format!("{ctx} family[{}]", r.family), &r.family, f);
+        }
         // A reopen is a WRITABLE open whatever the cell's own mode was: the
         // claim is that the store is permanently unopenable, and a read-only
         // probe would be a weaker one.
@@ -2575,18 +2615,32 @@ fn assert_reopen(
 /// catalogue names separately and which this predicate must therefore refuse: a
 /// D1 arm satisfied by an N6 refusal is a family column that cannot tell the
 /// ports' upgrade-safety boundary from Java's own row.
+///
+/// **The PATH is opaque.** The first draft split on the first `": "` after
+/// `" present at "` and called what preceded it the path, which makes a legal
+/// Unix path containing `": "` fail the predicate on a genuine refusal (codex
+/// round 1 finding 6). The fixed text is stripped from both ends instead and
+/// whatever is left is the path, whatever it contains. `" present at "` is part
+/// of the exact prefix for the same reason.
 fn d1_matches(msg: &str) -> bool {
-    let Some((what, rest)) = msg.split_once(" present at ") else {
+    const TAIL: &str = ": no migration to v3 — open it with the release that wrote it and copy \
+                        the data across, or move it aside";
+    let Some(head) = msg.strip_suffix(TAIL) else {
         return false;
     };
-    let Some((_path, tail)) = rest.split_once(": ") else {
-        return false;
-    };
-    (what == "regular file at the WAL base path (the v3 opener takes a base, not a log file)"
-        || what == "v1 checkpoint temp, possibly the only recoverable copy after a v1 crash")
-        && tail
-            == "no migration to v3 — open it with the release that wrote it and copy the data \
-                across, or move it aside"
+    for what in [
+        "regular file at the WAL base path (the v3 opener takes a base, not a log file)",
+        "v1 checkpoint temp, possibly the only recoverable copy after a v1 crash",
+    ] {
+        // A non-empty remainder: the row always names a path, and an empty one
+        // would mean the message ended where the path should start.
+        if let Some(path) = head.strip_prefix(&format!("{what} present at ")) {
+            if !path.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// S2 is the section-header `lsn <= seg.last_lsn` rule, wrapped by the WAL
@@ -2665,10 +2719,22 @@ pub fn assert_family(where_: &str, family: &str, t: &DbError) {
         // The UNREFINED corruption family: what the two divergent entry cells
         // land on, where the catalogue names no rule. Stated as an exclusion
         // because that is what it means — a corruption verdict no refined family
-        // in this corpus describes. `S2` is deliberately NOT excluded: it is a
-        // strict refinement of this family rather than a neighbour of it, so a
-        // predicate that refused it would be asserting something about a
-        // different rule.
+        // this corpus TRANSPORTS describes.
+        //
+        // **`S2` is excluded, and the first draft did not exclude it.** The
+        // argument for admitting it was that S2 is a strict refinement of this
+        // family rather than a neighbour, so refusing it would assert something
+        // about a different rule. codex round 1 finding 4 is the answer: a
+        // manifest row names ONE family, so with S2 admitted a divergent-entry
+        // cell that wrongly refused with the S2 rule still graded green, and the
+        // transport check the whole slice exists for is not exact. A refinement
+        // that another row can name is a neighbour here, whatever it is in the
+        // taxonomy.
+        //
+        // N6 is NOT excluded, and that is the same rule read the other way: no
+        // manifest row can name it (`REOPEN_FAMILIES` does not transport it), so
+        // nothing else claims that refusal and this family is where it belongs.
+        // If C8 transports N6, it must be excluded here on the day it is.
         let msg = match t {
             DbError::DataCorruption(c) => c.to_string(),
             _ => String::new(),
@@ -2676,8 +2742,9 @@ pub fn assert_family(where_: &str, family: &str, t: &DbError) {
         assert!(
             matches!(t, DbError::DataCorruption(_))
                 && !d1_matches(&msg)
+                && !s2_matches(&msg)
                 && msg != "not a MapDB StoreDirect file (bad magic)",
-            "{where_}: `DataCorruption` is a corruption verdict no refined family \
+            "{where_}: `DataCorruption` is a corruption verdict no TRANSPORTED refined family \
              names, and this is: {t}"
         );
         return;

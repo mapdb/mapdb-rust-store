@@ -21,8 +21,12 @@
 //!
 //! **`reopen` IS addressed to rust, and C5t is what changed that** (plan §3.12).
 //! Every eligible reject arm now carries one, derived in `catalogue.py` from the
-//! error family already pinned there — `D1` for the bare-base cell, `direct-magic`
-//! for the direct one, `StoreFull` for Q8's port arms — so this engine grades
+//! error family already pinned there. THIS ROOT carries three of the five
+//! families `catalogue.REOPEN_FAMILIES` transports — `D1` for the bare-base
+//! cell, `direct-magic` for the direct one, `StoreFull` for Q8's port arms; the
+//! other two, `DataCorruption` and `S2`, reach cells this root does not hold and
+//! are graded by the same `assert_family` when the frozen corpus is staged. So
+//! this engine grades
 //! WHICH failure a reject cell produced and that the refusal is STABLE. Until
 //! then the reject arm could only assert that the open failed, and a store that
 //! refused Q8 because a bug made it refuse everything passed. The sentence above
@@ -649,6 +653,33 @@ fn the_reopen_row_is_graded() {
     );
 }
 
+/// On a REJECT cell the family is graded on the cell's OWN refusal, before the
+/// reopen.
+///
+/// codex round 1 finding 2: C5t's first draft graded the family only on the
+/// reopen, which is a WRITABLE open whatever the cell's mode was. Every
+/// `mode=ro` row was therefore graded by a retry in the other mode, and a store
+/// that refuses read-only for one reason and writable for another passed.
+///
+/// **The corpus alone cannot show the fix.** Both opens of a conforming store
+/// refuse the same way, so deleting the first grading leaves the reopen's — same
+/// family, same predicate, gate green. What separates them is WHERE the red
+/// comes from: this doctored family reds at `family[..]` if the cell's own
+/// refusal was graded and at `reopen[..]` if only the second open was. Asserting
+/// the prefix is what makes the deletion visible.
+#[test]
+fn the_reject_arms_own_refusal_is_graded() {
+    const PFX: &str = "reopen\treject-wal3-d1-barebase\trust\trw\t";
+    let doctored_m = doctored(|t| format!("{}{PFX}R4-floor\n", drop_rows(t, PFX)));
+    refuses_cell(
+        "a reject arm whose own refusal is graded by nothing",
+        &doctored_m,
+        "reject-wal3-d1-barebase",
+        "rw",
+        "family[R4-floor]: error family R4-floor has no predicate in this engine",
+    );
+}
+
 /// The `reopen` family predicate must DISCRIMINATE, which no corpus can show.
 ///
 /// A predicate that accepted any corruption at all would pass every cell —
@@ -738,11 +769,8 @@ fn the_reopen_family_predicate_discriminates() {
     // cell is stated rather than derived, because a matrix with one quietly
     // wrong entry reads exactly like a correct one.
     //
-    // Two entries are not the identity and both are deliberate:
+    // ONE entry is not the identity, and it is deliberate:
     //
-    //   * `DataCorruption` accepts the S2 sample. S2 is a strict REFINEMENT of
-    //     it, not a neighbour, and a predicate that refused it would be
-    //     asserting something about a different rule.
     //   * `DataCorruption` accepts the N6 sample. N6 is a family the catalogue
     //     names and `REOPEN_FAMILIES` does not transport, so no manifest row can
     //     present it — the sample is here for the row BELOW it, which is the
@@ -752,7 +780,7 @@ fn the_reopen_family_predicate_discriminates() {
     //     confuse the ports' upgrade boundary with Java's own row.
     let migrate = "no migration to v3 — open it with the release that wrote it and copy the \
                    data across, or move it aside";
-    let samples: [(&str, DbError); 6] = [
+    let samples: [(&str, DbError); 7] = [
         (
             "direct",
             DbError::corrupt("not a MapDB StoreDirect file (bad magic)"),
@@ -762,6 +790,18 @@ fn the_reopen_family_predicate_discriminates() {
             DbError::corrupt_msg(format!(
                 "regular file at the WAL base path (the v3 opener takes a base, not a log file) \
              present at /tmp/x: {migrate}"
+            )),
+        ),
+        // The same D1 refusal about a path that contains the delimiter the first
+        // draft of `d1_matches` split on. A legal Unix filename may hold `": "`,
+        // and a predicate that reads the path as "everything up to the first
+        // `: `" refuses a genuine refusal (codex round 1 finding 6). The path is
+        // opaque or the predicate is wrong about which message it grades.
+        (
+            "d1-colon-in-path",
+            DbError::corrupt_msg(format!(
+                "regular file at the WAL base path (the v3 opener takes a base, not a log file) \
+             present at /tmp/od: dd/x: {migrate}"
             )),
         ),
         (
@@ -781,11 +821,14 @@ fn the_reopen_family_predicate_discriminates() {
         ("full", DbError::StoreFull),
     ];
     for (family, accepts) in [
-        ("direct-magic", "ynnnnn"),
-        ("D1", "nynnnn"),
-        ("DataCorruption", "nnyyyn"),
-        ("S2", "nnnnyn"),
-        ("StoreFull", "nnnnny"),
+        ("direct-magic", "ynnnnnn"),
+        ("D1", "nyynnnn"),
+        // "n" for the S2 column since codex round 1 finding 4: over the five
+        // families the corpus TRANSPORTS this matrix is a true diagonal, and the
+        // N6 column is the one extra — a family no manifest row can name.
+        ("DataCorruption", "nnnyynn"),
+        ("S2", "nnnnnyn"),
+        ("StoreFull", "nnnnnny"),
     ] {
         assert_eq!(accepts.len(), samples.len());
         for ((name, e), want) in samples.iter().zip(accepts.chars()) {
