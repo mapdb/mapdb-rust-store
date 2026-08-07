@@ -2672,18 +2672,24 @@ fn d1_matches(msg: &str) -> bool {
 /// text.
 fn s2_matches(msg: &str) -> bool {
     // `WAL segment <name>: section LSN <n> at offset <n> does not follow <n>`
+    //
+    // The NAME is opaque, for the reason `d1_matches` says at length: a legal
+    // segment filename may contain `": "`, and a predicate that reads the name
+    // as "everything up to the first `: `" refuses a genuine refusal about one.
+    // The first draft split there AND forbade a colon outright, which is the
+    // same mistake stated twice; codex round 2 found it after round 1 found it
+    // in the D1 predicate. The rest of the sentence is fixed, so the name is
+    // whatever lies between the fixed prefix and the next fixed marker — found
+    // from the RIGHT, so only the last such marker can end the name.
     let Some(rest) = msg.strip_prefix("WAL segment ") else {
         return false;
     };
-    let Some((name, rest)) = rest.split_once(": ") else {
+    let Some((name, rest)) = rest.rsplit_once(": section LSN ") else {
         return false;
     };
-    if name.is_empty() || name.contains(':') {
+    if name.is_empty() {
         return false;
     }
-    let Some(rest) = rest.strip_prefix("section LSN ") else {
-        return false;
-    };
     let Some((lsn, rest)) = rest.split_once(" at offset ") else {
         return false;
     };

@@ -95,6 +95,14 @@
 //! - the `v2-core` profile assertion in `run_v2_cells`. The static sample
 //!   carries no oracle row, so no input reaches it; it exists for the day one
 //!   appears.
+//! - **the REOPEN's `assert_family` call** (`familycall`, which was a case until
+//!   C5t). Round 1's finding 2 moved the family grading onto the reject arm's
+//!   OWN refusal and kept the reopen's as the STABILITY check; for any store
+//!   that refuses the same way twice — every conforming one — the two see the
+//!   same family, so deleting the second is invisible. The claim it carries is
+//!   one no conforming implementation can falsify. **It is a trade, not an
+//!   oversight**: before it, every `mode=ro` row's family was graded by a
+//!   WRITABLE retry and so was never graded at all.
 //! - `capture`'s "not a regular file" assertion. Not a leaf but SUBSUMED:
 //!   deleting it leaves `read_named` failing on the same input with a worse
 //!   message, so what the assertion buys is the diagnosis, not the refusal.
@@ -780,7 +788,7 @@ fn the_reopen_family_predicate_discriminates() {
     //     confuse the ports' upgrade boundary with Java's own row.
     let migrate = "no migration to v3 — open it with the release that wrote it and copy the \
                    data across, or move it aside";
-    let samples: [(&str, DbError); 7] = [
+    let samples: [(&str, DbError); 8] = [
         (
             "direct",
             DbError::corrupt("not a MapDB StoreDirect file (bad magic)"),
@@ -818,17 +826,28 @@ fn the_reopen_family_predicate_discriminates() {
             "s2",
             DbError::corrupt("WAL segment x.wal.4: section LSN -1 at offset 187 does not follow 9"),
         ),
+        // The same S2 refusal about a segment whose NAME contains the delimiter
+        // the first draft split on — and which it separately forbade outright.
+        // codex round 2, the same defect round 1 found in `d1_matches`: a legal
+        // filename may hold `": "`, and a predicate that reads the name as
+        // "everything up to the first `: `" refuses a genuine refusal.
+        (
+            "s2-colon-in-name",
+            DbError::corrupt(
+                "WAL segment od: dd/x.wal.4: section LSN -1 at offset 187 does not follow 9",
+            ),
+        ),
         ("full", DbError::StoreFull),
     ];
     for (family, accepts) in [
-        ("direct-magic", "ynnnnnn"),
-        ("D1", "nyynnnn"),
+        ("direct-magic", "ynnnnnnn"),
+        ("D1", "nyynnnnn"),
         // "n" for the S2 column since codex round 1 finding 4: over the five
         // families the corpus TRANSPORTS this matrix is a true diagonal, and the
         // N6 column is the one extra — a family no manifest row can name.
-        ("DataCorruption", "nnnyynn"),
-        ("S2", "nnnnnyn"),
-        ("StoreFull", "nnnnnny"),
+        ("DataCorruption", "nnnyynnn"),
+        ("S2", "nnnnnyyn"),
+        ("StoreFull", "nnnnnnny"),
     ] {
         assert_eq!(accepts.len(), samples.len());
         for ((name, e), want) in samples.iter().zip(accepts.chars()) {
