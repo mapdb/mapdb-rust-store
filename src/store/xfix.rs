@@ -2470,16 +2470,37 @@ impl<'a> Cells<'a> {
             .posts_of(&e.fixture, ENGINE, &e.mode)
             .iter()
             .any(|p| matches!(p.verb.as_str(), "modified" | "truncated" | "deleted"));
+        // A DIVERGENCE: another engine reaches a different verdict on this same
+        // fixture and mode. Read from `expect` rows the manifest already holds —
+        // the divergence needs no column of its own, because it IS the
+        // disagreement between two rows that are both already there.
+        //
+        // The staged run found this arm, on the next cell of the same shape once
+        // the `mutation_claimed` arm let it get that far — lesson (h) at corpus
+        // scale. `div-wal3-entry-recid0` carries only the universal `x.lock`
+        // post row, and the catalogue says why: java's behaviour on it is
+        // UNDEFINED (`recidToOffset` computes `recid - 1`) and pinning a logical
+        // state there would freeze an accident. The claim is the verdict itself,
+        // and it is graded — an engine that changed its mind fails the `expect`
+        // row. Demanding more of a `div-` cell means demanding that undefined
+        // reference behaviour become contract.
+        let divergent = m.expects.iter().any(|o| {
+            o.fixture == e.fixture
+                && o.mode == e.mode
+                && o.engine != ENGINE
+                && o.verdict != e.verdict
+        });
         let any = has_recids
             || !m.actions_of(&e.fixture, ENGINE, &e.mode).is_empty()
             || !m.reopens_of(&e.fixture, ENGINE, &e.mode).is_empty()
             || e.mode == "ro"
-            || mutation_claimed;
+            || mutation_claimed
+            || divergent;
         assert!(
             any,
             "[{ctx}] an accept cell with no recid rows, no action, no reopen, no post row claiming \
-             a change and a writable handle asserts nothing about the store it opened, which is \
-             not a check"
+             a change, no engine disagreeing about the verdict and a writable handle asserts \
+             nothing about the store it opened, which is not a check"
         );
     }
 
