@@ -1030,6 +1030,35 @@ fn an_accept_cell_that_asserts_nothing_is_refused() {
     // the claim. That half runs in `src/store/xfix_ro.rs`, which owns the
     // read-only opener; without the pair, "an accept cell must assert
     // something" and "ro is exempt" would be indistinguishable.
+
+    // The MUTATION-CLAIM arm, which no cell in this root exercises: the staged
+    // corpus's torn-tail fixtures carry a `post ... truncated` row and nothing
+    // else, and until the staged run they were graded by a guard that refused
+    // them. Same stripped manifest, with the universal lock row relabelled
+    // `modified` — the guard must let the cell through, and the red must then
+    // come from the POST check, which refuses `modified` on a file that was
+    // never an input. Asserting WHICH red fires is the whole case: delete the
+    // arm and the guard reds first with "asserts nothing".
+    const LOCK: &str = "post\twal3-java-cleaned\trust\trw\tx.lock\tcreated:";
+    refuses_cell(
+        "a writable accept cell whose only oracle is a mutation claim",
+        &doctored(|t| {
+            drop_rows(t, "recid\twal3-java-cleaned\t")
+                .lines()
+                .map(|l| {
+                    if l.starts_with(LOCK) {
+                        l.replace("\tcreated:", "\tmodified:")
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "wal3-java-cleaned",
+        "rw",
+        "names a file that was not an input",
+    );
 }
 
 /// A wal3 cell with no `post` rows asserts nothing about the directory it

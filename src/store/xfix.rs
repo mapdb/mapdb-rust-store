@@ -2449,18 +2449,37 @@ impl<'a> Cells<'a> {
     ///
     /// The disjunction admits every cell either root has: recid rows, an
     /// `action` row whose result a post oracle grades, a `reopen` row whose
-    /// claim is the store's permanent unopenability, or `mode == ro`, where the
-    /// read-only write refusal below is the executable claim.
+    /// claim is the store's permanent unopenability, `mode == ro`, where the
+    /// read-only write refusal below is the executable claim, or a `post` row
+    /// that says the open CHANGED the tree.
+    ///
+    /// **The staged run found that last arm**, and no preflight root could
+    /// have: `mut-wal3-torn-tail` carries no recid row, no action and no reopen,
+    /// and what it asserts is a post state — the tail truncated to the last
+    /// valid section end. A byte-exact statement of what recovery left behind is
+    /// an assertion about the store, not an absence of one.
+    ///
+    /// `created` and `unchanged` are deliberately NOT in it. Every wal3 cell
+    /// carries the universal `x.lock created` row, so admitting `created` would
+    /// make the guard vacuous — it would admit the very cell the doctored proof
+    /// above uses. `unchanged` is the two-sided rule's default statement and
+    /// asserts that the open did nothing.
     fn require_some_oracle(&self, ctx: &str, e: &V2Expect, has_recids: bool) {
         let m = &self.sample.manifest;
+        let mutation_claimed = m
+            .posts_of(&e.fixture, ENGINE, &e.mode)
+            .iter()
+            .any(|p| matches!(p.verb.as_str(), "modified" | "truncated" | "deleted"));
         let any = has_recids
             || !m.actions_of(&e.fixture, ENGINE, &e.mode).is_empty()
             || !m.reopens_of(&e.fixture, ENGINE, &e.mode).is_empty()
-            || e.mode == "ro";
+            || e.mode == "ro"
+            || mutation_claimed;
         assert!(
             any,
-            "[{ctx}] an accept cell with no recid rows, no action, no reopen and a writable handle \
-             asserts nothing about the store it opened, which is not a check"
+            "[{ctx}] an accept cell with no recid rows, no action, no reopen, no post row claiming \
+             a change and a writable handle asserts nothing about the store it opened, which is \
+             not a check"
         );
     }
 
