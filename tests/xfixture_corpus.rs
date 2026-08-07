@@ -11,13 +11,24 @@
 //!
 //! # What this engine executes, and what it accounts for
 //!
-//! **The corpus addresses no `action`, `bytes` or `reopen` row to rust**, and
-//! that is a property of the format rather than an oversight: `Cell.actions`,
-//! `Cell.byte_assertions` and `Cell.reopen` exist on exactly one cell and are
-//! keyed `("java", "rw")`. Revision 3 of the C5 plan claimed all three engines
+//! **The corpus addresses no `action` or `bytes` row to rust**, and that is a
+//! property of the format rather than an oversight: `Cell.actions` and
+//! `Cell.byte_assertions` exist on exactly one cell and are keyed
+//! `("java", "rw")`. Revision 3 of the C5 plan claimed all three engines
 //! execute them and both round-3 reviewers found the claim had an empty input
 //! column for two engines. Manufacturing a port-addressed assertion in the
 //! corpus to fix that would be fixture theatre.
+//!
+//! **`reopen` IS addressed to rust, and C5t is what changed that** (plan §3.12).
+//! Every eligible reject arm now carries one, derived in `catalogue.py` from the
+//! error family already pinned there — `D1` for the bare-base cell, `direct-magic`
+//! for the direct one, `StoreFull` for Q8's port arms — so this engine grades
+//! WHICH failure a reject cell produced and that the refusal is STABLE. Until
+//! then the reject arm could only assert that the open failed, and a store that
+//! refused Q8 because a bug made it refuse everything passed. The sentence above
+//! said "or `reopen`" for three slices; it was true when written and C5t made it
+//! false, which is why it is corrected here rather than left to a reader to
+//! notice.
 //!
 //! So plan §5.3 item 2 splits the flip: rust **accepts and accounts**, and its
 //! execution paths get their inputs from SYNTHETIC manifests here — where a row
@@ -620,9 +631,7 @@ const ACTION_BYTES_WRONG: &str = "000000000000000c";
 #[test]
 fn the_reopen_row_is_graded() {
     const PFX: &str = "reopen\tdiv-wal3-lsn-exhausted\trust\trw\t";
-    let with = |family: &str| {
-        doctored(|t| format!("{}{PFX}{family}\n", drop_rows(t, PFX)))
-    };
+    let with = |family: &str| doctored(|t| format!("{}{PFX}{family}\n", drop_rows(t, PFX)));
     run_one(&with("StoreFull"), "div-wal3-lsn-exhausted", "rw");
     refuses_cell(
         "a reopen family this engine implements but this refusal is not",
@@ -744,16 +753,31 @@ fn the_reopen_family_predicate_discriminates() {
     let migrate = "no migration to v3 — open it with the release that wrote it and copy the \
                    data across, or move it aside";
     let samples: [(&str, DbError); 6] = [
-        ("direct", DbError::corrupt("not a MapDB StoreDirect file (bad magic)")),
-        ("d1", DbError::corrupt_msg(format!(
-            "regular file at the WAL base path (the v3 opener takes a base, not a log file) \
-             present at /tmp/x: {migrate}"))),
-        ("n6", DbError::corrupt_msg(format!(
-            "v1 single-file WAL present at /tmp/x.wal: {migrate}"))),
-        ("corrupt", DbError::corrupt(
-            "WAL segment x.wal.4: entry references the reserved recid 0")),
-        ("s2", DbError::corrupt(
-            "WAL segment x.wal.4: section LSN -1 at offset 187 does not follow 9")),
+        (
+            "direct",
+            DbError::corrupt("not a MapDB StoreDirect file (bad magic)"),
+        ),
+        (
+            "d1",
+            DbError::corrupt_msg(format!(
+                "regular file at the WAL base path (the v3 opener takes a base, not a log file) \
+             present at /tmp/x: {migrate}"
+            )),
+        ),
+        (
+            "n6",
+            DbError::corrupt_msg(format!(
+                "v1 single-file WAL present at /tmp/x.wal: {migrate}"
+            )),
+        ),
+        (
+            "corrupt",
+            DbError::corrupt("WAL segment x.wal.4: entry references the reserved recid 0"),
+        ),
+        (
+            "s2",
+            DbError::corrupt("WAL segment x.wal.4: section LSN -1 at offset 187 does not follow 9"),
+        ),
         ("full", DbError::StoreFull),
     ];
     for (family, accepts) in [
@@ -769,9 +793,16 @@ fn the_reopen_family_predicate_discriminates() {
             if want == 'y' {
                 xfix::assert_family(&what, family, e);
             } else {
-                let e = std::panic::AssertUnwindSafe(e.clone());
+                // The BORROW is what crosses the unwind boundary, because
+                // `DbError` is deliberately not `Clone` — the matrix owns every
+                // sample for the whole loop, so a reference is all this needs.
+                // The CLOSURE is asserted unwind-safe, not the sample: `DbError`
+                // is deliberately not `Clone`, so the matrix owns every sample
+                // for the whole loop and each probe borrows one.
+                let probe =
+                    std::panic::AssertUnwindSafe(move || xfix::assert_family("probe", family, e));
                 assert!(
-                    red_of(move || xfix::assert_family("probe", family, &e)).is_some(),
+                    red_of(probe).is_some(),
                     "the family predicate accepted {what}"
                 );
             }
