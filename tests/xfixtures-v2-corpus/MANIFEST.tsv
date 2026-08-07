@@ -1,5 +1,5 @@
 version	2
-fixture	wal3-java-cleaned	wal3-namespace	java	d837f0e
+fixture	wal3-java-cleaned	wal3-namespace	java	b04c181
 file	wal3-java-cleaned	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	wal3-java-cleaned	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
 file	wal3-java-cleaned	x.wal.0000000000000004	186	a22f0cea9b149172d8377916bd7b90d9632bba6163cf2c334461cac10d1771fb	f06d380adc82546c4abdfc74d20e3411f832fbc7bb92249ef1aab3aae028ea4a
@@ -27,7 +27,7 @@ recid	wal3-java-cleaned	C	3	null	113	40
 recid	wal3-java-cleaned	D	4	prealloc	0	0
 recid	wal3-java-cleaned	E	5	deleted	114	256
 recid	wal3-java-cleaned	F	6	live	115	1200000
-fixture	reject-wal3-d1-barebase	reject	derived	ff6d67e
+fixture	reject-wal3-d1-barebase	reject	derived	1585290
 derived	reject-wal3-d1-barebase	wal3-java-cleaned	1	reject-wal3-d1-barebase
 file	reject-wal3-d1-barebase	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-d1-barebase	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -45,7 +45,11 @@ post	reject-wal3-d1-barebase	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c899
 post	reject-wal3-d1-barebase	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-d1-barebase	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-d1-barebase	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-fixture	reject-wal3-segment-at-direct	reject	derived	ff6d67e
+reopen	reject-wal3-d1-barebase	rust	ro	D1
+reopen	reject-wal3-d1-barebase	rust	rw	D1
+reopen	reject-wal3-d1-barebase	zig	ro	D1
+reopen	reject-wal3-d1-barebase	zig	rw	D1
+fixture	reject-wal3-segment-at-direct	reject	derived	1585290
 derived	reject-wal3-segment-at-direct	wal3-java-cleaned	1	reject-wal3-segment-at-direct
 file	reject-wal3-segment-at-direct	x	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 applies	reject-wal3-segment-at-direct	java	rw
@@ -55,7 +59,10 @@ expect	reject-wal3-segment-at-direct	rust	rw	reject	direct	x
 applies	reject-wal3-segment-at-direct	zig	rw
 expect	reject-wal3-segment-at-direct	zig	rw	reject	direct	x
 post	reject-wal3-segment-at-direct	java	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-fixture	div-wal3-lsn-exhausted	wal3-namespace	derived	ff6d67e
+reopen	reject-wal3-segment-at-direct	java	rw	direct-magic
+reopen	reject-wal3-segment-at-direct	rust	rw	direct-magic
+reopen	reject-wal3-segment-at-direct	zig	rw	direct-magic
+fixture	div-wal3-lsn-exhausted	wal3-namespace	derived	1585290
 derived	div-wal3-lsn-exhausted	wal3-java-cleaned	1	div-wal3-lsn-exhausted
 file	div-wal3-lsn-exhausted	x.wal.0000000000000002	1200509	1f859eb7e4fb9fdf0da45e138f816c717ebedb062e99b8a7709292ffcef8fcbd	51af9439e14909e6754d942df07e091b5fa2e187f4ea8c0c3689ec5909cc92da
 file	div-wal3-lsn-exhausted	x.wal.0000000000000003	65863	d7ff624112b6b14ffb4b6518f84b9a631874736ca368b8bdf1d62d24c716b55f	df394b6ce267b8c8ad2a875b070b1ac5a02788768a3741c4399c8f7c84977e3e
@@ -82,6 +89,10 @@ post	div-wal3-lsn-exhausted	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996f
 action	div-wal3-lsn-exhausted	java	rw	commit_one_record	op=put,payload_id=161,payload_len=64,recid_label=Q,serializer=raw
 bytes	div-wal3-lsn-exhausted	java	rw	x.wal.0000000000000004	187	8000000000000000
 reopen	div-wal3-lsn-exhausted	java	rw	S2
+reopen	div-wal3-lsn-exhausted	rust	ro	StoreFull
+reopen	div-wal3-lsn-exhausted	rust	rw	StoreFull
+reopen	div-wal3-lsn-exhausted	zig	ro	StoreFull
+reopen	div-wal3-lsn-exhausted	zig	rw	StoreFull
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000002	24	00000000000000039dcecda2	7ffffffffffffff88dfe8c14
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000002	37	0000000000000003	7ffffffffffffff8
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000002	53	c15572533ef0e746	709fd26ca809ca59

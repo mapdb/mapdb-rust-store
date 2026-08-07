@@ -2314,30 +2314,25 @@ impl<'a> Cells<'a> {
         let target = cell.join(&e.open_arg);
         match e.verdict.as_str() {
             "accept" => self.run_accept(&ctx, e, opener, &target, open, &mut owed),
-            // A `reject` cell asserts that the open FAILED. It does not assert
-            // WHICH failure, and that is a transport hole rather than a
-            // widening someone chose here.
+            // A `reject` cell asserts that the open FAILED, and this line still
+            // does not assert WHICH failure — but since C5t that is no longer
+            // the whole story, and the difference is plan §3.12's point.
             //
-            // C5r measured it: this engine's four reject cells refuse in TWO
-            // families. `reject-wal3-d1-barebase` and
-            // `reject-wal3-segment-at-direct` are corruption verdicts;
-            // `div-wal3-lsn-exhausted` is `StoreFull`, and contract §10.1 pins
-            // that — *"rust, zig, rw and ro: reject, error family StoreFull
-            // exactly — not the corruption family"*. The family lives in
-            // `catalogue.Cell.family` and the v2 `expect` row has **no column
-            // to carry it** (L15), so no engine can grade what the catalogue
-            // already knows. Requiring `DataCorruption` here refuses the
-            // corpus; requiring nothing accepts a store that refused Q8 for a
-            // bug reason.
+            // C5r measured the families: this engine's reject cells refuse as
+            // corruption verdicts except `div-wal3-lsn-exhausted`, which is
+            // `StoreFull`, and contract §10.1 pins that — *"rust, zig, rw and
+            // ro: reject, error family StoreFull exactly — not the corruption
+            // family"*. The v2 `expect` row still has no column to carry a
+            // family. What it has now is a `reopen` row per eligible reject
+            // arm, derived in `catalogue.py` from the family already pinned
+            // there; `assert_reopen` below opens the same tree again and hands
+            // the family to `assert_family`. So the family reaches this engine,
+            // and the refusal is additionally graded as STABLE — a store that
+            // refuses once and opens on the retry now fails, and passed before.
             //
-            // The grammar already has the row type that would close it — a
-            // `reopen` row carries a family and a reject cell's reopen refuses
-            // the same way its open did — and adding those rows regenerates the
-            // preflight root and both its seals, which is C5t's to do, not a
-            // reader flip's. **Recorded as an open hole rather than argued
-            // away**; `assert_family` implements both families the corpus
-            // actually produces, so the day the rows arrive there is nothing
-            // else to write.
+            // What is NOT covered: the eleven WAL-recovery families outside
+            // `catalogue.REOPEN_FAMILIES`, still graded by "it refused" alone.
+            // That is L15's remainder and its owner is C8.
             "reject" => {
                 let refusal = refusal_of(&ctx, opener, &e.mode, &target, open);
                 if refusal.is_none() {
@@ -2377,7 +2372,7 @@ impl<'a> Cells<'a> {
             &ctx,
             &mut owed,
         );
-        assert_reopen(m, e, &target, &ctx, open, &mut owed);
+        assert_reopen(m, e, opener, &target, &ctx, &mut owed);
         owed.require_all_consumed();
     }
 
@@ -2550,9 +2545,9 @@ fn assert_bytes_rows(
 fn assert_reopen(
     m: &V2,
     e: &V2Expect,
+    opener: &str,
     target: &Path,
     ctx: &str,
-    _open: &dyn Fn(&Path) -> Result<StoreWAL>,
     owed: &mut Consumption,
 ) {
     for r in m.reopens_of(&e.fixture, ENGINE, &e.mode) {
@@ -2560,11 +2555,38 @@ fn assert_reopen(
         // A reopen is a WRITABLE open whatever the cell's own mode was: the
         // claim is that the store is permanently unopenable, and a read-only
         // probe would be a weaker one.
-        let refusal = refusal_of(&where_, "wal3", "rw", target, &|p| StoreWAL::open(p));
+        //
+        // Through the cell's OWN opener, not a hard-coded `wal3`. Until C5t only
+        // Q8 carried a reopen row and Q8 is a wal3 cell, so the constant was
+        // right by accident; `reject-wal3-segment-at-direct` carries one now,
+        // and sending it to the WAL opener would grade a `direct-magic` family
+        // against a refusal `StoreDirect` never made.
+        let refusal = refusal_of(&where_, opener, "rw", target, &|p| StoreWAL::open(p));
         let t = refusal.unwrap_or_else(|| panic!("{where_}: the store opened again"));
         assert_family(&where_, &r.family, &t);
         owed.consume(&format!("reopen {}", r.family), r);
     }
+}
+
+/// D1 is the legacy boundary — a v1 artifact sitting where the v3 opener expects
+/// a base — and `wal_segments.rs` refuses it with one sentence per row.
+///
+/// TWO of the three rows, not three. The `.wal` row is family **N6**, which the
+/// catalogue names separately and which this predicate must therefore refuse: a
+/// D1 arm satisfied by an N6 refusal is a family column that cannot tell the
+/// ports' upgrade-safety boundary from Java's own row.
+fn d1_matches(msg: &str) -> bool {
+    let Some((what, rest)) = msg.split_once(" present at ") else {
+        return false;
+    };
+    let Some((_path, tail)) = rest.split_once(": ") else {
+        return false;
+    };
+    (what == "regular file at the WAL base path (the v3 opener takes a base, not a log file)"
+        || what == "v1 checkpoint temp, possibly the only recoverable copy after a v1 crash")
+        && tail
+            == "no migration to v3 — open it with the release that wrote it and copy the data \
+                across, or move it aside"
 }
 
 /// S2 is the section-header `lsn <= seg.last_lsn` rule, wrapped by the WAL
@@ -2609,7 +2631,57 @@ fn s2_matches(msg: &str) -> bool {
 /// this file happens to agree with. A family this engine has no predicate for
 /// is a **failure**: the alternative is a green cell whose reopen was checked
 /// by nothing.
+///
+/// **The three families C5t brought here are separated by their MESSAGE**, which
+/// is the mirror of how zig separates them. That port's `DbError` carries no
+/// payload, so it reads a typed `Diag` and tells `D1` from `DataCorruption` by
+/// whether recovery ran at all — a structural test. Here the payload IS the
+/// diagnosis and there is no channel saying who produced it, so `DataCorruption`
+/// has to be stated as "a corruption verdict that is none of the refined
+/// families this engine names". Same partition, expressed with what each engine
+/// has; neither is the other's oversight.
 pub fn assert_family(where_: &str, family: &str, t: &DbError) {
+    if family == "direct-magic" {
+        // `StoreDirect::open_file`'s first refusal, matched whole. This is the
+        // only cell in the corpus dispatched through the direct opener, so an
+        // engine that sent it to the WAL opener by mistake refuses as `D1`
+        // instead — the substitution `direct_cell_through_wal_opener` makes, and
+        // the reason this predicate must not settle for "some corruption".
+        assert!(
+            matches!(t, DbError::DataCorruption(c)
+                     if c.to_string() == "not a MapDB StoreDirect file (bad magic)"),
+            "{where_}: `direct-magic` is StoreDirect's bad-magic refusal, and this is: {t}"
+        );
+        return;
+    }
+    if family == "D1" {
+        assert!(
+            matches!(t, DbError::DataCorruption(c) if d1_matches(&c.to_string())),
+            "{where_}: `D1` is the legacy-boundary refusal, and this is: {t}"
+        );
+        return;
+    }
+    if family == "DataCorruption" {
+        // The UNREFINED corruption family: what the two divergent entry cells
+        // land on, where the catalogue names no rule. Stated as an exclusion
+        // because that is what it means — a corruption verdict no refined family
+        // in this corpus describes. `S2` is deliberately NOT excluded: it is a
+        // strict refinement of this family rather than a neighbour of it, so a
+        // predicate that refused it would be asserting something about a
+        // different rule.
+        let msg = match t {
+            DbError::DataCorruption(c) => c.to_string(),
+            _ => String::new(),
+        };
+        assert!(
+            matches!(t, DbError::DataCorruption(_))
+                && !d1_matches(&msg)
+                && msg != "not a MapDB StoreDirect file (bad magic)",
+            "{where_}: `DataCorruption` is a corruption verdict no refined family \
+             names, and this is: {t}"
+        );
+        return;
+    }
     if family == "S2" {
         // ONE statement for a claim with two halves: the refusal is a
         // corruption verdict AND its payload is the S2 rule's message. The

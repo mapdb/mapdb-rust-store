@@ -170,7 +170,7 @@ fn fresh_session(tag: &str) -> PathBuf {
 ///
 /// Regenerate with `python3 todo/store-cross/freeze_v2.py --preflight
 /// --dist-seals`.
-pub const DIST_SEAL: &str = "6eb39e86807c4775f87096de296798ce24d2ae00e34e7187c3935a13582f8fec";
+pub const DIST_SEAL: &str = "83260fc8819b979de0c50a236a0e82f362e5d48e0c40a60990e14f03a85109e0";
 
 fn open_rw(base: &Path) -> mapdb_rust_store::error::Result<StoreWAL> {
     StoreWAL::open(base)
@@ -597,9 +597,16 @@ const ACTION_BYTES_WRONG: &str = "000000000000000c";
 /// reopen of the same directory refuses the same way, so the row has a real
 /// input. The family is `StoreFull` — contract §10.1 pins it, *"rust, zig, rw
 /// and ro: reject, error family StoreFull exactly — not the corruption
-/// family"* — which makes this the one place in this engine where a `reject`
-/// cell's family is graded at all. The `expect` row has no column for it (see
-/// `run_cell`'s reject arm).
+/// family"*.
+///
+/// **C5t made the positive case real.** Until then the corpus addressed no
+/// reopen row to rust and this test's manifest was the only input the handler
+/// ever had; plan §3.12's derived rows mean the checked-in corpus now carries
+/// that exact line, so the first case below re-states what `corpus_rw_cells_
+/// conform` already runs. It is kept as the control the two negatives are
+/// measured against, and the row is REPLACED rather than appended — a second
+/// copy is a duplicate the parser refuses, which would grade the negatives for
+/// the wrong reason.
 ///
 /// Three inputs, because a family predicate with one member cannot be shown to
 /// READ the row:
@@ -612,22 +619,21 @@ const ACTION_BYTES_WRONG: &str = "000000000000000c";
 ///   failure rather than "it threw something".
 #[test]
 fn the_reopen_row_is_graded() {
-    let row = |family: &str| format!("reopen\tdiv-wal3-lsn-exhausted\trust\trw\t{family}\n");
-    run_one(
-        &doctored(|t| format!("{t}{}", row("StoreFull"))),
-        "div-wal3-lsn-exhausted",
-        "rw",
-    );
+    const PFX: &str = "reopen\tdiv-wal3-lsn-exhausted\trust\trw\t";
+    let with = |family: &str| {
+        doctored(|t| format!("{}{PFX}{family}\n", drop_rows(t, PFX)))
+    };
+    run_one(&with("StoreFull"), "div-wal3-lsn-exhausted", "rw");
     refuses_cell(
         "a reopen family this engine implements but this refusal is not",
-        &doctored(|t| format!("{t}{}", row("S2"))),
+        &with("S2"),
         "div-wal3-lsn-exhausted",
         "rw",
         "not the S2 rule's refusal",
     );
     refuses_cell(
         "a reopen family this engine has no predicate for",
-        &doctored(|t| format!("{t}{}", row("R4-floor"))),
+        &with("R4-floor"),
         "div-wal3-lsn-exhausted",
         "rw",
         "has no predicate in this engine",
@@ -714,6 +720,63 @@ fn the_reopen_family_predicate_discriminates() {
             "prefix: WAL segment x: section LSN 1 at offset 2 does not follow 0; suffix",
         ),
     );
+
+    // ---- and C5t's three, as the WHOLE MATRIX ----------------------------
+    //
+    // A family predicate that is never shown a NEIGHBOUR's refusal has not been
+    // shown to read the family at all — the lesson the two cases above this one
+    // were written for, now that there are five families instead of two. Every
+    // cell is stated rather than derived, because a matrix with one quietly
+    // wrong entry reads exactly like a correct one.
+    //
+    // Two entries are not the identity and both are deliberate:
+    //
+    //   * `DataCorruption` accepts the S2 sample. S2 is a strict REFINEMENT of
+    //     it, not a neighbour, and a predicate that refused it would be
+    //     asserting something about a different rule.
+    //   * `DataCorruption` accepts the N6 sample. N6 is a family the catalogue
+    //     names and `REOPEN_FAMILIES` does not transport, so no manifest row can
+    //     present it — the sample is here for the row BELOW it, which is the
+    //     claim that matters: **`D1` refuses N6.** Those two refusals are one
+    //     `for` loop apart in `wal_segments.rs` and share every word but the
+    //     first, so a D1 predicate that took the whole sentence-shape would
+    //     confuse the ports' upgrade boundary with Java's own row.
+    let migrate = "no migration to v3 — open it with the release that wrote it and copy the \
+                   data across, or move it aside";
+    let samples: [(&str, DbError); 6] = [
+        ("direct", DbError::corrupt("not a MapDB StoreDirect file (bad magic)")),
+        ("d1", DbError::corrupt_msg(format!(
+            "regular file at the WAL base path (the v3 opener takes a base, not a log file) \
+             present at /tmp/x: {migrate}"))),
+        ("n6", DbError::corrupt_msg(format!(
+            "v1 single-file WAL present at /tmp/x.wal: {migrate}"))),
+        ("corrupt", DbError::corrupt(
+            "WAL segment x.wal.4: entry references the reserved recid 0")),
+        ("s2", DbError::corrupt(
+            "WAL segment x.wal.4: section LSN -1 at offset 187 does not follow 9")),
+        ("full", DbError::StoreFull),
+    ];
+    for (family, accepts) in [
+        ("direct-magic", "ynnnnn"),
+        ("D1", "nynnnn"),
+        ("DataCorruption", "nnyyyn"),
+        ("S2", "nnnnyn"),
+        ("StoreFull", "nnnnny"),
+    ] {
+        assert_eq!(accepts.len(), samples.len());
+        for ((name, e), want) in samples.iter().zip(accepts.chars()) {
+            let what = format!("{name} graded as {family}");
+            if want == 'y' {
+                xfix::assert_family(&what, family, e);
+            } else {
+                let e = std::panic::AssertUnwindSafe(e.clone());
+                assert!(
+                    red_of(move || xfix::assert_family("probe", family, &e)).is_some(),
+                    "the family predicate accepted {what}"
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +835,10 @@ fn an_oracle_row_addressed_to_an_absent_cell_fails_the_suite() {
         for pfx in [
             &format!("applies\t{absent}\trust\trw"),
             &format!("expect\t{absent}\trust\trw\t"),
+            // Since C5t this cell has a `reopen` row of its own (`direct-magic`,
+            // plan §3.12). Removing the cell coherently means removing that too,
+            // or every case below reports the ORPHAN it did not add.
+            &format!("reopen\t{absent}\trust\trw\t"),
         ] {
             out = drop_rows(&out, pfx);
         }
