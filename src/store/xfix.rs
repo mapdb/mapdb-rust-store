@@ -2480,14 +2480,18 @@ impl<'a> Cells<'a> {
         // would freeze an accident.
         //
         // This engine had that arm too, for one day, and round 4 measured it:
-        // **it can never fire here.** All three of the corpus's divergent
-        // (fixture, mode) groups — `div-wal3-lsn-exhausted`,
-        // `div-wal3-entry-recid0`, `div-wal3-packlong-overlong` — are java
-        // ACCEPT against ports REJECT, and this guard runs on the accept arm
-        // only. So for every rust accept cell in either root the arm was `false`
-        // outright, not masked by an earlier disjunct: deleting it cannot change
-        // any result of any run this engine has ever done, the staged one
-        // included. It went, rather than staying as a guard nothing can trip.
+        // **it can never fire here.** The corpus holds THREE divergent fixtures
+        // and therefore SIX divergent (fixture, mode) groups, since each
+        // diverges in both `rw` and `ro`: `div-wal3-lsn-exhausted`,
+        // `div-wal3-entry-recid0`, `div-wal3-packlong-overlong`. The preflight
+        // root holds the two groups of the first. All eight are java ACCEPT
+        // against ports REJECT — round 5 re-enumerated them, because round 4's
+        // census said "three groups" and a proof that miscounts its own domain
+        // is a proof to re-check. This guard runs on the accept arm only, so for
+        // every rust accept cell in either root the arm was `false` outright,
+        // not masked by an earlier disjunct: deleting it cannot change any
+        // result of any run this engine has ever done, the staged one included.
+        // It went, rather than staying as a guard nothing can trip.
         //
         // What that costs, stated rather than discovered: if a future corpus
         // ever holds a cell this engine ACCEPTS and another REJECTS, this guard
