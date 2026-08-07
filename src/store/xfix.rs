@@ -61,7 +61,6 @@ pub const VERDICTS: [&str; 2] = ["accept", "reject"];
 /// `wal3-namespace`", and `port-wal`/`java-wal-namespace` are **retained as
 /// valid tokens** though no v2 fixture uses them — retiring a fixture family is
 /// not a reason to make a version-dispatch parser reject the token.
-pub const V1_KINDS: [&str; 4] = ["direct", "reject", "port-wal", "java-wal-namespace"];
 pub const V2_KINDS: [&str; 5] = [
     "direct",
     "reject",
@@ -74,7 +73,6 @@ pub const V2_KINDS: [&str; 5] = [
 /// one `derived` row (contract §2, amendment 3).
 pub const V2_GENERATORS: [&str; 4] = ["java", "rust", "zig", "derived"];
 
-pub const V1_OPENERS: [&str; 2] = ["direct", "wal"];
 pub const V2_OPENERS: [&str; 2] = ["direct", "wal3"];
 
 /// sha256 of the empty byte string — the zero-length-content marker that has
@@ -627,52 +625,6 @@ fn push_range(into: &mut Vec<RecidRow>, fixture: &str, t: &[&str], line: &str) {
     }
 }
 
-// --- schema v1 ---------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub struct V1File {
-    pub fixture: String,
-    pub rel: String,
-    pub raw_len: u64,
-    pub raw_sha: String,
-    pub gz_sha: String,
-}
-
-/// `expect <fid> <engine> <verdict> <opener> <placeAs> <openArg>` — seven
-/// fields, and the SAME arity as a v2 `expect` row with different columns in
-/// them. That collision is why the version line is a hard dispatch and not a
-/// hint; see [`parse`].
-#[derive(Clone, Debug)]
-pub struct V1Expect {
-    pub fixture: String,
-    pub engine: String,
-    pub verdict: String,
-    pub opener: String,
-    pub place_as: String,
-    pub open_arg: String,
-}
-
-#[derive(Default, Debug)]
-pub struct V1 {
-    pub fixture_kinds: BTreeMap<String, String>,
-    pub files: Vec<V1File>,
-    pub expects: Vec<V1Expect>,
-    pub recids: Vec<RecidRow>,
-}
-
-impl V1 {
-    pub fn files_of(&self, fixture: &str) -> Vec<&V1File> {
-        self.files.iter().filter(|f| f.fixture == fixture).collect()
-    }
-
-    pub fn recids_of(&self, fixture: &str) -> Vec<&RecidRow> {
-        self.recids
-            .iter()
-            .filter(|r| r.fixture == fixture)
-            .collect()
-    }
-}
-
 // --- schema v2 ---------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -832,44 +784,29 @@ impl V2 {
     }
 }
 
-/// The parsed manifest, tagged by the schema version its first line declared.
+/// A parsed schema-v2 manifest. Version is always 2 after C7r.
 #[derive(Debug)]
-pub enum Loaded {
-    V1(V1),
-    V2(V2),
+pub struct Loaded {
+    pub version: u32,
+    pub v2: V2,
 }
 
 impl Loaded {
     pub fn version(&self) -> u32 {
-        match self {
-            Loaded::V1(_) => 1,
-            Loaded::V2(_) => 2,
-        }
-    }
-
-    pub fn v1(&self) -> &V1 {
-        match self {
-            Loaded::V1(m) => m,
-            Loaded::V2(_) => panic!("manifest is schema v2, not v1"),
-        }
+        self.version
     }
 
     pub fn v2(&self) -> &V2 {
-        match self {
-            Loaded::V2(m) => m,
-            Loaded::V1(_) => panic!("manifest is schema v1, not v2"),
-        }
+        &self.v2
     }
 }
 
-/// Dispatches on the version line, then parses with the grammar that line names.
+/// Parses a schema-v2 manifest. Schema version 1 is retired (Stage C, C7r).
 ///
-/// **The two grammars collide on arity.** A v1 `expect` row and a v2 `expect`
-/// row both have seven fields, and v1's third column is a verdict where v2's is
-/// a mode. Guessing the schema from a row's shape would therefore read
-/// `accept` as a mode and `wal3` as a verdict without any arity check firing,
-/// so the version line is authoritative and an unknown version is refused
-/// rather than assumed to be the newest.
+/// The version line remains a hard gate: v1 and v2 `expect` rows shared arity
+/// with different columns, so guessing the schema from row shape would misread
+/// fields without a single arity check firing. An unknown or retired version is
+/// refused rather than assumed.
 pub fn parse(text: &str) -> Loaded {
     let mut lines = text.lines();
     let head = loop {
@@ -885,120 +822,19 @@ pub fn parse(text: &str) -> Loaded {
     });
     let rest: Vec<&str> = lines.collect();
     match t[1] {
-        "1" => Loaded::V1(parse_v1(&rest)),
-        "2" => Loaded::V2(parse_v2(&rest)),
+        "1" => panic!(
+            "manifest schema version 1 is retired (Stage C, C7r) — this reader speaks only \
+             schema 2; the dual v1/v2 dispatch is gone"
+        ),
+        "2" => Loaded {
+            version: 2,
+            v2: parse_v2(&rest),
+        },
         other => panic!(
-            "unsupported manifest schema version {other} — this reader speaks 1 and 2, and \
-             refuses rather than guessing: the two grammars share row arities, so a newer \
-             schema would be misread field by field without a single check firing"
+            "unsupported manifest schema version {other} — this reader speaks only schema 2, and \
+             refuses rather than guessing at the columns"
         ),
     }
-}
-
-fn parse_v1(lines: &[&str]) -> V1 {
-    let mut m = V1::default();
-    for line in lines {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let t: Vec<&str> = line.split('\t').collect();
-        match t[0] {
-            "version" => panic!("a second version row: {line}"),
-            "fixture" => {
-                arity(&t, 5, line);
-                one_of(t[2], &V1_KINDS, "fixture kind", line);
-                one_of(t[3], &ENGINES, "generatorEngine", line);
-                check(
-                    m.fixture_kinds
-                        .insert(t[1].to_string(), t[2].to_string())
-                        .is_none(),
-                    || format!("duplicate fixture row for {}: {line}", t[1]),
-                );
-            }
-            "file" => {
-                arity(&t, 6, line);
-                let f = V1File {
-                    fixture: t[1].to_string(),
-                    rel: rel_name(t[2], line),
-                    raw_len: nat(t[3], line),
-                    raw_sha: t[4].to_string(),
-                    gz_sha: t[5].to_string(),
-                };
-                for prior in &m.files {
-                    check(!(prior.fixture == f.fixture && prior.rel == f.rel), || {
-                        format!("duplicate file row for {}/{}: {line}", f.fixture, f.rel)
-                    });
-                }
-                m.files.push(f);
-            }
-            "expect" => {
-                arity(&t, 7, line);
-                let e = V1Expect {
-                    fixture: t[1].to_string(),
-                    engine: one_of(t[2], &ENGINES, "engine", line),
-                    verdict: one_of(t[3], &VERDICTS, "verdict", line),
-                    opener: one_of(t[4], &V1_OPENERS, "opener", line),
-                    place_as: rel_name(t[5], line),
-                    open_arg: rel_name(t[6], line),
-                };
-                // A v1 cell is identified by (fixture, engine, opener, placeAs),
-                // NOT by (fixture, engine): the live tree has both a `direct`
-                // and a `wal` cell for the same engine on `wal-v1-rust-tail`,
-                // which is exactly what the v1 `opener` column is for. A
-                // narrower key rejects the real manifest — it did, here, before
-                // the live data corrected it.
-                for prior in &m.expects {
-                    check(
-                        !(prior.fixture == e.fixture
-                            && prior.engine == e.engine
-                            && prior.opener == e.opener
-                            && prior.place_as == e.place_as),
-                        || {
-                            format!(
-                                "duplicate expect row for {}/{}/{}: {line}",
-                                e.fixture, e.engine, e.opener
-                            )
-                        },
-                    );
-                }
-                m.expects.push(e);
-            }
-            "recid" => {
-                arity(&t, 7, line);
-                add_recid(
-                    &mut m.recids,
-                    RecidRow {
-                        fixture: t[1].to_string(),
-                        label: t[2].to_string(),
-                        recid: nat(t[3], line),
-                        state: parse_state(t[4], line),
-                        payload_id: nat(t[5], line),
-                        len: nat(t[6], line) as usize,
-                    },
-                    line,
-                );
-            }
-            "recidrange" => {
-                arity(&t, 8, line);
-                let fixture = t[1].to_string();
-                push_range(&mut m.recids, &fixture, &t, line);
-            }
-            "edit" => {
-                arity(&t, 6, line);
-                // provenance for a derived reject image; nothing here executes it.
-            }
-            other => panic!("unknown v1 manifest row type {other:?}: {line}"),
-        }
-    }
-    check(!m.files.is_empty(), || {
-        "a v1 manifest with no file rows".to_string()
-    });
-    let mut referenced: BTreeSet<String> = BTreeSet::new();
-    referenced.extend(m.files.iter().map(|x| x.fixture.clone()));
-    referenced.extend(m.expects.iter().map(|x| x.fixture.clone()));
-    referenced.extend(m.recids.iter().map(|x| x.fixture.clone()));
-    referential_integrity(&m.fixture_kinds, &referenced);
-    m
 }
 
 fn parse_v2(lines: &[&str]) -> V2 {
@@ -1411,10 +1247,6 @@ pub fn v2_corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/xfixtures-v2-corpus")
 }
 
-pub fn v1_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/xfixtures")
-}
-
 pub fn read_root_file(root: &Path, name: &str) -> Vec<u8> {
     let p = root.join(name);
     std::fs::read(&p).unwrap_or_else(|e| {
@@ -1445,10 +1277,7 @@ pub fn load_sample_v2(root: &Path) -> SampleV2 {
 /// reader would never have accepted.
 pub fn load_sample_v2_text(root: &Path, text: &str) -> SampleV2 {
     let loaded = parse(text);
-    let manifest = match loaded {
-        Loaded::V2(m) => m,
-        Loaded::V1(_) => panic!("{} is schema v1, not v2", root.display()),
-    };
+    let manifest = loaded.v2;
     let mut raw = BTreeMap::new();
     for f in &manifest.files {
         let gz = read_root_file(root, &f.blob_name());
