@@ -171,6 +171,7 @@ use mapdb_rust_store::store::StoreWAL;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use xfix::red_of;
 
 /// A scratch directory no other test in this binary can be handed.
@@ -185,6 +186,51 @@ use xfix::red_of;
 fn fresh_session(tag: &str) -> xfix::Session {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     xfix::session_dir(&format!("{tag}_{}", SEQ.fetch_add(1, Ordering::SeqCst)))
+}
+
+/// The guard's cleanup, on the path that made it necessary.
+///
+/// `Session` exists because the cleanup line after a panic never runs and this
+/// suite panics BY DESIGN — every `assert_refused` case unwinds — which had
+/// leaked 53,141 scratch directories and about 31 GB before the mutation
+/// campaign hit `QuotaExceeded` and made it visible.
+///
+/// Review round 3 found the repair unobserved: emptying `Drop::drop` left every
+/// functional assertion and every pinned mutation green, so the campaign would
+/// print KILLED all the way down while recreating the leak. That is rule (g) —
+/// a comparison sees only variation its inputs contain, and no input here
+/// observed a directory's ABSENCE.
+///
+/// The `Session` is created INSIDE the closure deliberately. Creating it outside
+/// and unwinding past a borrow would exercise the ordinary end-of-scope drop,
+/// which was never in doubt; only a drop during unwinding is the path that was
+/// leaking.
+#[test]
+fn the_session_guard_removes_its_directory_when_the_test_panics() {
+    let seen: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+    let inner = Arc::clone(&seen);
+    let red = xfix::red_of(move || {
+        let s = fresh_session("dropprobe");
+        assert!(s.is_dir(), "the session directory was not created");
+        *inner.lock().unwrap() = Some(s.to_path_buf());
+        panic!("deliberate — this is the path every refusal case in this file takes");
+    });
+    assert!(
+        red.is_some(),
+        "the probe must actually unwind, or it proves nothing"
+    );
+
+    let path = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the probe never reached the point where it records the path");
+    assert!(
+        !path.exists(),
+        "the session directory outlived the panic that dropped it: {} — this is the \
+         leak that filled the disk, and `Session::drop` is what is supposed to stop it",
+        path.display()
+    );
 }
 
 /// `freeze_v2.PREFLIGHT_DIST_SEALS["rust"]`, and the referent is
@@ -788,7 +834,7 @@ fn the_reopen_family_predicate_discriminates() {
     //     confuse the ports' upgrade boundary with Java's own row.
     let migrate = "no migration to v3 — open it with the release that wrote it and copy the \
                    data across, or move it aside";
-    let samples: [(&str, DbError); 8] = [
+    let samples: [(&str, DbError); 9] = [
         (
             "direct",
             DbError::corrupt("not a MapDB StoreDirect file (bad magic)"),
@@ -837,17 +883,33 @@ fn the_reopen_family_predicate_discriminates() {
                 "WAL segment od: dd/x.wal.4: section LSN -1 at offset 187 does not follow 9",
             ),
         ),
+        // An S2-shaped message with a NEGATIVE OFFSET, which is not an S2
+        // refusal and not any refusal this engine renders: the two LSNs are
+        // `i64` and can legitimately go negative, the offset is `u64` and cannot.
+        // Round 3 found one sign predicate covering all three fields, so this
+        // graded as S2 — a message no engine produces, which means a refusal
+        // wearing it came from somewhere else and must not be given a family.
+        // It belongs to the generic arm, exactly as `corrupt` does.
+        (
+            "s2-negative-offset",
+            DbError::corrupt("WAL segment x.wal.4: section LSN -1 at offset -2 does not follow 9"),
+        ),
         ("full", DbError::StoreFull),
     ];
     for (family, accepts) in [
-        ("direct-magic", "ynnnnnnn"),
-        ("D1", "nyynnnnn"),
+        ("direct-magic", "ynnnnnnnn"),
+        ("D1", "nyynnnnnn"),
         // "n" for the S2 column since codex round 1 finding 4: over the five
         // families the corpus TRANSPORTS this matrix is a true diagonal, and the
         // N6 column is the one extra — a family no manifest row can name.
-        ("DataCorruption", "nnnyynnn"),
-        ("S2", "nnnnnyyn"),
-        ("StoreFull", "nnnnnnny"),
+        // The negative-offset sample lands HERE, in the generic arm, and that is
+        // the whole point of adding it: it is a corruption verdict this engine
+        // has no refined family for, so it must be graded exactly as `corrupt`
+        // is. A predicate that put it in S2 was claiming to recognise a message
+        // no engine writes.
+        ("DataCorruption", "nnnyynnyn"),
+        ("S2", "nnnnnyynn"),
+        ("StoreFull", "nnnnnnnny"),
     ] {
         assert_eq!(accepts.len(), samples.len());
         for ((name, e), want) in samples.iter().zip(accepts.chars()) {

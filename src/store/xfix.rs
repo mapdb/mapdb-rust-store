@@ -2696,11 +2696,16 @@ fn s2_matches(msg: &str) -> bool {
     let Some((off, prev)) = rest.split_once(" does not follow ") else {
         return false;
     };
-    let int = |s: &str| {
-        let s = s.strip_prefix('-').unwrap_or(s);
-        !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())
-    };
-    int(lsn) && int(off) && int(prev)
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    // The two LSNs are SIGNED and the offset is NOT, and the asymmetry is the
+    // engine's, not a convenience: an LSN is `i64` on disk, so a CRC-valid
+    // section carrying a negative one is a real input this rule can be shown,
+    // while the offset is a `u64` and no refusal this engine renders can put a
+    // minus sign there. Round 3 found one sign predicate covering all three,
+    // which accepted `at offset -2` as S2 — a message no engine produces, so a
+    // refusal wearing it is something else entirely and must not be graded here.
+    let signed = |s: &str| digits(s.strip_prefix('-').unwrap_or(s));
+    signed(lsn) && digits(off) && signed(prev)
 }
 
 /// Asserts a refusal belongs to the named contract family.
