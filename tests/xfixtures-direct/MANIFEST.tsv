@@ -1,0 +1,60 @@
+version	2
+fixture	direct-v1-java	direct	java	c7-direct
+fixture	direct-v1-rust	direct	rust	c7-direct
+fixture	direct-v1-zig	direct	zig	c7-direct
+fixture	reject-mdb5-sd1	reject	java	c7-direct
+fixture	reject-sd1-badfeatures	reject	java	c7-direct
+fixture	reject-sd1-badchecksum	reject	java	c7-direct
+fixture	reject-sd1-short	reject	java	c7-direct
+file	direct-v1-java	direct-v1-java.db	4194304	c060f6cf452d6a9a128a2f8c15878d2c1d397731fecdf1a6299da0855d95e691	983764846a8df7b2eeba9c6406f2a4545613367ce93a68b5a30b1c3a923ddbe9
+file	direct-v1-rust	direct-v1-rust.db	4194304	c060f6cf452d6a9a128a2f8c15878d2c1d397731fecdf1a6299da0855d95e691	983764846a8df7b2eeba9c6406f2a4545613367ce93a68b5a30b1c3a923ddbe9
+file	direct-v1-zig	direct-v1-zig.db	4194304	c060f6cf452d6a9a128a2f8c15878d2c1d397731fecdf1a6299da0855d95e691	983764846a8df7b2eeba9c6406f2a4545613367ce93a68b5a30b1c3a923ddbe9
+file	reject-mdb5-sd1	reject-mdb5-sd1.db	4194304	2a5b0826f933cf2f03a65c65d8f770cf1f5a9322d966cb61db6b057003e564f5	68d1f036a93e715faa1b7c0316689069d02c2bf19d4c2a2a4428266f3581192d
+file	reject-sd1-badfeatures	reject-sd1-badfeatures.db	4194304	41066e879264b5f14ce3b3dc544ef26321e2da1044387c1170fdd0b27b6ae535	ff2bcee809e9abd22e47fe026c01c98e43e3d9295f89de852ff34fbe6ba5374d
+file	reject-sd1-badchecksum	reject-sd1-badchecksum.db	4194304	d4013d0ee95f7bde6f7f2db13067a834549a97a9cd58a4d25cf780cad35a315b	1f0c795be0a7767f37b3b3d45a65d1fe75e9742ac17bffd5c5477717d28534c8
+file	reject-sd1-short	reject-sd1-short.db	4096	702333cbeeb438a934b3355d713b18d421a2fd6e3458cf403acd491a2732e38a	dc6f8a9d4d0b906e2275d29eaabe1cbf98489bde2021f72af2b697146b397334
+expect	direct-v1-java	java	rw	accept	direct	direct-v1-java.db
+expect	direct-v1-rust	java	rw	accept	direct	direct-v1-rust.db
+expect	direct-v1-zig	java	rw	accept	direct	direct-v1-zig.db
+expect	reject-mdb5-sd1	java	rw	reject	direct	reject-mdb5-sd1.db
+expect	reject-sd1-badfeatures	java	rw	reject	direct	reject-sd1-badfeatures.db
+expect	reject-sd1-badchecksum	java	rw	reject	direct	reject-sd1-badchecksum.db
+expect	reject-sd1-short	java	rw	reject	direct	reject-sd1-short.db
+expect	direct-v1-java	rust	rw	accept	direct	direct-v1-java.db
+expect	direct-v1-rust	rust	rw	accept	direct	direct-v1-rust.db
+expect	direct-v1-zig	rust	rw	accept	direct	direct-v1-zig.db
+expect	reject-mdb5-sd1	rust	rw	reject	direct	reject-mdb5-sd1.db
+expect	reject-sd1-badfeatures	rust	rw	reject	direct	reject-sd1-badfeatures.db
+expect	reject-sd1-badchecksum	rust	rw	reject	direct	reject-sd1-badchecksum.db
+expect	reject-sd1-short	rust	rw	reject	direct	reject-sd1-short.db
+expect	direct-v1-java	zig	rw	accept	direct	direct-v1-java.db
+expect	direct-v1-rust	zig	rw	accept	direct	direct-v1-rust.db
+expect	direct-v1-zig	zig	rw	accept	direct	direct-v1-zig.db
+expect	reject-mdb5-sd1	zig	rw	reject	direct	reject-mdb5-sd1.db
+expect	reject-sd1-badfeatures	zig	rw	reject	direct	reject-sd1-badfeatures.db
+expect	reject-sd1-badchecksum	zig	rw	reject	direct	reject-sd1-badchecksum.db
+expect	reject-sd1-short	zig	rw	reject	direct	reject-sd1-short.db
+recid	direct-v1-java	A	1	live	1	100
+recid	direct-v1-java	B	2	live	2	0
+recid	direct-v1-java	C	3	null	3	40
+recid	direct-v1-java	D	4	prealloc	0	0
+recid	direct-v1-java	F	5	live	6	1048525
+recid	direct-v1-java	G	6	live	7	256
+recid	direct-v1-java	E	7	deleted	5	256
+recidrange	direct-v1-java	churn	8	207	deleted	1000	256
+recid	direct-v1-rust	A	1	live	1	100
+recid	direct-v1-rust	B	2	live	2	0
+recid	direct-v1-rust	C	3	null	3	40
+recid	direct-v1-rust	D	4	prealloc	0	0
+recid	direct-v1-rust	E	7	deleted	5	256
+recid	direct-v1-rust	F	5	live	6	1048525
+recid	direct-v1-rust	G	6	live	7	256
+recidrange	direct-v1-rust	churn	8	207	deleted	1000	256
+recid	direct-v1-zig	A	1	live	1	100
+recid	direct-v1-zig	B	2	live	2	0
+recid	direct-v1-zig	C	3	null	3	40
+recid	direct-v1-zig	D	4	prealloc	0	0
+recid	direct-v1-zig	F	5	live	6	1048525
+recid	direct-v1-zig	G	6	live	7	256
+recid	direct-v1-zig	E	7	deleted	5	256
+recidrange	direct-v1-zig	churn	8	207	deleted	1000	256
