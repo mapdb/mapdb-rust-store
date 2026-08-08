@@ -255,6 +255,16 @@ fn doctored(edit: impl Fn(&str) -> String) -> xfix::SampleV2 {
     xfix::load_sample_v2_text(&root, &out)
 }
 
+/// Like [`doctored`], then injects catalogue-derived `family` rows for every
+/// rust reject arm.
+///
+/// C8f f1 / pre-f2 bridge: the frozen MANIFEST has no `family` rows yet. Suite-
+/// level cases that must run every cell need those rows so the red under test
+/// is not "reject arm has no family row".
+fn doctored_with_families(edit: impl Fn(&str) -> String) -> xfix::SampleV2 {
+    doctored(|t| xfix::inject_rust_family_rows(&edit(t)))
+}
+
 fn drop_rows(text: &str, prefix: &str) -> String {
     let kept: Vec<&str> = text
         .split('\n')
@@ -312,12 +322,33 @@ fn rust_cell(sample: &xfix::SampleV2, fixture: &str, mode: &str) -> xfix::V2Expe
 // ---------------------------------------------------------------------------
 
 /// Every `applies` row addressed to rust in `rw`, run, and exactly those.
+///
+/// Pre-f2: injects `family` rows (frozen MANIFEST has none yet). After f2 the
+/// inject is a no-op re-emit of the same set and this stays green.
 #[test]
 fn corpus_rw_cells_conform() {
-    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
+    let sample = xfix::load_corpus_v2_with_family_rows(&xfix::v2_corpus_root());
     let session = fresh_session("xfcorpus_rw");
     xfix::run_v2_corpus_cells(&sample, "rw", &session, &open_rw);
     let _ = std::fs::remove_dir_all(&session);
+}
+
+/// Bare frozen MANIFEST (no `family` rows) must fail-closed on first reject.
+///
+/// Documents the f2 gap: until the corpus freezes `family` rows, loading the
+/// root without the inject bridge reds at plan §4.2 item 1.
+#[test]
+fn frozen_manifest_without_family_rows_fails_closed() {
+    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
+    assert!(
+        sample.manifest.families.is_empty(),
+        "frozen MANIFEST already carries family rows — drop the inject bridge"
+    );
+    refuses_suite(
+        "the frozen pre-f2 corpus with no family rows",
+        &sample,
+        "reject arm has no family row",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -345,9 +376,16 @@ fn corpus_rw_cells_conform() {
 /// opener accepted D1 would keep the file sets and lose the verdicts — but each
 /// assertion written separately is a leaf the whole gate can lose without
 /// noticing. Collapsing them leaves one leaf for the group instead of four.
+///
+/// **C8f f1:** the frozen corpus has no `family` rows yet (f2 freezes them).
+/// This case injects the cell's `family` row so the control path can still
+/// prove the §3.11 lock red rather than "reject arm has no family row".
 #[test]
 fn a_direct_cell_sent_to_the_wal_opener_goes_red() {
-    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
+    let sample = doctored(|t| {
+        let t = drop_rows(t, "family\treject-wal3-segment-at-direct\trust\trw\t");
+        format!("{t}family\treject-wal3-segment-at-direct\trust\trw\tdirect-magic\n")
+    });
     let e = rust_cell(&sample, "reject-wal3-segment-at-direct", "rw");
     assert_eq!(e.opener, "direct", "the corpus's direct cell moved");
     let session = fresh_session("xfcorpus_mutant");
@@ -657,7 +695,7 @@ const ACTION_BYTES_OFFSET: usize = 187;
 const ACTION_BYTES_HEX: &str = "000000000000000b";
 const ACTION_BYTES_WRONG: &str = "000000000000000c";
 
-/// A `reopen` row addressed to rust is run, and its FAMILY is graded.
+/// A `reopen` row addressed to rust is run as the STABILITY (second-open) grade.
 ///
 /// `div-wal3-lsn-exhausted` is the cell whose image this engine refuses, and a
 /// reopen of the same directory refuses the same way, so the row has a real
@@ -665,14 +703,9 @@ const ACTION_BYTES_WRONG: &str = "000000000000000c";
 /// and ro: reject, error family StoreFull exactly — not the corruption
 /// family"*.
 ///
-/// **C5t made the positive case real.** Until then the corpus addressed no
-/// reopen row to rust and this test's manifest was the only input the handler
-/// ever had; plan §3.12's derived rows mean the checked-in corpus now carries
-/// that exact line, so the first case below re-states what `corpus_rw_cells_
-/// conform` already runs. It is kept as the control the two negatives are
-/// measured against, and the row is REPLACED rather than appended — a second
-/// copy is a duplicate the parser refuses, which would grade the negatives for
-/// the wrong reason.
+/// **C8f f1:** first-open family is carried by the `family` row; these cases
+/// pin that row to the true family so the reopen path is what the negatives
+/// measure. Wrong reopen family reds at `reopen[..]`, not `family[..]`.
 ///
 /// Three inputs, because a family predicate with one member cannot be shown to
 /// READ the row:
@@ -685,43 +718,103 @@ const ACTION_BYTES_WRONG: &str = "000000000000000c";
 ///   predicate — C8f f0), so it must fail rather than "it threw something".
 #[test]
 fn the_reopen_row_is_graded() {
-    const PFX: &str = "reopen\tdiv-wal3-lsn-exhausted\trust\trw\t";
-    let with = |family: &str| doctored(|t| format!("{}{PFX}{family}\n", drop_rows(t, PFX)));
+    const REOPEN: &str = "reopen\tdiv-wal3-lsn-exhausted\trust\trw\t";
+    const FAMILY: &str = "family\tdiv-wal3-lsn-exhausted\trust\trw\t";
+    // First-open always true; reopen is what varies.
+    let with = |reopen_family: &str| {
+        doctored(|t| {
+            let t = drop_rows(t, REOPEN);
+            let t = drop_rows(&t, FAMILY);
+            format!("{t}{FAMILY}StoreFull\n{REOPEN}{reopen_family}\n")
+        })
+    };
     run_one(&with("StoreFull"), "div-wal3-lsn-exhausted", "rw");
     refuses_cell(
         "a reopen family this engine implements but this refusal is not",
         &with("S2"),
         "div-wal3-lsn-exhausted",
         "rw",
-        "not the S2 rule's refusal",
+        "reopen[S2]: not the S2 rule's refusal",
     );
     refuses_cell(
         "a reopen family this engine has no predicate for",
         &with("H99"),
         "div-wal3-lsn-exhausted",
         "rw",
-        "has no predicate in this engine",
+        "reopen[H99]: error family H99 has no predicate in this engine",
     );
 }
 
-/// On a REJECT cell the family is graded on the cell's OWN refusal, before the
-/// reopen.
+/// A `family` row grades the cell's OWN (first-open) refusal (C8f f1).
 ///
-/// codex round 1 finding 2: C5t's first draft graded the family only on the
-/// reopen, which is a WRITABLE open whatever the cell's mode was. Every
-/// `mode=ro` row was therefore graded by a retry in the other mode, and a store
-/// that refuses read-only for one reason and writable for another passed.
+/// Distinct from the reopen stability path: wrong `family` reds at `family[..]`
+/// before the second open runs. The true-family positive case also carries a
+/// matching reopen so the accountant is fully paid.
+#[test]
+fn the_family_row_is_graded() {
+    const REOPEN: &str = "reopen\tdiv-wal3-lsn-exhausted\trust\trw\t";
+    const FAMILY: &str = "family\tdiv-wal3-lsn-exhausted\trust\trw\t";
+    let with = |family: &str| {
+        doctored(|t| {
+            let t = drop_rows(t, REOPEN);
+            let t = drop_rows(&t, FAMILY);
+            format!("{t}{FAMILY}{family}\n{REOPEN}StoreFull\n")
+        })
+    };
+    run_one(&with("StoreFull"), "div-wal3-lsn-exhausted", "rw");
+    refuses_cell(
+        "a family name this engine implements but this refusal is not",
+        &with("S2"),
+        "div-wal3-lsn-exhausted",
+        "rw",
+        "family[S2]: not the S2 rule's refusal",
+    );
+    refuses_cell(
+        "a family name this engine has no predicate for",
+        &with("H99"),
+        "div-wal3-lsn-exhausted",
+        "rw",
+        "family[H99]: error family H99 has no predicate in this engine",
+    );
+    // Absence on a reject arm is failure (plan §4.2 item 1) — not a silent skip.
+    refuses_cell(
+        "a reject arm with no family row",
+        &doctored(|t| {
+            let t = drop_rows(t, FAMILY);
+            // Keep reopen so an older "grade via reopen only" path cannot green this.
+            let t = drop_rows(&t, REOPEN);
+            format!("{t}{REOPEN}StoreFull\n")
+        }),
+        "div-wal3-lsn-exhausted",
+        "rw",
+        "reject arm has no family row",
+    );
+}
+
+/// On a REJECT cell the first-open family is graded from the `family` row,
+/// before the reopen stability check.
 ///
-/// **The corpus alone cannot show the fix.** Both opens of a conforming store
-/// refuse the same way, so deleting the first grading leaves the reopen's — same
-/// family, same predicate, gate green. What separates them is WHERE the red
-/// comes from: this doctored family reds at `family[..]` if the cell's own
-/// refusal was graded and at `reopen[..]` if only the second open was. Asserting
-/// the prefix is what makes the deletion visible.
+/// codex round 1 finding 2 (carried forward through C8f f1): grading only on
+/// the reopen is a WRITABLE open whatever the cell's mode was. C8f f1 moves the
+/// first grade onto the `family` row so mutating R6-audit/rw (family only) is
+/// covered and `mode=ro` is graded on the arm the corpus names.
+///
+/// **The corpus alone cannot show the fix** until f2 freezes `family` rows.
+/// Both opens of a conforming store refuse the same way, so deleting the first
+/// grading leaves the reopen's — same family, same predicate, gate green. What
+/// separates them is WHERE the red comes from: this doctored family reds at
+/// `family[..]` if the cell's own refusal was graded and at `reopen[..]` if only
+/// the second open was. Asserting the prefix is what makes the deletion visible.
 #[test]
 fn the_reject_arms_own_refusal_is_graded() {
-    const PFX: &str = "reopen\treject-wal3-d1-barebase\trust\trw\t";
-    let doctored_m = doctored(|t| format!("{}{PFX}H99\n", drop_rows(t, PFX)));
+    const REOPEN: &str = "reopen\treject-wal3-d1-barebase\trust\trw\t";
+    const FAMILY: &str = "family\treject-wal3-d1-barebase\trust\trw\t";
+    let doctored_m = doctored(|t| {
+        let t = drop_rows(t, REOPEN);
+        let t = drop_rows(&t, FAMILY);
+        // True reopen (would pass second open); wrong family on first open.
+        format!("{t}{FAMILY}H99\n{REOPEN}D1\n")
+    });
     refuses_cell(
         "a reject arm whose own refusal is graded by nothing",
         &doctored_m,
@@ -1016,11 +1109,15 @@ fn the_reopen_family_predicate_discriminates() {
 /// precisely "parses" wearing "executes"'s clothes.
 #[test]
 fn an_oracle_row_no_arm_can_run_fails_the_cell() {
+    // C8f f1: reject arms require a `family` row. Inject the true one so the
+    // red is the unconsumed `action`, not "reject arm has no family row".
     refuses_cell(
         "an action row on a reject cell",
         &doctored(|t| {
+            let t = drop_rows(t, "family\treject-wal3-d1-barebase\trust\trw\t");
             format!(
-                "{t}action\treject-wal3-d1-barebase\trust\trw\tcommit_one_record\t\
+                "{t}family\treject-wal3-d1-barebase\trust\trw\tD1\n\
+                 action\treject-wal3-d1-barebase\trust\trw\tcommit_one_record\t\
                  op=put,payload_id=1,payload_len=1,recid_label=Z,serializer=raw\n"
             )
         }),
@@ -1063,10 +1160,14 @@ fn an_oracle_row_addressed_to_an_absent_cell_fails_the_suite() {
             // plan §3.12). Removing the cell coherently means removing that too,
             // or every case below reports the ORPHAN it did not add.
             &format!("reopen\t{absent}\trust\trw\t"),
+            // C8f f1: same for `family` once f2 freezes those rows.
+            &format!("family\t{absent}\trust\trw\t"),
         ] {
             out = drop_rows(&out, pfx);
         }
-        out
+        // Pre-f2: remaining reject arms need family rows so the suite reaches
+        // the orphan check rather than failing closed on first-open.
+        xfix::inject_rust_family_rows(&out)
     };
     refuses_suite(
         "a bytes row addressed to a cell rust never runs",
@@ -1077,6 +1178,11 @@ fn an_oracle_row_addressed_to_an_absent_cell_fails_the_suite() {
         "a reopen row addressed to a cell rust never runs",
         &doctored(|t| format!("{}reopen\t{absent}\trust\trw\tS2\n", strip(t))),
         &format!("reopen {absent}/rw"),
+    );
+    refuses_suite(
+        "a family row addressed to a cell rust never runs",
+        &doctored(|t| format!("{}family\t{absent}\trust\trw\tS2\n", strip(t))),
+        &format!("family {absent}/rw"),
     );
     refuses_suite(
         "an action row addressed to a cell rust never runs",
@@ -1225,7 +1331,13 @@ fn an_accept_cell_that_asserts_nothing_is_refused() {
 fn a_wal3_cell_with_no_post_rows_is_refused() {
     refuses_cell(
         "a wal3 cell with every post row removed",
-        &doctored(|t| drop_rows(t, "post\treject-wal3-d1-barebase\trust\trw\t")),
+        &doctored(|t| {
+            let t = drop_rows(t, "post\treject-wal3-d1-barebase\trust\trw\t");
+            let t = drop_rows(&t, "family\treject-wal3-d1-barebase\trust\trw\t");
+            // Family present so the red is the post-cardinality guard, not
+            // "reject arm has no family row".
+            format!("{t}family\treject-wal3-d1-barebase\trust\trw\tD1\n")
+        }),
         "reject-wal3-d1-barebase",
         "rw",
         "asserts nothing about the directory it just opened",
@@ -1240,6 +1352,7 @@ fn a_wal3_cell_with_no_post_rows_is_refused() {
 /// otherwise.
 #[test]
 fn an_applies_row_missing_its_expect_fails() {
+    // Fires at applies==expect before any cell runs — no family inject needed.
     let sample = doctored(|t| drop_rows(t, "applies\twal3-java-cleaned\trust\trw"));
     assert!(
         sample
@@ -1270,7 +1383,7 @@ fn an_applies_row_missing_its_expect_fails() {
 #[test]
 fn an_unchanged_post_row_is_graded() {
     let session = fresh_session("xfcorpus_unchanged");
-    let sample = doctored(|t| {
+    let sample = doctored_with_families(|t| {
         format!("{t}post\twal3-java-cleaned\trust\trw\tx.wal.0000000000000002\tunchanged\n")
     });
     xfix::run_v2_corpus_cells(&sample, "rw", &session, &open_rw);

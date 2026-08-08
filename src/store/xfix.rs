@@ -709,8 +709,26 @@ pub struct V2Bytes {
 
 /// `reopen <fid> <engine> <mode> <family>` — after the cell's actions have run
 /// and the store has been closed, a SECOND open must fail with this family.
+///
+/// Stability / second-open grade only (C8f f1). First-open family grading is
+/// carried by [`V2Family`], including the mutating R6-audit/rw arms that have
+/// no `reopen` row.
 #[derive(Clone, Debug)]
 pub struct V2Reopen {
+    pub fixture: String,
+    pub engine: String,
+    pub mode: String,
+    pub family: String,
+}
+
+/// `family <fid> <engine> <mode> <familyName>` — first-open refusal grade for a
+/// reject arm (C8f f1 / plan §4.2).
+///
+/// Fail-closed bijection with reject arms: every reject cell this engine runs
+/// owes exactly one row; an accept cell carrying one fails as unconsumed.
+/// Mutating R6-audit/rw carries `family` only (no `reopen`).
+#[derive(Clone, Debug)]
+pub struct V2Family {
     pub fixture: String,
     pub engine: String,
     pub mode: String,
@@ -727,6 +745,7 @@ pub struct V2 {
     pub actions: Vec<V2Action>,
     pub bytes: Vec<V2Bytes>,
     pub reopens: Vec<V2Reopen>,
+    pub families: Vec<V2Family>,
     pub recids: Vec<RecidRow>,
 }
 
@@ -751,6 +770,13 @@ impl V2 {
 
     pub fn reopens_of(&self, fixture: &str, engine: &str, mode: &str) -> Vec<&V2Reopen> {
         self.reopens
+            .iter()
+            .filter(|r| r.fixture == fixture && r.engine == engine && r.mode == mode)
+            .collect()
+    }
+
+    pub fn families_of(&self, fixture: &str, engine: &str, mode: &str) -> Vec<&V2Family> {
+        self.families
             .iter()
             .filter(|r| r.fixture == fixture && r.engine == engine && r.mode == mode)
             .collect()
@@ -1039,6 +1065,29 @@ fn parse_v2(lines: &[&str]) -> V2 {
                 }
                 m.reopens.push(r);
             }
+            "family" => {
+                // C8f f1 / plan §4.2 — same arity and key shape as `reopen`,
+                // but oracle-profile first-open grade (not the second open).
+                arity(&t, 5, line);
+                let r = V2Family {
+                    fixture: t[1].to_string(),
+                    engine: one_of(t[2], &ENGINES, "engine", line),
+                    mode: one_of(t[3], &MODES, "mode", line),
+                    // Same non-vocabulary reason as `reopen`: predicates live
+                    // in `assert_family`, not a second list here.
+                    family: t[4].to_string(),
+                };
+                for prior in &m.families {
+                    check(
+                        !cell_eq(
+                            (&prior.fixture, &prior.engine, &prior.mode),
+                            (&r.fixture, &r.engine, &r.mode),
+                        ),
+                        || format!("duplicate family row: {line}"),
+                    );
+                }
+                m.families.push(r);
+            }
             "bytes" => {
                 arity(&t, 7, line);
                 let b = V2Bytes {
@@ -1110,6 +1159,7 @@ fn referenced_v2(m: &V2) -> BTreeSet<String> {
     r.extend(m.actions.iter().map(|x| x.fixture.clone()));
     r.extend(m.bytes.iter().map(|x| x.fixture.clone()));
     r.extend(m.reopens.iter().map(|x| x.fixture.clone()));
+    r.extend(m.families.iter().map(|x| x.fixture.clone()));
     r.extend(m.recids.iter().map(|x| x.fixture.clone()));
     r
 }
@@ -1266,6 +1316,81 @@ pub fn read_root_text(root: &Path, name: &str) -> String {
 /// never checked against their pins describes whatever happened to be on disk.
 pub fn load_sample_v2(root: &Path) -> SampleV2 {
     load_sample_v2_text(root, &read_root_text(root, "MANIFEST.tsv"))
+}
+
+/// Pre-f2 bridge: inject catalogue-derived `family` rows for every rust reject
+/// arm in `text`.
+///
+/// C8f f1 lands the consumer before f2 freezes `family` into the corpus
+/// MANIFEST. Full-suite paths call this so first-open grading is measurable;
+/// bare frozen loads stay fail-closed (no family row → red).
+///
+/// f2 should make this a pure re-emit of rows already present; drop the bridge
+/// once the frozen root carries the bijection.
+pub fn inject_rust_family_rows(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut reject_arms: Vec<(String, String)> = Vec::new();
+    for line in text.split('\n') {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 3 && cols[0] == "family" && cols[2] == "rust" {
+            continue;
+        }
+        if cols.len() >= 5 && cols[0] == "expect" && cols[2] == "rust" && cols[4] == "reject" {
+            reject_arms.push((cols[1].to_string(), cols[3].to_string()));
+        }
+        out.push(line.to_string());
+    }
+    for (fid, mode) in reject_arms {
+        let fam = rust_reject_family_for_inject(&fid)
+            .unwrap_or_else(|| panic!("no catalogue family pinned for rust reject fixture {fid}"));
+        out.push(format!("family\t{fid}\trust\t{mode}\t{fam}"));
+    }
+    // Always end with a newline so a caller that does `format!("{injected}row\n")`
+    // cannot glue the new row onto the last family line.
+    let mut s = out.join("\n");
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+/// Loads the corpus root with [`inject_rust_family_rows`] applied (pre-f2).
+pub fn load_corpus_v2_with_family_rows(root: &Path) -> SampleV2 {
+    let text = read_root_text(root, "MANIFEST.tsv");
+    let injected = inject_rust_family_rows(&text);
+    assert_ne!(
+        injected, text,
+        "inject_rust_family_rows added nothing — frozen root already has family rows; drop the bridge"
+    );
+    load_sample_v2_text(root, &injected)
+}
+
+/// `catalogue.cell.family_for("rust")` for every reject fixture the frozen
+/// corpus still addresses to rust. Kept in lockstep with T1's fill until f2.
+fn rust_reject_family_for_inject(fixture: &str) -> Option<&'static str> {
+    Some(match fixture {
+        "reject-wal3-n6-barewal" => "N6",
+        "reject-wal3-d1-barebase" | "reject-wal3-d1-ckpt" => "D1",
+        "reject-wal3-h5-version" => "H5",
+        "reject-wal3-h6-flags" => "H6",
+        "reject-wal3-h7-seq" => "H7",
+        "reject-wal3-h9-firstlsn" => "H9",
+        "reject-wal3-k4-through" => "K4",
+        "reject-wal3-k-through0" | "reject-wal3-k-logstart0" | "reject-wal3-k-logstart-hi" => {
+            "S8/K-bounds"
+        }
+        "reject-wal3-s2-lsn-regress" => "S2",
+        "reject-wal3-s9-gap" => "S9",
+        "reject-wal3-s4-midlog-crc" => "S4/mid-log",
+        "reject-wal3-r4-floor" => "R4-floor",
+        "reject-wal3-r4-chain" => "R4-chain",
+        "reject-wal3-r4-self" => "R4-self",
+        "reject-wal3-segment-at-direct" => "direct-magic",
+        "mut-wal3-mark-then-refusal" => "R6-audit",
+        "div-wal3-lsn-exhausted" => "StoreFull",
+        "div-wal3-entry-recid0" | "div-wal3-packlong-overlong" => "DataCorruption",
+        _ => return None,
+    })
 }
 
 /// [`load_sample_v2`] over manifest text supplied by the caller, so a DOCTORED
@@ -2033,8 +2158,8 @@ impl<'a> Cells<'a> {
         }
     }
 
-    /// Every `action`/`bytes`/`reopen`/`post` row addressed to this engine in
-    /// `mode` must name a cell the engine actually runs.
+    /// Every `action`/`bytes`/`reopen`/`family`/`post` row addressed to this
+    /// engine in `mode` must name a cell the engine actually runs.
     ///
     /// **Per-cell consumption cannot see this**, and both C5j reviewers proved
     /// it independently: the accountant is built from the rows addressed to the
@@ -2074,7 +2199,14 @@ impl<'a> Cells<'a> {
                 orphans.insert(format!("reopen {}/{} {}", r.fixture, r.mode, r.family));
             }
         }
-        // `post` is the FOURTH addressed row type. C5j's round 2 found that
+        // C8f f1: `family` is the fifth addressed oracle row type — same
+        // suite-wide orphan rule as reopen (plan §4.2 item 2).
+        for r in &m.families {
+            if addressed(&r.engine, &r.mode, &r.fixture) {
+                orphans.insert(format!("family {}/{} {}", r.fixture, r.mode, r.family));
+            }
+        }
+        // `post` is an addressed row type. C5j's round 2 found that
         // nothing on either side of the fence caught one addressed to a cell no
         // engine runs; §2.3 names it now, and it has a per-cell debt as well.
         for p in &m.posts {
@@ -2123,6 +2255,9 @@ impl<'a> Cells<'a> {
         for r in m.reopens_of(&e.fixture, ENGINE, &e.mode) {
             owed.owe(&format!("reopen {}", r.family), r);
         }
+        for r in m.families_of(&e.fixture, ENGINE, &e.mode) {
+            owed.owe(&format!("family {}", r.family), r);
+        }
         for p in m.posts_of(&e.fixture, ENGINE, &e.mode) {
             owed.owe(&format!("post {}", p.rel), p);
         }
@@ -2142,42 +2277,26 @@ impl<'a> Cells<'a> {
         };
         let target = cell.join(&e.open_arg);
         // The cell's OWN refusal, on a reject cell. `None` on an accept cell,
-        // where there is none and the reopen row (Q8's) is graded alone.
+        // where there is none and a `reopen` row (Q8's) is the only grade.
         let mut first_refusal: Option<DbError> = None;
         match e.verdict.as_str() {
             "accept" => self.run_accept(&ctx, e, opener, &target, open, &mut owed),
             // A `reject` cell asserts that the open FAILED. Since C5t it can
             // also assert WHICH failure, and that is plan §3.12's point.
             //
-            // C5r measured the families: this engine's reject cells refuse as
-            // corruption verdicts except `div-wal3-lsn-exhausted`, which is
-            // `StoreFull`, and contract §10.1 pins that — *"rust, zig, rw and
-            // ro: reject, error family StoreFull exactly — not the corruption
-            // family"*. The v2 `expect` row still has no column to carry a
-            // family. What it has now is a `reopen` row per eligible reject
-            // arm, derived in `catalogue.py` from the family already pinned
-            // there, and the family is graded HERE, on this arm's own refusal.
-            // `assert_reopen` then opens again and grades the same family a
-            // second time, which is the STABILITY half — a store that refuses
-            // once and opens on the retry now fails, and passed before.
+            // C8f f1: first-open family comes from the `family` row (plan §4.2),
+            // not only via the `reopen` path. `assert_first_open_family` looks
+            // up exactly one key for `(fixture, rust, mode)`, grades the held
+            // refusal, and consumes once. `assert_reopen` is then stability /
+            // second-open only. Mutating R6-audit/rw carries `family` alone.
             //
-            // Grading here rather than only on the reopen is codex round 1
-            // finding 2: the reopen is a WRITABLE open, so every `mode=ro` row
-            // was graded on a retry in the other mode, and a store that refuses
-            // read-only for one reason and writable for another passed. The arm
-            // the corpus names is this one.
-            //
-            // What is NOT covered: the thirteen families outside
-            // `catalogue.REOPEN_FAMILIES`, still graded by "it refused" alone.
-            // That is L15's remainder and its owner is C8.
-            //
-            // The refusal is HELD rather than graded here. `assert_reopen`
-            // grades it, after the capture and the post-state rules, because
-            // §3.11's mutant — the direct cell dispatched to the wal3 opener —
-            // trips both this family check and the post-row rule it was written
-            // to prove, and lesson (h) says such an input measures whichever
-            // fires first. Grading here made §3.11's mutant report the family,
-            // and §3.11's own rule went unmeasured.
+            // The refusal is HELD rather than graded here. Family grading runs
+            // after the capture and the post-state rules, because §3.11's
+            // mutant — the direct cell dispatched to the wal3 opener — trips
+            // both this family check and the post-row rule it was written to
+            // prove, and lesson (h) says such an input measures whichever fires
+            // first. Grading here made §3.11's mutant report the family, and
+            // §3.11's own rule went unmeasured.
             "reject" => {
                 first_refusal = Some(
                     refusal_of(&ctx, opener, &e.mode, &target, open).unwrap_or_else(|| {
@@ -2218,15 +2337,11 @@ impl<'a> Cells<'a> {
             &ctx,
             &mut owed,
         );
-        assert_reopen(
-            m,
-            e,
-            opener,
-            &target,
-            &ctx,
-            &mut owed,
-            first_refusal.as_ref(),
-        );
+        // First-open family grade (C8f f1) BEFORE the stability reopen, so a
+        // wrong `family` row reds at `family[..]` and a wrong `reopen` reds at
+        // `reopen[..]` — distinct sites, no double-consume (different keys).
+        assert_first_open_family(m, e, &ctx, &mut owed, first_refusal.as_ref());
+        assert_reopen(m, e, opener, &target, &ctx, &mut owed);
         owed.require_all_consumed();
     }
 
@@ -2444,6 +2559,70 @@ fn assert_bytes_rows(
     }
 }
 
+/// Grades the cell's OWN (first-open) refusal against the `family` row.
+///
+/// Plan §4.2 executor invariant (C8f f1):
+/// 1. On every rejected open: look up exactly one `family` key for
+///    `(fixture, rust, mode)`; absence is failure; `assert_family`; consume
+///    once.
+/// 2. Accept arms carry no `family` row; a present row is owed and left
+///    unconsumed, which fails at suite/cell end — same as orphan reopen.
+/// 3. Mutating R6-audit/rw: `family` only (no `reopen`) still grades here.
+///
+/// Kept AFTER post-state (see `run_cell`) so §3.11's misrouted direct cell
+/// reports the lock/file-set red rather than a family red (lesson h).
+fn assert_first_open_family(
+    m: &V2,
+    e: &V2Expect,
+    ctx: &str,
+    owed: &mut Consumption,
+    first: Option<&DbError>,
+) {
+    let fams = m.families_of(&e.fixture, ENGINE, &e.mode);
+    match e.verdict.as_str() {
+        "reject" => {
+            let f = first.unwrap_or_else(|| {
+                panic!("[{ctx}] reject cell has no held first-open refusal to grade")
+            });
+            // Absence is failure — not a silent skip. Zero rows would leave
+            // nothing owed and the first open ungraded; more than one is a
+            // parser-level duplicate already, but re-assert for the invariant.
+            assert!(
+                !fams.is_empty(),
+                "[{ctx}] reject arm has no family row for ({}/{}/{}) — first-open family is \
+                 required (C8f f1 / plan §4.2)",
+                e.fixture,
+                ENGINE,
+                e.mode
+            );
+            assert_eq!(
+                fams.len(),
+                1,
+                "[{ctx}] reject arm has {} family rows for ({}/{}/{}); exactly one is required",
+                fams.len(),
+                e.fixture,
+                ENGINE,
+                e.mode
+            );
+            let r = fams[0];
+            assert_family(&format!("{ctx} family[{}]", r.family), &r.family, f);
+            owed.consume(&format!("family {}", r.family), r);
+        }
+        "accept" => {
+            // A family row on an accept arm is catalogue-illegal; if one is
+            // present it stays owed and `require_all_consumed` reds. No consume
+            // path here — that is the fail-closed half of the bijection.
+            let _ = (fams, first);
+        }
+        v => panic!("[{ctx}] unsupported verdict {v}"),
+    }
+}
+
+/// Stability / second-open grade only (C8f f1).
+///
+/// First-open family grading moved to [`assert_first_open_family`]. On an
+/// ACCEPT cell — Q8 — there is no first refusal and the reopen remains the
+/// only grade. On a REJECT cell the second open must refuse the same way.
 fn assert_reopen(
     m: &V2,
     e: &V2Expect,
@@ -2451,24 +2630,9 @@ fn assert_reopen(
     target: &Path,
     ctx: &str,
     owed: &mut Consumption,
-    first: Option<&DbError>,
 ) {
     for r in m.reopens_of(&e.fixture, ENGINE, &e.mode) {
         let where_ = format!("{ctx} reopen[{}]", r.family);
-        // THE CELL'S OWN REFUSAL FIRST, where there was one. C5t's first draft
-        // graded the family on the reopen alone and threw the first refusal
-        // away; codex round 1 finding 2 is why it does not. The reopen is a
-        // WRITABLE open whatever the cell's mode was, so every `mode=ro` row was
-        // graded on a retry in the OTHER mode — a store that refuses read-only
-        // for one reason and writable for another passed, and so did a stateful
-        // one that got it wrong once and right on retry. The arm the corpus
-        // names is the first open; the second is the stability check.
-        //
-        // On an ACCEPT cell — Q8 — `first` is None and the reopen is the only
-        // grading there is, because the cell's own open succeeded.
-        if let Some(f) = first {
-            assert_family(&format!("{ctx} family[{}]", r.family), &r.family, f);
-        }
         // A reopen is a WRITABLE open whatever the cell's own mode was: the
         // claim is that the store is permanently unopenable, and a read-only
         // probe would be a weaker one.
@@ -2686,9 +2850,10 @@ fn s4_matches(msg: &str) -> bool {
     // offset ", which is also the non-final marker — checking non-final first
     // would take the mid-log message, fail the non-final tail, and refuse a
     // genuine mid-log refusal.
-    if let Some(rest) =
-        after_wal_segment(msg, ": mid-log corruption: section body CRC mismatch at offset ")
-    {
+    if let Some(rest) = after_wal_segment(
+        msg,
+        ": mid-log corruption: section body CRC mismatch at offset ",
+    ) {
         let Some((off, tail)) = rest.split_once(" but valid sections follow") else {
             return false;
         };
@@ -2773,7 +2938,8 @@ fn r6_audit_matches(msg: &str) -> bool {
     ) else {
         return false;
     };
-    let Some((recid, tail)) = rest.split_once("): the log is missing sections it depends on") else {
+    let Some((recid, tail)) = rest.split_once("): the log is missing sections it depends on")
+    else {
         return false;
     };
     digits(n) && digits(recid) && tail.is_empty()
@@ -2943,7 +3109,11 @@ pub fn run_v2_cells(
     // row would be running assertions this rule never bought, and since C5 moved
     // the profile split into the grammar that is a refusal, not a widening.
     assert!(
-        m.applies.is_empty() && m.actions.is_empty() && m.bytes.is_empty() && m.reopens.is_empty(),
+        m.applies.is_empty()
+            && m.actions.is_empty()
+            && m.bytes.is_empty()
+            && m.reopens.is_empty()
+            && m.families.is_empty(),
         "the static sample carries an oracle row; it is v2-core through C7"
     );
     let want: BTreeSet<String> = m

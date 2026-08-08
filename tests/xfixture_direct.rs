@@ -29,8 +29,14 @@ fn store_direct_cross_port_cells_conform() {
         if e.engine != xfix::ENGINE {
             continue;
         }
-        assert_eq!(e.opener, "direct", "this harness only runs the direct opener");
-        assert_eq!(e.mode, "rw", "StoreDirect has no read-only cell in this harness");
+        assert_eq!(
+            e.opener, "direct",
+            "this harness only runs the direct opener"
+        );
+        assert_eq!(
+            e.mode, "rw",
+            "StoreDirect has no read-only cell in this harness"
+        );
 
         let cell = session.join(format!("cell-{}", accepts + rejects));
         std::fs::create_dir_all(&cell).unwrap();
@@ -72,7 +78,10 @@ fn store_direct_cross_port_cells_conform() {
         );
         let _ = std::fs::remove_dir_all(&cell);
     }
-    assert_eq!(accepts, 3, "missing a StoreDirect accept cell (3 writers × this reader)");
+    assert_eq!(
+        accepts, 3,
+        "missing a StoreDirect accept cell (3 writers × this reader)"
+    );
     assert_eq!(
         rejects, 4,
         "missing a StoreDirect reject cell (4 shared malformed images)"

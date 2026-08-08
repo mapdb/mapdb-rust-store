@@ -372,7 +372,8 @@ fn the_c5_oracle_rows_parse_and_are_checked() {
          action\tf\trust\tro\tcommit_one_record\top=put,payload_id=1,payload_len=2,\
          recid_label=Z,serializer=raw\n\
          bytes\tf\trust\tro\tx.wal.0000000000000001\t0\taabb\n\
-         reopen\tf\trust\tro\tS2\n"
+         reopen\tf\trust\tro\tS2\n\
+         family\tf\trust\tro\tS2\n"
     );
     let m = xfix::parse(&good);
     let m = m.v2();
@@ -380,12 +381,14 @@ fn the_c5_oracle_rows_parse_and_are_checked() {
     assert_eq!(m.actions_of("f", "rust", "ro").len(), 1);
     assert_eq!(m.bytes_of("f", "rust", "ro").len(), 1);
     assert_eq!(m.reopens_of("f", "rust", "ro").len(), 1);
+    assert_eq!(m.families_of("f", "rust", "ro").len(), 1);
     assert_eq!(m.actions[0].verb, "commit_one_record");
     assert_eq!(m.bytes[0].offset, 0);
     assert_eq!(m.bytes[0].hex, "aabb");
     assert_eq!(m.reopens[0].family, "S2");
+    assert_eq!(m.families[0].family, "S2");
 
-    let cases: [(&str, String); 12] = [
+    let cases: [(&str, String); 14] = [
         (
             "a duplicate applies row",
             format!("{head}applies\tf\trust\tro\napplies\tf\trust\tro\n"),
@@ -401,6 +404,14 @@ fn the_c5_oracle_rows_parse_and_are_checked() {
         (
             "a second reopen row for one cell",
             format!("{head}reopen\tf\trust\tro\tS2\nreopen\tf\trust\tro\tS9\n"),
+        ),
+        (
+            "an out-of-vocabulary mode on a family row",
+            format!("{head}family\tf\trust\trwx\tS2\n"),
+        ),
+        (
+            "a second family row for one cell",
+            format!("{head}family\tf\trust\tro\tS2\nfamily\tf\trust\tro\tS9\n"),
         ),
         (
             "a second action row for one cell and verb",
