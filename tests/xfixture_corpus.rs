@@ -77,19 +77,10 @@
 //! coverage claim nothing checks. Each of these was applied and the whole suite
 //! stayed green:
 //!
-//! - `ran == want` in `run_v2_corpus_cells`. `applies == expect` fires first on
-//!   every input that separates them, and `run_cells` runs one cell per
-//!   `expect` row by construction, so the two can disagree only if the executor
-//!   itself is broken. Deleting `applies == expect` IS killed — by this
-//!   equality — so the pair guards each other in one direction only.
-//! - the `ro_probed` comparison, the corpus-root file-set comparison, and the
-//!   distribution-seal comparison. Each is the last statement in its group:
-//!   they are what give the probe call, the root inventory and the copy its
-//!   reds, and nothing observes THEM. This is the leaf pushed down, not
-//!   removed.
-//! - the `v2-core` profile assertion in `run_v2_cells`. The static sample
-//!   carries no oracle row, so no input reaches it; it exists for the day one
-//!   appears.
+//! - ~~`ran == want` / `ro_probed` / rootset / distseal / profile /
+//!   capture_isfile~~ — **C9m measured all six** (see the `C9m` section and
+//!   `todo/store-wal3/wal3-c9-plan.md`). Under-run seam, skip-probe-record,
+//!   wrong-artifact roots, oracle-bearing static sample, subdirectory capture.
 //! - **the REOPEN's `assert_family` call** (`familycall`, which was a case until
 //!   C5t). Round 1's finding 2 moved the family grading onto the reject arm's
 //!   OWN refusal and kept the reopen's as the STABILITY check; for any store
@@ -1478,6 +1469,43 @@ fn an_unconsumed_oracle_row_is_a_failure() {
 // the root itself
 // ---------------------------------------------------------------------------
 
+/// Production inventory check — parameterized so C9m can doctor a temporary
+/// root while the mutant still targets this assert fragment.
+fn assert_corpus_rootset(root: &Path, sample: &xfix::SampleV2) {
+    let mut expected: BTreeSet<String> = BTreeSet::new();
+    expected.insert("MANIFEST.tsv".to_string());
+    for f in &sample.manifest.files {
+        expected.insert(f.blob_name());
+    }
+    assert_eq!(
+        expected,
+        dir_names(root),
+        "the corpus root holds files no `file` row accounts for (or is missing one)"
+    );
+}
+
+/// Production dist-seal check — same parameterization as [`assert_corpus_rootset`].
+fn assert_corpus_distseal(root: &Path) {
+    let names = dir_names(root);
+    assert!(!names.is_empty(), "the corpus root is empty");
+    let mut pre = String::from("mapdb-xfixtures-dist\tv1\nengine\trust\n");
+    for n in &names {
+        let b = std::fs::read(root.join(n)).unwrap();
+        pre.push_str(&format!(
+            "file\t{n}\t{}\t{}\troot\n",
+            b.len(),
+            xfix::sha256_hex(&b)
+        ));
+    }
+    assert_eq!(
+        DIST_SEAL,
+        xfix::sha256_hex(pre.as_bytes()),
+        "this root is not todo/store-cross/corpus-v2/'s `root` slice. Regenerate with \
+         `freeze_v2.py --corpus --dist-seals`, and copy the TREE too — a constant updated \
+         alone certifies whatever is here"
+    );
+}
+
 /// The corpus root holds `MANIFEST.tsv` plus one blob per `file` row and
 /// nothing else (C5 plan §4c).
 ///
@@ -1486,17 +1514,9 @@ fn an_unconsumed_oracle_row_is_a_failure() {
 /// distributed to any engine.
 #[test]
 fn the_corpus_root_has_nothing_unexplained() {
-    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
-    let mut expected: BTreeSet<String> = BTreeSet::new();
-    expected.insert("MANIFEST.tsv".to_string());
-    for f in &sample.manifest.files {
-        expected.insert(f.blob_name());
-    }
-    assert_eq!(
-        expected,
-        dir_names(&xfix::v2_corpus_root()),
-        "the corpus root holds files no `file` row accounts for (or is missing one)"
-    );
+    let root = xfix::v2_corpus_root();
+    let sample = xfix::load_sample_v2(&root);
+    assert_corpus_rootset(&root, &sample);
 }
 
 /// This root is byte-identical to todo's sealed tree.
@@ -1518,23 +1538,140 @@ fn the_corpus_root_has_nothing_unexplained() {
 /// of the distributed bytes and this repository has no way to check them.
 #[test]
 fn the_corpus_root_matches_todos_sealed_tree() {
-    let dir = xfix::v2_corpus_root();
-    let names = dir_names(&dir);
-    assert!(!names.is_empty(), "the corpus root is empty");
-    let mut pre = String::from("mapdb-xfixtures-dist\tv1\nengine\trust\n");
-    for n in &names {
-        let b = std::fs::read(dir.join(n)).unwrap();
-        pre.push_str(&format!(
-            "file\t{n}\t{}\t{}\troot\n",
-            b.len(),
-            xfix::sha256_hex(&b)
-        ));
-    }
-    assert_eq!(
-        DIST_SEAL,
-        xfix::sha256_hex(pre.as_bytes()),
-        "this root is not todo/store-cross/corpus-v2/'s `root` slice. Regenerate with \
-         `freeze_v2.py --corpus --dist-seals`, and copy the TREE too — a constant updated \
-         alone certifies whatever is here"
+    assert_corpus_distseal(&xfix::v2_corpus_root());
+}
+
+// ---------------------------------------------------------------------------
+// C9m — measure the six formerly unmeasured leaves
+// ---------------------------------------------------------------------------
+
+/// `capture_isfile` (plan option a): a subdirectory in a cell inventory must
+/// refuse with the diagnostic; when the assert is deleted, `read_named` is the
+/// replacement red (`cannot read`).
+#[test]
+fn capture_refuses_a_subdirectory() {
+    let session = fresh_session("capture_subdir");
+    let cell = session.join("cell");
+    std::fs::create_dir_all(cell.join("nested")).unwrap();
+    // a regular sibling so the walk is not empty for other reasons
+    std::fs::write(cell.join("x"), b"payload").unwrap();
+    let msg = red_of(|| {
+        let _ = xfix::capture(&cell, "capture_subdir");
+    })
+    .unwrap_or_else(|| panic!("capture accepted a cell directory holding a subdirectory"));
+    assert!(
+        msg.contains("is not a regular file"),
+        "capture_isfile diagnostic: got: {msg}"
     );
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// `rootset`: inventory super-set must be the only red.
+#[test]
+fn rootset_refuses_an_extra_file() {
+    let src = xfix::v2_corpus_root();
+    let sample = xfix::load_sample_v2(&src);
+    let session = fresh_session("rootset_extra");
+    let root = session.join("root");
+    copy_tree(&src, &root);
+    std::fs::write(root.join("EXTRA_NOT_IN_MANIFEST"), b"x").unwrap();
+    let msg = red_of(|| assert_corpus_rootset(&root, &sample))
+        .unwrap_or_else(|| panic!("rootset accepted a root with an extra file"));
+    assert!(
+        msg.contains("no `file` row accounts for") || msg.contains("assertion `left == right` failed"),
+        "rootset: got: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// `distseal`: wrong artifact bytes must be the only red.
+#[test]
+fn distseal_refuses_a_flipped_blob() {
+    let src = xfix::v2_corpus_root();
+    let session = fresh_session("distseal_flip");
+    let root = session.join("root");
+    copy_tree(&src, &root);
+    // flip one distributed blob's first byte
+    let names = dir_names(&root);
+    let blob = names
+        .iter()
+        .find(|n| n.ends_with(".gz") || n.contains("wal"))
+        .expect("corpus root has a blob to flip");
+    let mut b = std::fs::read(root.join(blob)).unwrap();
+    if b.is_empty() {
+        b.push(1);
+    } else {
+        b[0] ^= 0xff;
+    }
+    std::fs::write(root.join(blob), &b).unwrap();
+    let msg = red_of(|| assert_corpus_distseal(&root))
+        .unwrap_or_else(|| panic!("distseal accepted a root whose bytes differ from DIST_SEAL"));
+    assert!(
+        msg.contains("not todo/store-cross/corpus-v2")
+            || msg.contains("assertion `left == right` failed"),
+        "distseal: got: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// `profile`: static-sample path must refuse a manifest that carries an oracle row.
+#[test]
+fn profile_refuses_oracle_rows_on_v2_core_path() {
+    let root = xfix::v2_root();
+    let text = xfix::read_root_text(&root, "MANIFEST.tsv");
+    // Any applies row trips the v2-core profile assert in run_v2_cells.
+    let doctored = format!("{text}applies\twal3-java-tail\trust\trw\n");
+    assert_ne!(doctored, text);
+    let sample = xfix::load_sample_v2_text(&root, &doctored);
+    let session = fresh_session("profile_oracle");
+    let msg = red_of(|| xfix::run_v2_cells(&sample, "rw", &session, &open_rw))
+        .unwrap_or_else(|| panic!("profile accepted a static sample carrying an applies row"));
+    assert!(
+        msg.contains("static sample carries an oracle row"),
+        "profile: got: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+/// `ranwant` (plan option A): under-run seam skips one expect cell while
+/// `want == expects` stays true.
+#[test]
+fn ranwant_detects_an_under_run() {
+    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
+    let skip = sample
+        .manifest
+        .expects
+        .iter()
+        .find(|e| e.engine == "rust" && e.mode == "rw")
+        .map(|e| e.fixture.clone())
+        .expect("corpus has a rust rw expect cell to skip");
+    let session = fresh_session("ranwant_under");
+    let msg = red_of(|| {
+        xfix::with_under_run_skip(&skip, || {
+            xfix::run_v2_corpus_cells(&sample, "rw", &session, &open_rw);
+        });
+    })
+    .unwrap_or_else(|| panic!("ranwant accepted an under-run (skipped {skip})"));
+    assert!(
+        msg.contains("cells that ran are not the ones `applies` calls for"),
+        "ranwant: got: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&session);
+}
+
+// `roset` is measured in `xfix_ro` (crate-internal open_ro), not here.
+
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for ent in std::fs::read_dir(src).unwrap() {
+        let ent = ent.unwrap();
+        let name = ent.file_name();
+        let from = ent.path();
+        let to = dst.join(&name);
+        if from.is_dir() {
+            copy_tree(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
 }

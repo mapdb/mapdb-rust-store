@@ -61,6 +61,25 @@ fn corpus_ro_cells_conform() {
     let _ = std::fs::remove_dir_all(&session);
 }
 
+/// C9m `roset`: skip probe bookkeeping so `ro_probed` disagrees with `ro_cells`.
+/// Lives here because only this module reaches the crate-internal read-only open.
+#[test]
+fn roset_detects_missing_probe_records() {
+    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
+    let session = xfix::session_dir("xfix_roset_skip");
+    let msg = xfix::red_of(|| {
+        xfix::with_skip_ro_probe_record(|| {
+            xfix::run_v2_corpus_cells(&sample, "ro", &session, &open_ro);
+        });
+    })
+    .unwrap_or_else(|| panic!("roset accepted a ro suite that recorded no probes"));
+    assert!(
+        msg.contains("the ro cells whose read-only handle was probed with a write"),
+        "roset: got: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&session);
+}
+
 /// The read-only refusal is not vacuous: the same write, on the same fixture,
 /// through the two handles, with opposite outcomes.
 ///

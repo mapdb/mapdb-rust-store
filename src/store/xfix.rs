@@ -2410,7 +2410,14 @@ impl<'a> Cells<'a> {
         // recording at the call site, deleting the call and keeping the `add`
         // leaves the gate green — the set then observes that the bookkeeping
         // ran, not that the probe did.
-        self.ro_probed.insert(format!("{}/{}", e.fixture, e.mode));
+        //
+        // C9m: `SKIP_RO_PROBE_RECORD` lets a doctored ro suite omit the
+        // bookkeeping while the write probe itself still runs — so `roset`'s
+        // `ro_cells == ro_probed` assert is the only red. Production paths
+        // never set the flag.
+        if !SKIP_RO_PROBE_RECORD.with(|c| c.get()) {
+            self.ro_probed.insert(format!("{}/{}", e.fixture, e.mode));
+        }
     }
 }
 
@@ -3149,6 +3156,12 @@ fn run_cells(
         .collect();
     let mut ran: BTreeSet<String> = BTreeSet::new();
     for (i, e) in expects.iter().enumerate() {
+        // C9m ranwant: optional under-run seam. Production never sets this.
+        // `want` is still built from every applies/expect row; skipping here
+        // makes `ran != want` while leaving `want == expects` true.
+        if UNDER_RUN_SKIP_FIXTURE.with(|s| s.borrow().as_deref() == Some(e.fixture.as_str())) {
+            continue;
+        }
         let cell = session.join(format!("v2-{mode}-{i}"));
         let _ = std::fs::remove_dir_all(&cell);
         std::fs::create_dir_all(&cell).unwrap();
@@ -3161,6 +3174,40 @@ fn run_cells(
         std::fs::remove_dir_all(&cell).unwrap();
     }
     ran
+}
+
+// ---------------------------------------------------------------------------
+// C9m test seams — production paths never set these.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// When set to a fixture id, [`run_cells`] skips that expect cell so
+    /// `ran != want` while `want == expects` stays true. Measures `ranwant`.
+    pub static UNDER_RUN_SKIP_FIXTURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// When true, [`Cells::assert_write_refused`] still probes the write but
+    /// does not record into `ro_probed`. Measures `roset`.
+    pub static SKIP_RO_PROBE_RECORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with [`UNDER_RUN_SKIP_FIXTURE`] set, then clears it.
+pub fn with_under_run_skip(fixture: &str, f: impl FnOnce()) {
+    UNDER_RUN_SKIP_FIXTURE.with(|s| *s.borrow_mut() = Some(fixture.to_string()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    UNDER_RUN_SKIP_FIXTURE.with(|s| *s.borrow_mut() = None);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// Runs `f` with [`SKIP_RO_PROBE_RECORD`] set, then clears it.
+pub fn with_skip_ro_probe_record(f: impl FnOnce()) {
+    SKIP_RO_PROBE_RECORD.with(|c| c.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    SKIP_RO_PROBE_RECORD.with(|c| c.set(false));
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 /// The completeness half of the recid oracle: every recid the LOG mentions is
