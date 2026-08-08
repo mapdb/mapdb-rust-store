@@ -34,6 +34,9 @@ pub(crate) mod wal_segments;
 /// WAL format v3 section writer (table W) and the durability event seam.
 pub(crate) mod wal_write;
 
+/// C8x cross-process lock probe (crate-internal RO seam).
+#[cfg(test)]
+mod wal3_lock_probe;
 /// Cross-port fixture harness shared by the in-crate `ro` executor and the
 /// integration tests (`#[path]`-included there). See C-D3.
 #[cfg(test)]
