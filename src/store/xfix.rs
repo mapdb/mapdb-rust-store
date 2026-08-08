@@ -2566,6 +2566,241 @@ fn s2_matches(msg: &str) -> bool {
     signed(lsn) && digits(off) && signed(prev)
 }
 
+/// Strip the `WAL segment <name>: ` prefix with an opaque name (may contain
+/// `": "` or newlines). Returns the remainder after the last matching marker.
+fn after_wal_segment<'a>(msg: &'a str, marker: &str) -> Option<&'a str> {
+    let rest = msg.strip_prefix("WAL segment ")?;
+    let (_name, rest) = rest.rsplit_once(marker)?;
+    if _name.is_empty() {
+        return None;
+    }
+    Some(rest)
+}
+
+fn digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())
+}
+
+fn signed_digits(s: &str) -> bool {
+    digits(s.strip_prefix('-').unwrap_or(s))
+}
+
+fn n6_matches(msg: &str) -> bool {
+    // Rust/zig use "to v3"; java still says "to v2". This engine's wording:
+    // `v1 single-file WAL present at <path>: no migration to v3 — …`
+    const TAIL: &str = ": no migration to v3 — open it with the release that wrote it and copy \
+                        the data across, or move it aside";
+    let Some(head) = msg.strip_suffix(TAIL) else {
+        return false;
+    };
+    let Some(path) = head.strip_prefix("v1 single-file WAL present at ") else {
+        return false;
+    };
+    !path.is_empty()
+}
+
+fn h5_matches(msg: &str) -> bool {
+    let Some(rest) = after_wal_segment(msg, ": unsupported WAL format version ") else {
+        return false;
+    };
+    signed_digits(rest)
+}
+
+fn h6_matches(msg: &str) -> bool {
+    let Some(rest) = after_wal_segment(msg, ": unknown segment flags ") else {
+        return false;
+    };
+    signed_digits(rest)
+}
+
+fn h7_matches(msg: &str) -> bool {
+    let Some(rest) = after_wal_segment(msg, ": header sequence ") else {
+        return false;
+    };
+    let Some((seq, tail)) = rest.split_once(" does not match its name") else {
+        return false;
+    };
+    signed_digits(seq) && tail.is_empty()
+}
+
+fn h9_matches(msg: &str) -> bool {
+    let Some(rest) = after_wal_segment(msg, ": header firstLsn ") else {
+        return false;
+    };
+    let Some((lsn, tail)) = rest.split_once(" is not a valid LSN") else {
+        return false;
+    };
+    signed_digits(lsn) && tail.is_empty()
+}
+
+fn k4_matches(msg: &str) -> bool {
+    let Some(rest) = after_wal_segment(msg, ": clean mark in segment ") else {
+        return false;
+    };
+    let Some((seg, rest)) = rest.split_once(" authorizes removing segment ") else {
+        return false;
+    };
+    let Some((through, tail)) = rest.split_once(", including itself") else {
+        return false;
+    };
+    signed_digits(seg) && signed_digits(through) && tail.is_empty()
+}
+
+fn s8_matches(msg: &str) -> bool {
+    // Three disjuncts on the 'K' body. K4 is a neighbour on the same mark.
+    if let Some(rest) = after_wal_segment(msg, ": clean mark body is ") {
+        if let Some((n, tail)) = rest.split_once(" bytes, not 16") {
+            return signed_digits(n) && tail.is_empty();
+        }
+        return false;
+    }
+    if let Some(rest) = after_wal_segment(msg, ": clean mark attests cleanedThroughSeq ") {
+        return signed_digits(rest);
+    }
+    if let Some(rest) = after_wal_segment(msg, ": clean mark attests logStartLsn ") {
+        let Some((start, rest)) =
+            rest.split_once(", which is not an LSN at or below the mark's own ")
+        else {
+            return false;
+        };
+        return signed_digits(start) && signed_digits(rest);
+    }
+    false
+}
+
+fn s9_matches(msg: &str) -> bool {
+    let Some(rest) = after_wal_segment(msg, ": section LSNs must be consecutive: ") else {
+        return false;
+    };
+    let Some((lsn, rest)) = rest.split_once(" at offset ") else {
+        return false;
+    };
+    let Some((off, prev)) = rest.split_once(" after ") else {
+        return false;
+    };
+    signed_digits(lsn) && digits(off) && signed_digits(prev)
+}
+
+fn s4_matches(msg: &str) -> bool {
+    // Active mid-log FIRST: its wording embeds ": section body CRC mismatch at
+    // offset ", which is also the non-final marker — checking non-final first
+    // would take the mid-log message, fail the non-final tail, and refuse a
+    // genuine mid-log refusal.
+    if let Some(rest) =
+        after_wal_segment(msg, ": mid-log corruption: section body CRC mismatch at offset ")
+    {
+        let Some((off, tail)) = rest.split_once(" but valid sections follow") else {
+            return false;
+        };
+        return digits(off) && tail.is_empty();
+    }
+    if let Some(rest) = after_wal_segment(msg, ": section body CRC mismatch at offset ") {
+        let Some((off, tail)) = rest.split_once(" in a non-final segment") else {
+            return false;
+        };
+        return digits(off) && tail.is_empty();
+    }
+    false
+}
+
+fn r4_floor_matches(msg: &str) -> bool {
+    // `WAL retained log begins at LSN <n> in <name> but <why>: sections below it are gone`
+    let Some(rest) = msg.strip_prefix("WAL retained log begins at LSN ") else {
+        return false;
+    };
+    let Some((lsn, rest)) = rest.split_once(" in ") else {
+        return false;
+    };
+    let Some((_name, rest)) = rest.rsplit_once(" but ") else {
+        return false;
+    };
+    let Some((_why, tail)) = rest.rsplit_once(": sections below it are gone") else {
+        return false;
+    };
+    signed_digits(lsn) && tail.is_empty() && !_name.is_empty() && !_why.is_empty()
+}
+
+fn r4_chain_matches(msg: &str) -> bool {
+    // `WAL segment <name> states it begins at LSN <n> but <prev> accounts for LSNs up to <n>: sections between them are gone`
+    let Some(rest) = msg.strip_prefix("WAL segment ") else {
+        return false;
+    };
+    let Some((_name, rest)) = rest.rsplit_once(" states it begins at LSN ") else {
+        return false;
+    };
+    if _name.is_empty() {
+        return false;
+    }
+    let Some((stated, rest)) = rest.split_once(" but ") else {
+        return false;
+    };
+    let Some((_prev, rest)) = rest.rsplit_once(" accounts for LSNs up to ") else {
+        return false;
+    };
+    let Some((upto, tail)) = rest.split_once(": sections between them are gone") else {
+        return false;
+    };
+    signed_digits(stated) && signed_digits(upto) && tail.is_empty() && !_prev.is_empty()
+}
+
+fn r4_self_matches(msg: &str) -> bool {
+    // `WAL segment <name> states it begins at LSN <n> but its first section is <n>: its leading sections are gone`
+    let Some(rest) = msg.strip_prefix("WAL segment ") else {
+        return false;
+    };
+    let Some((_name, rest)) = rest.rsplit_once(" states it begins at LSN ") else {
+        return false;
+    };
+    if _name.is_empty() {
+        return false;
+    }
+    let Some((stated, rest)) = rest.split_once(" but its first section is ") else {
+        return false;
+    };
+    let Some((first, tail)) = rest.split_once(": its leading sections are gone") else {
+        return false;
+    };
+    signed_digits(stated) && signed_digits(first) && tail.is_empty()
+}
+
+fn r6_audit_matches(msg: &str) -> bool {
+    // Exact engine form, numbers opaque.
+    let Some(rest) = msg.strip_prefix("WAL replay skipped ") else {
+        return false;
+    };
+    let Some((n, rest)) = rest.split_once(
+        " append(s) whose base image is absent and which no later entry superseded (recid ",
+    ) else {
+        return false;
+    };
+    let Some((recid, tail)) = rest.split_once("): the log is missing sections it depends on") else {
+        return false;
+    };
+    digits(n) && digits(recid) && tail.is_empty()
+}
+
+/// True when a corruption payload belongs to any refined family this engine grades.
+/// Used by the generic `DataCorruption` arm as an exclusion set (C8f f0: all thirteen
+/// L15 families plus the C5t set).
+fn refined_family_matches(msg: &str) -> bool {
+    d1_matches(msg)
+        || s2_matches(msg)
+        || n6_matches(msg)
+        || h5_matches(msg)
+        || h6_matches(msg)
+        || h7_matches(msg)
+        || h9_matches(msg)
+        || k4_matches(msg)
+        || s8_matches(msg)
+        || s9_matches(msg)
+        || s4_matches(msg)
+        || r4_floor_matches(msg)
+        || r4_chain_matches(msg)
+        || r4_self_matches(msg)
+        || r6_audit_matches(msg)
+        || msg == "not a MapDB StoreDirect file (bad magic)"
+}
+
 /// Asserts a refusal belongs to the named contract family.
 ///
 /// The family is read from the manifest row, never hard-coded, so editing
@@ -2607,31 +2842,17 @@ pub fn assert_family(where_: &str, family: &str, t: &DbError) {
         // The UNREFINED corruption family: what the two divergent entry cells
         // land on, where the catalogue names no rule. Stated as an exclusion
         // because that is what it means — a corruption verdict no refined family
-        // this corpus TRANSPORTS describes.
+        // this engine GRADES describes.
         //
-        // **`S2` is excluded, and the first draft did not exclude it.** The
-        // argument for admitting it was that S2 is a strict refinement of this
-        // family rather than a neighbour, so refusing it would assert something
-        // about a different rule. codex round 1 finding 4 is the answer: a
-        // manifest row names ONE family, so with S2 admitted a divergent-entry
-        // cell that wrongly refused with the S2 rule still graded green, and the
-        // transport check the whole slice exists for is not exact. A refinement
-        // that another row can name is a neighbour here, whatever it is in the
-        // taxonomy.
-        //
-        // N6 is NOT excluded, and that is the same rule read the other way: no
-        // manifest row can name it (`REOPEN_FAMILIES` does not transport it), so
-        // nothing else claims that refusal and this family is where it belongs.
-        // If C8 transports N6, it must be excluded here on the day it is.
+        // C8f f0: every L15 family has a predicate, so all of them are excluded
+        // here (N6 included — the day C5t deferred). A refinement another arm
+        // can name is a neighbour, whatever it is in the taxonomy.
         let msg = match t {
             DbError::DataCorruption(c) => c.to_string(),
             _ => String::new(),
         };
         assert!(
-            matches!(t, DbError::DataCorruption(_))
-                && !d1_matches(&msg)
-                && !s2_matches(&msg)
-                && msg != "not a MapDB StoreDirect file (bad magic)",
+            matches!(t, DbError::DataCorruption(_)) && !refined_family_matches(&msg),
             "{where_}: `DataCorruption` is a corruption verdict no TRANSPORTED refined family \
              names, and this is: {t}"
         );
@@ -2642,28 +2863,6 @@ pub fn assert_family(where_: &str, family: &str, t: &DbError) {
         // corruption verdict AND its payload is the S2 rule's message. The
         // message is read from the PAYLOAD, not from the rendered error, because
         // `Display for DbError` prefixes `"data corruption: "`.
-        //
-        // **Why one statement.** Written as two, the variant assertion could be
-        // DELETED with the suite green: every currently constructible
-        // non-corruption `DbError` renders with a prefix of its own
-        // (`"verify failed: "`, `"unsupported operation: "`, `"store full"`), so
-        // the message half refuses the same input the variant half was there to
-        // catch. That is one check masked by another — lesson (h), the same
-        // shape C5j's round 3 found in java's form of this predicate from the
-        // opposite direction.
-        //
-        // **The round-1 review corrected me on the mechanism, and the
-        // correction matters.** I first wrote that the old variant check "could
-        // not be reached". It was reached, and it fired: the old code
-        // destructured `DataCorruption` FIRST and panicked on anything else, so
-        // the `VerifyFailed` probe died there. What was true is narrower — its
-        // DELETION was invisible, because the next predicate refused the same
-        // input. Reachable-and-masked, not unreachable. C5z should look for the
-        // masking, not for an unreached branch.
-        //
-        // The conjunction is expressed structurally rather than by leaning on
-        // those `Display` prefixes: a future `DbError` variant that rendered
-        // bare would otherwise silently satisfy this predicate.
         let payload = match t {
             DbError::DataCorruption(c) => Some(c.to_string()),
             _ => None,
@@ -2680,20 +2879,43 @@ pub fn assert_family(where_: &str, family: &str, t: &DbError) {
         // verdict for `div-wal3-lsn-exhausted` produces: a WAL segment
         // namespace with no sequence number left is a capacity ceiling with
         // nothing damaged, so the port refuses to call an intact store corrupt.
-        // A separate variant, so this predicate needs no message at all — and
-        // it is what makes the family reading DISCRIMINATE rather than agree
-        // with itself: the corpus has exactly one family per engine, and a
-        // predicate with one member cannot be shown to read the row.
         assert!(
             matches!(t, DbError::StoreFull),
             "{where_}: StoreFull is a capacity verdict, got {t}"
         );
         return;
     }
-    panic!(
-        "{where_}: error family {family} has no predicate in this engine. Refusing rather than \
-         accepting any refusal at all — an unimplemented family graded as 'it threw something' is \
-         the check not running"
+    // ---- C8f f0: L15 remainder (thirteen families) ----
+    let payload = match t {
+        DbError::DataCorruption(c) => Some(c.to_string()),
+        _ => None,
+    };
+    let ok = match family {
+        "N6" => payload.as_deref().is_some_and(n6_matches),
+        "H5" => payload.as_deref().is_some_and(h5_matches),
+        "H6" => payload.as_deref().is_some_and(h6_matches),
+        "H7" => payload.as_deref().is_some_and(h7_matches),
+        "H9" => payload.as_deref().is_some_and(h9_matches),
+        "K4" => payload.as_deref().is_some_and(k4_matches),
+        "S8/K-bounds" => payload.as_deref().is_some_and(s8_matches),
+        "S9" => payload.as_deref().is_some_and(s9_matches),
+        "S4/mid-log" => payload.as_deref().is_some_and(s4_matches),
+        "R4-floor" => payload.as_deref().is_some_and(r4_floor_matches),
+        "R4-chain" => payload.as_deref().is_some_and(r4_chain_matches),
+        "R4-self" => payload.as_deref().is_some_and(r4_self_matches),
+        "R6-audit" => payload.as_deref().is_some_and(r6_audit_matches),
+        _ => {
+            panic!(
+                "{where_}: error family {family} has no predicate in this engine. Refusing rather \
+                 than accepting any refusal at all — an unimplemented family graded as 'it threw \
+                 something' is the check not running"
+            );
+        }
+    };
+    assert!(
+        ok,
+        "{where_}: not the {family} rule's refusal — it must be a corruption verdict whose \
+         payload is that family's message, and this is: {t}"
     );
 }
 

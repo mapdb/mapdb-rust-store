@@ -681,8 +681,8 @@ const ACTION_BYTES_WRONG: &str = "000000000000000c";
 /// - `S2` — a family this engine DOES implement, whose predicate this refusal
 ///   fails. Only a family actually read from the row can tell this manifest
 ///   from the one above;
-/// - `R4-floor` — a family this engine has no predicate for, which must be a
-///   failure rather than "it threw something".
+/// - `H99` — outside the catalogue vocabulary (every real family now has a
+///   predicate — C8f f0), so it must fail rather than "it threw something".
 #[test]
 fn the_reopen_row_is_graded() {
     const PFX: &str = "reopen\tdiv-wal3-lsn-exhausted\trust\trw\t";
@@ -697,7 +697,7 @@ fn the_reopen_row_is_graded() {
     );
     refuses_cell(
         "a reopen family this engine has no predicate for",
-        &with("R4-floor"),
+        &with("H99"),
         "div-wal3-lsn-exhausted",
         "rw",
         "has no predicate in this engine",
@@ -721,13 +721,13 @@ fn the_reopen_row_is_graded() {
 #[test]
 fn the_reject_arms_own_refusal_is_graded() {
     const PFX: &str = "reopen\treject-wal3-d1-barebase\trust\trw\t";
-    let doctored_m = doctored(|t| format!("{}{PFX}R4-floor\n", drop_rows(t, PFX)));
+    let doctored_m = doctored(|t| format!("{}{PFX}H99\n", drop_rows(t, PFX)));
     refuses_cell(
         "a reject arm whose own refusal is graded by nothing",
         &doctored_m,
         "reject-wal3-d1-barebase",
         "rw",
-        "family[R4-floor]: error family R4-floor has no predicate in this engine",
+        "family[H99]: error family H99 has no predicate in this engine",
     );
 }
 
@@ -782,7 +782,7 @@ fn the_reopen_family_predicate_discriminates() {
     );
     refused(
         "a family this engine has no predicate for",
-        "R4-floor",
+        "H99",
         DbError::corrupt("anything at all"),
     );
     // The second implemented family, both ways round: it must accept its own
@@ -812,26 +812,19 @@ fn the_reopen_family_predicate_discriminates() {
         ),
     );
 
-    // ---- and C5t's three, as the WHOLE MATRIX ----------------------------
+    // ---- C5t + C8f f0: the WHOLE MATRIX ----------------------------------
     //
     // A family predicate that is never shown a NEIGHBOUR's refusal has not been
-    // shown to read the family at all — the lesson the two cases above this one
-    // were written for, now that there are five families instead of two. Every
-    // cell is stated rather than derived, because a matrix with one quietly
-    // wrong entry reads exactly like a correct one.
+    // shown to read the family at all. Over every family this engine grades the
+    // matrix is a true diagonal (with the extra columns that prove opacity /
+    // generic-arm membership for samples no refined family claims).
     //
-    // ONE entry is not the identity, and it is deliberate:
-    //
-    //   * `DataCorruption` accepts the N6 sample. N6 is a family the catalogue
-    //     names and `REOPEN_FAMILIES` does not transport, so no manifest row can
-    //     present it — the sample is here for the row BELOW it, which is the
-    //     claim that matters: **`D1` refuses N6.** Those two refusals are one
-    //     `for` loop apart in `wal_segments.rs` and share every word but the
-    //     first, so a D1 predicate that took the whole sentence-shape would
-    //     confuse the ports' upgrade boundary with Java's own row.
+    // C8f f0: N6 is now a graded family and is excluded from DataCorruption.
+    // D1 still refuses N6 (neighbour on the legacy-boundary loop).
     let migrate = "no migration to v3 — open it with the release that wrote it and copy the \
                    data across, or move it aside";
-    let samples: [(&str, DbError); 9] = [
+    // Sample order is the accepts-string column order below.
+    let samples: [(&str, DbError); 20] = [
         (
             "direct",
             DbError::corrupt("not a MapDB StoreDirect file (bad magic)"),
@@ -843,11 +836,6 @@ fn the_reopen_family_predicate_discriminates() {
              present at /tmp/x: {migrate}"
             )),
         ),
-        // The same D1 refusal about a path that contains the delimiter the first
-        // draft of `d1_matches` split on. A legal Unix filename may hold `": "`,
-        // and a predicate that reads the path as "everything up to the first
-        // `: `" refuses a genuine refusal (codex round 1 finding 6). The path is
-        // opaque or the predicate is wrong about which message it grades.
         (
             "d1-colon-in-path",
             DbError::corrupt_msg(format!(
@@ -869,57 +857,108 @@ fn the_reopen_family_predicate_discriminates() {
             "s2",
             DbError::corrupt("WAL segment x.wal.4: section LSN -1 at offset 187 does not follow 9"),
         ),
-        // The same S2 refusal about a segment whose NAME contains the delimiter
-        // the first draft split on — and which it separately forbade outright.
-        // codex round 2, the same defect round 1 found in `d1_matches`: a legal
-        // filename may hold `": "`, and a predicate that reads the name as
-        // "everything up to the first `: `" refuses a genuine refusal.
         (
             "s2-colon-in-name",
             DbError::corrupt(
                 "WAL segment od: dd/x.wal.4: section LSN -1 at offset 187 does not follow 9",
             ),
         ),
-        // An S2-shaped message with a NEGATIVE OFFSET, which is not an S2
-        // refusal and not any refusal this engine renders: the two LSNs are
-        // `i64` and can legitimately go negative, the offset is `u64` and cannot.
-        // Round 3 found one sign predicate covering all three fields, so this
-        // graded as S2 — a message no engine produces, which means a refusal
-        // wearing it came from somewhere else and must not be given a family.
-        // It belongs to the generic arm, exactly as `corrupt` does.
+        // Negative offset is not S2 (offset is u64); lands in DataCorruption.
         (
             "s2-negative-offset",
             DbError::corrupt("WAL segment x.wal.4: section LSN -1 at offset -2 does not follow 9"),
         ),
         ("full", DbError::StoreFull),
+        (
+            "h5",
+            DbError::corrupt("WAL segment x.wal.5: unsupported WAL format version 4"),
+        ),
+        (
+            "h6",
+            DbError::corrupt("WAL segment x.wal.5: unknown segment flags 1"),
+        ),
+        (
+            "h7",
+            DbError::corrupt("WAL segment x.wal.5: header sequence 6 does not match its name"),
+        ),
+        (
+            "h9",
+            DbError::corrupt("WAL segment x.wal.5: header firstLsn 0 is not a valid LSN"),
+        ),
+        (
+            "k4",
+            DbError::corrupt(
+                "WAL segment x.wal.4: clean mark in segment 4 authorizes removing segment 4, \
+                 including itself",
+            ),
+        ),
+        (
+            "s8",
+            DbError::corrupt("WAL segment x.wal.4: clean mark attests cleanedThroughSeq 0"),
+        ),
+        (
+            "s9",
+            DbError::corrupt(
+                "WAL segment x.wal.4: section LSNs must be consecutive: 12 at offset 187 after 9",
+            ),
+        ),
+        (
+            "s4",
+            DbError::corrupt(
+                "WAL segment x.wal.3: section body CRC mismatch at offset 100 in a non-final \
+                 segment",
+            ),
+        ),
+        (
+            "r4-floor",
+            DbError::corrupt(
+                "WAL retained log begins at LSN 3 in x.wal.3 but the clean mark attests it \
+                 begins at 2: sections below it are gone",
+            ),
+        ),
+        (
+            "r4-chain",
+            DbError::corrupt(
+                "WAL segment x.wal.4 states it begins at LSN 10 but x.wal.3 accounts for LSNs \
+                 up to 8: sections between them are gone",
+            ),
+        ),
+        (
+            "r4-self",
+            DbError::corrupt(
+                "WAL segment x.wal.3 states it begins at LSN 5 but its first section is 6: its \
+                 leading sections are gone",
+            ),
+        ),
     ];
+    // Columns: direct d1 d1c n6 corrupt s2 s2c s2neg full h5 h6 h7 h9 k4 s8 s9 s4 r4f r4c r4s
+    // DataCorruption accepts: corrupt + s2-negative-offset only among refined-unclaimed.
     for (family, accepts) in [
-        ("direct-magic", "ynnnnnnnn"),
-        ("D1", "nyynnnnnn"),
-        // "n" for the S2 column since codex round 1 finding 4: over the five
-        // families the corpus TRANSPORTS this matrix is a true diagonal, and the
-        // N6 column is the one extra — a family no manifest row can name.
-        // The negative-offset sample lands HERE, in the generic arm, and that is
-        // the whole point of adding it: it is a corruption verdict this engine
-        // has no refined family for, so it must be graded exactly as `corrupt`
-        // is. A predicate that put it in S2 was claiming to recognise a message
-        // no engine writes.
-        ("DataCorruption", "nnnyynnyn"),
-        ("S2", "nnnnnyynn"),
-        ("StoreFull", "nnnnnnnny"),
+        ("direct-magic", "ynnnnnnnnnnnnnnnnnnn"),
+        ("D1", "nyynnnnnnnnnnnnnnnnn"),
+        ("N6", "nnnynnnnnnnnnnnnnnnn"),
+        // DataCorruption: corrupt(4)+s2-neg(7); N6(3)/S2(5,6) excluded as refined.
+        ("DataCorruption", "nnnnynnynnnnnnnnnnnn"),
+        ("S2", "nnnnnyynnnnnnnnnnnnn"),
+        ("StoreFull", "nnnnnnnnynnnnnnnnnnn"),
+        ("H5", "nnnnnnnnnynnnnnnnnnn"),
+        ("H6", "nnnnnnnnnnynnnnnnnnn"),
+        ("H7", "nnnnnnnnnnnynnnnnnnn"),
+        ("H9", "nnnnnnnnnnnnynnnnnnn"),
+        ("K4", "nnnnnnnnnnnnnynnnnnn"),
+        ("S8/K-bounds", "nnnnnnnnnnnnnnynnnnn"),
+        ("S9", "nnnnnnnnnnnnnnnynnnn"),
+        ("S4/mid-log", "nnnnnnnnnnnnnnnnynnn"),
+        ("R4-floor", "nnnnnnnnnnnnnnnnnynn"),
+        ("R4-chain", "nnnnnnnnnnnnnnnnnnyn"),
+        ("R4-self", "nnnnnnnnnnnnnnnnnnny"),
     ] {
-        assert_eq!(accepts.len(), samples.len());
+        assert_eq!(accepts.len(), samples.len(), "accepts for {family}");
         for ((name, e), want) in samples.iter().zip(accepts.chars()) {
             let what = format!("{name} graded as {family}");
             if want == 'y' {
                 xfix::assert_family(&what, family, e);
             } else {
-                // The BORROW is what crosses the unwind boundary, because
-                // `DbError` is deliberately not `Clone` — the matrix owns every
-                // sample for the whole loop, so a reference is all this needs.
-                // The CLOSURE is asserted unwind-safe, not the sample: `DbError`
-                // is deliberately not `Clone`, so the matrix owns every sample
-                // for the whole loop and each probe borrows one.
                 let probe =
                     std::panic::AssertUnwindSafe(move || xfix::assert_family("probe", family, e));
                 assert!(
@@ -929,6 +968,39 @@ fn the_reopen_family_predicate_discriminates() {
             }
         }
     }
+    // R6-audit and S8/S4 extra disjuncts (not every disjunct needs a matrix column).
+    xfix::assert_family(
+        "R6-audit control",
+        "R6-audit",
+        &DbError::corrupt(
+            "WAL replay skipped 1 append(s) whose base image is absent and which no later entry \
+             superseded (recid 4): the log is missing sections it depends on",
+        ),
+    );
+    xfix::assert_family(
+        "S8 logStart",
+        "S8/K-bounds",
+        &DbError::corrupt(
+            "WAL segment x.wal.4: clean mark attests logStartLsn 0, which is not an LSN at or \
+             below the mark's own 10",
+        ),
+    );
+    xfix::assert_family(
+        "S4 mid-log active",
+        "S4/mid-log",
+        &DbError::corrupt(
+            "WAL segment x.wal.5: mid-log corruption: section body CRC mismatch at offset 100 \
+             but valid sections follow",
+        ),
+    );
+    refused(
+        "K4 as S8",
+        "S8/K-bounds",
+        DbError::corrupt(
+            "WAL segment x.wal.4: clean mark in segment 4 authorizes removing segment 4, \
+             including itself",
+        ),
+    );
 }
 
 // ---------------------------------------------------------------------------
