@@ -4,11 +4,11 @@
 //! `tests/xfixtures-v2-corpus/` is a byte-identical copy of the `root`-marked
 //! files of `todo/store-cross/corpus-v2/` — eighty-nine files: `MANIFEST.tsv`
 //! and one blob per `file` row, and nothing else (C5 plan §4c). It is the
-//! `v2-oracle` profile: it carries `applies`, `action`, `bytes` and `reopen`
-//! rows. The static `tests/xfixtures-v2/` sample stays `v2-core` and is
-//! untouched by C6; [`xfixture_conformance`] still owns it, through the same
-//! executor. The dual reader (v1 sample + v2 sample + this corpus root) is
-//! what keeps the cutover a data commit.
+//! `v2-oracle` profile: it carries `applies`, `action`, `bytes`, `reopen` and
+//! (C8f f2+) `family` rows. The static `tests/xfixtures-v2/` sample stays
+//! `v2-core` and is untouched by C6; [`xfixture_conformance`] still owns it,
+//! through the same executor. The dual reader (v2 sample + this corpus root)
+//! keeps C7's schema-v1 retirement a pure code commit.
 //!
 //! # What this engine executes, and what it accounts for
 //!
@@ -236,7 +236,7 @@ fn the_session_guard_removes_its_directory_when_the_test_panics() {
 ///
 /// Regenerate with `python3 todo/store-cross/freeze_v2.py --corpus
 /// --dist-seals`.
-pub const DIST_SEAL: &str = "e1f8ae52d856e6c04cfa302365a8a47bdf980b5f1737f7297d7568cc5e6df969";
+pub const DIST_SEAL: &str = "ebff75b4c5d6c37f06e049f4fb93ddb7af311dcbc79ac36d2bbceeb0919268bf";
 
 fn open_rw(base: &Path) -> mapdb_rust_store::error::Result<StoreWAL> {
     StoreWAL::open(base)
@@ -253,16 +253,6 @@ fn doctored(edit: impl Fn(&str) -> String) -> xfix::SampleV2 {
         "the doctoring changed nothing, so this case grades the same manifest twice"
     );
     xfix::load_sample_v2_text(&root, &out)
-}
-
-/// Like [`doctored`], then injects catalogue-derived `family` rows for every
-/// rust reject arm.
-///
-/// C8f f1 / pre-f2 bridge: the frozen MANIFEST has no `family` rows yet. Suite-
-/// level cases that must run every cell need those rows so the red under test
-/// is not "reject arm has no family row".
-fn doctored_with_families(edit: impl Fn(&str) -> String) -> xfix::SampleV2 {
-    doctored(|t| xfix::inject_rust_family_rows(&edit(t)))
 }
 
 fn drop_rows(text: &str, prefix: &str) -> String {
@@ -323,56 +313,66 @@ fn rust_cell(sample: &xfix::SampleV2, fixture: &str, mode: &str) -> xfix::V2Expe
 
 /// Every `applies` row addressed to rust in `rw`, run, and exactly those.
 ///
-/// Pre-f2: injects `family` rows (frozen MANIFEST has none yet). The inject is
-/// self-expiring — it panics if the frozen root already carries rust `family`
-/// rows — so f2 must switch this path to raw [`xfix::load_sample_v2`] rather
-/// than leaving a hand-pinned substitute in place.
+/// C8f f3: loads the raw sealed MANIFEST — family rows are frozen in corpus-v2
+/// (43 rust family / 42 rust reopen). No inject bridge.
 #[test]
 fn corpus_rw_cells_conform() {
-    let sample = xfix::load_corpus_v2_with_family_rows(&xfix::v2_corpus_root());
+    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
     let session = fresh_session("xfcorpus_rw");
     xfix::run_v2_corpus_cells(&sample, "rw", &session, &open_rw);
     let _ = std::fs::remove_dir_all(&session);
 }
 
-/// Bare frozen MANIFEST (no `family` rows) must fail-closed on first reject.
+/// The sealed corpus root carries rust `family` oracle rows (C8f f2 freeze).
 ///
-/// Documents the f2 gap: until the corpus freezes `family` rows, loading the
-/// root without the inject bridge reds at plan §4.2 item 1.
+/// Replaces the pre-f2 "bare MANIFEST fails closed" and inject self-expiry
+/// probes: after distribute, the raw root is the green path. Missing / wrong /
+/// orphan family doctor reds live in [`the_family_row_is_graded`] and
+/// [`an_oracle_row_addressed_to_an_absent_cell_fails_the_suite`].
 #[test]
-fn frozen_manifest_without_family_rows_fails_closed() {
+fn sealed_corpus_carries_rust_family_rows() {
     let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
-    assert!(
-        sample.manifest.families.is_empty(),
-        "frozen MANIFEST already carries family rows — drop the inject bridge"
+    let rust_families: Vec<_> = sample
+        .manifest
+        .families
+        .iter()
+        .filter(|r| r.engine == "rust")
+        .collect();
+    let rust_reopens: Vec<_> = sample
+        .manifest
+        .reopens
+        .iter()
+        .filter(|r| r.engine == "rust")
+        .collect();
+    assert_eq!(
+        rust_families.len(),
+        43,
+        "sealed corpus must pin every rust reject arm's first-open family \
+         (f1 expect 43; got {})",
+        rust_families.len()
     );
-    refuses_suite(
-        "the frozen pre-f2 corpus with no family rows",
-        &sample,
-        "reject arm has no family row",
+    assert_eq!(
+        rust_reopens.len(),
+        42,
+        "sealed corpus rust reopen count (f1 expect 42; got {})",
+        rust_reopens.len()
     );
-}
-
-/// The pre-f2 inject must not overwrite sealed family rows after f2.
-///
-/// A single existing rust `family` row (even a wrong name) is enough: the
-/// bridge panics rather than drop-and-rebuild from the hand-pinned table.
-#[test]
-fn inject_rust_family_rows_refuses_input_that_already_has_family() {
-    let text = xfix::read_root_text(&xfix::v2_corpus_root(), "MANIFEST.tsv");
-    let with_one = format!("{text}family\treject-wal3-h5-version\trust\trw\tH99\n");
-    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = xfix::inject_rust_family_rows(&with_one);
-    }))
-    .expect_err("inject must refuse a manifest that already carries rust family rows");
-    let msg = payload
-        .downcast_ref::<String>()
-        .map(|s| s.as_str())
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or_else(|| panic!("inject panicked with a non-string payload"));
-    assert!(
-        msg.contains("already has rust family rows"),
-        "unexpected inject panic: {msg}"
+    // Family covers every reject expect arm (including mutating R6-audit/rw,
+    // which has family only — no reopen transport).
+    let reject_arms: std::collections::BTreeSet<_> = sample
+        .manifest
+        .expects
+        .iter()
+        .filter(|e| e.engine == "rust" && e.verdict == "reject")
+        .map(|e| (e.fixture.as_str(), e.mode.as_str()))
+        .collect();
+    let family_arms: std::collections::BTreeSet<_> = rust_families
+        .iter()
+        .map(|r| (r.fixture.as_str(), r.mode.as_str()))
+        .collect();
+    assert_eq!(
+        reject_arms, family_arms,
+        "family keys must equal every rust reject arm (bijection)"
     );
 }
 
@@ -402,11 +402,12 @@ fn inject_rust_family_rows_refuses_input_that_already_has_family() {
 /// assertion written separately is a leaf the whole gate can lose without
 /// noticing. Collapsing them leaves one leaf for the group instead of four.
 ///
-/// **C8f f1:** the frozen corpus has no `family` rows yet (f2 freezes them).
-/// This case injects the cell's `family` row so the control path can still
-/// prove the §3.11 lock red rather than "reject arm has no family row".
+/// **C8f f3:** sealed MANIFEST already carries this cell's `family` row
+/// (`direct-magic`). Doctor only the dispatch path under test.
 #[test]
 fn a_direct_cell_sent_to_the_wal_opener_goes_red() {
+    // Identity doctor: re-pin the sealed family so `doctored` sees a text delta
+    // while keeping first-open grading green; the red under test is the lock.
     let sample = doctored(|t| {
         let t = drop_rows(t, "family\treject-wal3-segment-at-direct\trust\trw\t");
         format!("{t}family\treject-wal3-segment-at-direct\trust\trw\tdirect-magic\n")
@@ -824,12 +825,12 @@ fn the_family_row_is_graded() {
 /// first grade onto the `family` row so mutating R6-audit/rw (family only) is
 /// covered and `mode=ro` is graded on the arm the corpus names.
 ///
-/// **The corpus alone cannot show the fix** until f2 freezes `family` rows.
 /// Both opens of a conforming store refuse the same way, so deleting the first
 /// grading leaves the reopen's — same family, same predicate, gate green. What
 /// separates them is WHERE the red comes from: this doctored family reds at
 /// `family[..]` if the cell's own refusal was graded and at `reopen[..]` if only
 /// the second open was. Asserting the prefix is what makes the deletion visible.
+/// C8f f3: sealed corpus has family rows; doctor reds still use raw text edits.
 #[test]
 fn the_reject_arms_own_refusal_is_graded() {
     const REOPEN: &str = "reopen\treject-wal3-d1-barebase\trust\trw\t";
@@ -1185,14 +1186,13 @@ fn an_oracle_row_addressed_to_an_absent_cell_fails_the_suite() {
             // plan §3.12). Removing the cell coherently means removing that too,
             // or every case below reports the ORPHAN it did not add.
             &format!("reopen\t{absent}\trust\trw\t"),
-            // C8f f1: same for `family` once f2 freezes those rows.
+            // C8f f3: sealed family rows travel with the cell; drop them too.
             &format!("family\t{absent}\trust\trw\t"),
         ] {
             out = drop_rows(&out, pfx);
         }
-        // Pre-f2: remaining reject arms need family rows so the suite reaches
-        // the orphan check rather than failing closed on first-open.
-        xfix::inject_rust_family_rows(&out)
+        // Raw sealed MANIFEST for every other arm — no inject bridge.
+        out
     };
     refuses_suite(
         "a bytes row addressed to a cell rust never runs",
@@ -1377,7 +1377,7 @@ fn a_wal3_cell_with_no_post_rows_is_refused() {
 /// otherwise.
 #[test]
 fn an_applies_row_missing_its_expect_fails() {
-    // Fires at applies==expect before any cell runs — no family inject needed.
+    // Fires at applies==expect before any cell runs.
     let sample = doctored(|t| drop_rows(t, "applies\twal3-java-cleaned\trust\trw"));
     assert!(
         sample
@@ -1408,7 +1408,7 @@ fn an_applies_row_missing_its_expect_fails() {
 #[test]
 fn an_unchanged_post_row_is_graded() {
     let session = fresh_session("xfcorpus_unchanged");
-    let sample = doctored_with_families(|t| {
+    let sample = doctored(|t| {
         format!("{t}post\twal3-java-cleaned\trust\trw\tx.wal.0000000000000002\tunchanged\n")
     });
     xfix::run_v2_corpus_cells(&sample, "rw", &session, &open_rw);

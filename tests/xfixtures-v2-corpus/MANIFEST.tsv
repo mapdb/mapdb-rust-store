@@ -1,5 +1,5 @@
 version	2
-fixture	wal3-java-tail	wal3-namespace	java	223aba3
+fixture	wal3-java-tail	wal3-namespace	java	3149bfb
 file	wal3-java-tail	x.wal.0000000000000001	1200537	c997af1d8c50bc48279dc2da73a63e0d36906c8e0b4862bf40230944f88e1112	68671699d3b646d609fecbc3dfd9b3a53bf2c8e27f2fd2aece6095d740c00e4d
 file	wal3-java-tail	x.wal.0000000000000002	188	85af7e7eb70f4091a86b523828c876d55f31327b75269e02d2e0ef7aeb6fa6f6	56769e54987952fbf95cf0f935ba7ef3f3c57d2f1892fb7bf725e89b663aeb1e
 applies	wal3-java-tail	java	rw
@@ -26,7 +26,7 @@ recid	wal3-java-tail	C	3	null	103	40
 recid	wal3-java-tail	D	4	prealloc	0	0
 recid	wal3-java-tail	E	5	deleted	104	256
 recid	wal3-java-tail	F	6	live	105	1200000
-fixture	wal3-java-cleaned	wal3-namespace	java	223aba3
+fixture	wal3-java-cleaned	wal3-namespace	java	3149bfb
 file	wal3-java-cleaned	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	wal3-java-cleaned	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
 file	wal3-java-cleaned	x.wal.0000000000000004	186	a22f0cea9b149172d8377916bd7b90d9632bba6163cf2c334461cac10d1771fb	f06d380adc82546c4abdfc74d20e3411f832fbc7bb92249ef1aab3aae028ea4a
@@ -54,7 +54,7 @@ recid	wal3-java-cleaned	C	3	null	113	40
 recid	wal3-java-cleaned	D	4	prealloc	0	0
 recid	wal3-java-cleaned	E	5	deleted	114	256
 recid	wal3-java-cleaned	F	6	live	115	1200000
-fixture	wal3-rust-tail	wal3-namespace	rust	2b45550
+fixture	wal3-rust-tail	wal3-namespace	rust	589996b
 file	wal3-rust-tail	x.wal.0000000000000001	1200537	5eaba8e8d9e31883ef7e7847f1e83cfa479d03dd22e572ddf70af1f9fd05ab22	9d295f6d9ff679c3a4001cfa9994658c0cf30c6ea8cb5d809f0c92a451cc7563
 file	wal3-rust-tail	x.wal.0000000000000002	188	c0d973f7f7161e564e2a893a9852c67189c9341c1d6bf05f8d6204b56b991ee3	48f6416f4d92ebf4c194b8babdcdb17f6559bd98cbfc27a82681d00eba58d3a0
 applies	wal3-rust-tail	java	rw
@@ -81,7 +81,7 @@ recid	wal3-rust-tail	C	3	null	123	40
 recid	wal3-rust-tail	D	4	prealloc	0	0
 recid	wal3-rust-tail	E	5	deleted	124	256
 recid	wal3-rust-tail	F	6	live	125	1200000
-fixture	wal3-rust-cleaned	wal3-namespace	rust	2b45550
+fixture	wal3-rust-cleaned	wal3-namespace	rust	589996b
 file	wal3-rust-cleaned	x.wal.0000000000000002	1200509	ba19574d03149b509f54bdb0ca21a346a47c4cd6599af1fc6c507bf66ef60708	a4142f52d461de1ae1b6b43c74d337ffe9420ea78379cb6b49437226c31dba35
 file	wal3-rust-cleaned	x.wal.0000000000000003	65863	d4a428d7cbe8a57400cc9125642eeb49988596b1bc83fa75cd9b9b21ae088715	bd6bea6e401c2c11121d55d270e8699db079bc32d02a8690b9cdb0ddbb0fd35d
 file	wal3-rust-cleaned	x.wal.0000000000000004	186	5fda6a9f9e128e2fdcdd937647f9072d681c8b2e7e0e1041ce57f794b2d1ec35	388b0d8a0ce0a2ebf6478a5427c396153049fcbcf4d3d04a6cba0608a5ac23fe
@@ -109,7 +109,7 @@ recid	wal3-rust-cleaned	C	3	null	133	40
 recid	wal3-rust-cleaned	D	4	prealloc	0	0
 recid	wal3-rust-cleaned	E	5	deleted	134	256
 recid	wal3-rust-cleaned	F	6	live	135	1200000
-fixture	wal3-zig-tail	wal3-namespace	zig	5fc6713
+fixture	wal3-zig-tail	wal3-namespace	zig	e8a5949
 file	wal3-zig-tail	x.wal.0000000000000001	1200537	6e2bfc3d7a4d3e3428a50a8bb57333c3cb8f41a907390c53105cce2b07ebb81b	74734df2d7934fa0af7c334f71d2f79e60b8ab1295368efcccbc8dace0b163fc
 file	wal3-zig-tail	x.wal.0000000000000002	188	007b4bdf888e1e999541f5342996273d2aab8be6e9d055c545e7ce63ec6ba85b	25777c6c97a8cb882850ce9a39dd5a9e86c86a1e5bc1919afa7c758a9e9ce692
 applies	wal3-zig-tail	java	rw
@@ -136,7 +136,7 @@ recid	wal3-zig-tail	C	3	null	143	40
 recid	wal3-zig-tail	D	4	prealloc	0	0
 recid	wal3-zig-tail	E	5	deleted	144	256
 recid	wal3-zig-tail	F	6	live	145	1200000
-fixture	wal3-zig-cleaned	wal3-namespace	zig	5fc6713
+fixture	wal3-zig-cleaned	wal3-namespace	zig	e8a5949
 file	wal3-zig-cleaned	x.wal.0000000000000002	1200509	dcbc7a98ee2521f6458bf6804ba347fdfe22dcdd286249d900074ef1937fac70	818641e6a2238769275758edb55b3a6c2bfc0648505017ac760b3c548811ae35
 file	wal3-zig-cleaned	x.wal.0000000000000003	65863	f117bd5a5427375e426277f7782ec2cd7b636dcdee980d7016b64a3614dcbfa5	d0782625dd866d7d6b6d3d20fe88fecd0f6b1f01bdef13ed137094bae1e42185
 file	wal3-zig-cleaned	x.wal.0000000000000004	186	98e31a81d93bdecd89a23313cf0dc68d3061b071d5ebbe4c75e6c553786957be	fa1adfe89d688bf3f725ce6ee7525b083e8b492a1602c5a96ad14d0d088836d1
@@ -164,7 +164,7 @@ recid	wal3-zig-cleaned	C	3	null	153	40
 recid	wal3-zig-cleaned	D	4	prealloc	0	0
 recid	wal3-zig-cleaned	E	5	deleted	154	256
 recid	wal3-zig-cleaned	F	6	live	155	1200000
-fixture	reject-wal3-n6-barewal	reject	derived	b59ba58
+fixture	reject-wal3-n6-barewal	reject	derived	657f413
 derived	reject-wal3-n6-barewal	wal3-java-cleaned	1	reject-wal3-n6-barewal
 file	reject-wal3-n6-barewal	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-n6-barewal	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -188,7 +188,19 @@ post	reject-wal3-n6-barewal	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996
 post	reject-wal3-n6-barewal	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-n6-barewal	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-n6-barewal	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-fixture	reject-wal3-d1-barebase	reject	derived	b59ba58
+reopen	reject-wal3-n6-barewal	java	ro	N6
+reopen	reject-wal3-n6-barewal	java	rw	N6
+reopen	reject-wal3-n6-barewal	rust	ro	N6
+reopen	reject-wal3-n6-barewal	rust	rw	N6
+reopen	reject-wal3-n6-barewal	zig	ro	N6
+reopen	reject-wal3-n6-barewal	zig	rw	N6
+family	reject-wal3-n6-barewal	java	ro	N6
+family	reject-wal3-n6-barewal	java	rw	N6
+family	reject-wal3-n6-barewal	rust	ro	N6
+family	reject-wal3-n6-barewal	rust	rw	N6
+family	reject-wal3-n6-barewal	zig	ro	N6
+family	reject-wal3-n6-barewal	zig	rw	N6
+fixture	reject-wal3-d1-barebase	reject	derived	657f413
 derived	reject-wal3-d1-barebase	wal3-java-cleaned	1	reject-wal3-d1-barebase
 file	reject-wal3-d1-barebase	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-d1-barebase	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -210,7 +222,11 @@ reopen	reject-wal3-d1-barebase	rust	ro	D1
 reopen	reject-wal3-d1-barebase	rust	rw	D1
 reopen	reject-wal3-d1-barebase	zig	ro	D1
 reopen	reject-wal3-d1-barebase	zig	rw	D1
-fixture	reject-wal3-d1-ckpt	reject	derived	b59ba58
+family	reject-wal3-d1-barebase	rust	ro	D1
+family	reject-wal3-d1-barebase	rust	rw	D1
+family	reject-wal3-d1-barebase	zig	ro	D1
+family	reject-wal3-d1-barebase	zig	rw	D1
+fixture	reject-wal3-d1-ckpt	reject	derived	657f413
 derived	reject-wal3-d1-ckpt	wal3-java-cleaned	1	reject-wal3-d1-ckpt
 file	reject-wal3-d1-ckpt	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-d1-ckpt	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -232,7 +248,11 @@ reopen	reject-wal3-d1-ckpt	rust	ro	D1
 reopen	reject-wal3-d1-ckpt	rust	rw	D1
 reopen	reject-wal3-d1-ckpt	zig	ro	D1
 reopen	reject-wal3-d1-ckpt	zig	rw	D1
-fixture	reject-wal3-h5-version	reject	derived	b59ba58
+family	reject-wal3-d1-ckpt	rust	ro	D1
+family	reject-wal3-d1-ckpt	rust	rw	D1
+family	reject-wal3-d1-ckpt	zig	ro	D1
+family	reject-wal3-d1-ckpt	zig	rw	D1
+fixture	reject-wal3-h5-version	reject	derived	657f413
 derived	reject-wal3-h5-version	wal3-java-cleaned	1	reject-wal3-h5-version
 file	reject-wal3-h5-version	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-h5-version	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -255,10 +275,22 @@ post	reject-wal3-h5-version	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996
 post	reject-wal3-h5-version	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-h5-version	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-h5-version	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-h5-version	java	ro	H5
+reopen	reject-wal3-h5-version	java	rw	H5
+reopen	reject-wal3-h5-version	rust	ro	H5
+reopen	reject-wal3-h5-version	rust	rw	H5
+reopen	reject-wal3-h5-version	zig	ro	H5
+reopen	reject-wal3-h5-version	zig	rw	H5
+family	reject-wal3-h5-version	java	ro	H5
+family	reject-wal3-h5-version	java	rw	H5
+family	reject-wal3-h5-version	rust	ro	H5
+family	reject-wal3-h5-version	rust	rw	H5
+family	reject-wal3-h5-version	zig	ro	H5
+family	reject-wal3-h5-version	zig	rw	H5
 edit	reject-wal3-h5-version	x.wal.0000000000000004	11	03	04
 edit	reject-wal3-h5-version	x.wal.0000000000000004	32	97080c8c	feef8ad4
 edit	reject-wal3-h5-version	x.wal.0000000000000004	53	180badc4264b60d7	c30d57f3388c43e7
-fixture	reject-wal3-h6-flags	reject	derived	b59ba58
+fixture	reject-wal3-h6-flags	reject	derived	657f413
 derived	reject-wal3-h6-flags	wal3-java-cleaned	1	reject-wal3-h6-flags
 file	reject-wal3-h6-flags	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-h6-flags	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -281,10 +313,22 @@ post	reject-wal3-h6-flags	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb
 post	reject-wal3-h6-flags	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-h6-flags	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-h6-flags	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-h6-flags	java	ro	H6
+reopen	reject-wal3-h6-flags	java	rw	H6
+reopen	reject-wal3-h6-flags	rust	ro	H6
+reopen	reject-wal3-h6-flags	rust	rw	H6
+reopen	reject-wal3-h6-flags	zig	ro	H6
+reopen	reject-wal3-h6-flags	zig	rw	H6
+family	reject-wal3-h6-flags	java	ro	H6
+family	reject-wal3-h6-flags	java	rw	H6
+family	reject-wal3-h6-flags	rust	ro	H6
+family	reject-wal3-h6-flags	rust	rw	H6
+family	reject-wal3-h6-flags	zig	ro	H6
+family	reject-wal3-h6-flags	zig	rw	H6
 edit	reject-wal3-h6-flags	x.wal.0000000000000004	15	00	01
 edit	reject-wal3-h6-flags	x.wal.0000000000000004	32	97080c8c	10aec7cf
 edit	reject-wal3-h6-flags	x.wal.0000000000000004	53	180badc4264b60d7	ea35ebc6709be4bc
-fixture	reject-wal3-h7-seq	reject	derived	b59ba58
+fixture	reject-wal3-h7-seq	reject	derived	657f413
 derived	reject-wal3-h7-seq	wal3-java-cleaned	1	reject-wal3-h7-seq
 file	reject-wal3-h7-seq	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-h7-seq	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -307,10 +351,22 @@ post	reject-wal3-h7-seq	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92
 post	reject-wal3-h7-seq	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-h7-seq	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-h7-seq	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-h7-seq	java	ro	H7
+reopen	reject-wal3-h7-seq	java	rw	H7
+reopen	reject-wal3-h7-seq	rust	ro	H7
+reopen	reject-wal3-h7-seq	rust	rw	H7
+reopen	reject-wal3-h7-seq	zig	ro	H7
+reopen	reject-wal3-h7-seq	zig	rw	H7
+family	reject-wal3-h7-seq	java	ro	H7
+family	reject-wal3-h7-seq	java	rw	H7
+family	reject-wal3-h7-seq	rust	ro	H7
+family	reject-wal3-h7-seq	rust	rw	H7
+family	reject-wal3-h7-seq	zig	ro	H7
+family	reject-wal3-h7-seq	zig	rw	H7
 edit	reject-wal3-h7-seq	x.wal.0000000000000004	23	04	05
 edit	reject-wal3-h7-seq	x.wal.0000000000000004	32	97080c8c	807318cf
 edit	reject-wal3-h7-seq	x.wal.0000000000000004	53	180badc4264b60d7	a77b44aa5884a7b1
-fixture	reject-wal3-h9-firstlsn	reject	derived	b59ba58
+fixture	reject-wal3-h9-firstlsn	reject	derived	657f413
 derived	reject-wal3-h9-firstlsn	wal3-java-cleaned	1	reject-wal3-h9-firstlsn
 file	reject-wal3-h9-firstlsn	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-h9-firstlsn	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -333,9 +389,21 @@ post	reject-wal3-h9-firstlsn	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c899
 post	reject-wal3-h9-firstlsn	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-h9-firstlsn	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-h9-firstlsn	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-h9-firstlsn	java	ro	H9
+reopen	reject-wal3-h9-firstlsn	java	rw	H9
+reopen	reject-wal3-h9-firstlsn	rust	ro	H9
+reopen	reject-wal3-h9-firstlsn	rust	rw	H9
+reopen	reject-wal3-h9-firstlsn	zig	ro	H9
+reopen	reject-wal3-h9-firstlsn	zig	rw	H9
+family	reject-wal3-h9-firstlsn	java	ro	H9
+family	reject-wal3-h9-firstlsn	java	rw	H9
+family	reject-wal3-h9-firstlsn	rust	ro	H9
+family	reject-wal3-h9-firstlsn	rust	rw	H9
+family	reject-wal3-h9-firstlsn	zig	ro	H9
+family	reject-wal3-h9-firstlsn	zig	rw	H9
 edit	reject-wal3-h9-firstlsn	x.wal.0000000000000004	31	0a97080c8c	0077dde592
 edit	reject-wal3-h9-firstlsn	x.wal.0000000000000004	53	180badc4264b60d7	52e4f0f48a058096
-fixture	reject-wal3-k4-through	reject	derived	b59ba58
+fixture	reject-wal3-k4-through	reject	derived	657f413
 derived	reject-wal3-k4-through	wal3-java-cleaned	1	reject-wal3-k4-through
 file	reject-wal3-k4-through	x.wal.0000000000000002	1200509	43d1289e83d82734c37c7b2f62addb6b7092d7b368cb10b1635dc05d2f027f11	127791755fde8a91be846a980c7c942bd55980d5cadf18121143bd201a2dcb21
 file	reject-wal3-k4-through	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -358,9 +426,21 @@ post	reject-wal3-k4-through	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996
 post	reject-wal3-k4-through	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-k4-through	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-k4-through	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-k4-through	java	ro	K4
+reopen	reject-wal3-k4-through	java	rw	K4
+reopen	reject-wal3-k4-through	rust	ro	K4
+reopen	reject-wal3-k4-through	rust	rw	K4
+reopen	reject-wal3-k4-through	zig	ro	K4
+reopen	reject-wal3-k4-through	zig	rw	K4
+family	reject-wal3-k4-through	java	ro	K4
+family	reject-wal3-k4-through	java	rw	K4
+family	reject-wal3-k4-through	rust	ro	K4
+family	reject-wal3-k4-through	rust	rw	K4
+family	reject-wal3-k4-through	zig	ro	K4
+family	reject-wal3-k4-through	zig	rw	K4
 edit	reject-wal3-k4-through	x.wal.0000000000000002	196	3348578a	0ac56b4f
 edit	reject-wal3-k4-through	x.wal.0000000000000002	207	01	02
-fixture	reject-wal3-k-through0	reject	derived	b59ba58
+fixture	reject-wal3-k-through0	reject	derived	657f413
 derived	reject-wal3-k-through0	wal3-java-cleaned	1	reject-wal3-k-through0
 file	reject-wal3-k-through0	x.wal.0000000000000002	1200509	bf2832784a2920a7a85095a031e8c042b09c4257dcfe97450bb87eaebe29037d	d3397b13f77ec39896c926c82b9512ea38095bd279f54cc264f48bb4b98d4c91
 file	reject-wal3-k-through0	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -383,9 +463,21 @@ post	reject-wal3-k-through0	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996
 post	reject-wal3-k-through0	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-k-through0	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-k-through0	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-k-through0	java	ro	S8/K-bounds
+reopen	reject-wal3-k-through0	java	rw	S8/K-bounds
+reopen	reject-wal3-k-through0	rust	ro	S8/K-bounds
+reopen	reject-wal3-k-through0	rust	rw	S8/K-bounds
+reopen	reject-wal3-k-through0	zig	ro	S8/K-bounds
+reopen	reject-wal3-k-through0	zig	rw	S8/K-bounds
+family	reject-wal3-k-through0	java	ro	S8/K-bounds
+family	reject-wal3-k-through0	java	rw	S8/K-bounds
+family	reject-wal3-k-through0	rust	ro	S8/K-bounds
+family	reject-wal3-k-through0	rust	rw	S8/K-bounds
+family	reject-wal3-k-through0	zig	ro	S8/K-bounds
+family	reject-wal3-k-through0	zig	rw	S8/K-bounds
 edit	reject-wal3-k-through0	x.wal.0000000000000002	196	3348578a	243343c9
 edit	reject-wal3-k-through0	x.wal.0000000000000002	207	01	00
-fixture	reject-wal3-k-logstart0	reject	derived	b59ba58
+fixture	reject-wal3-k-logstart0	reject	derived	657f413
 derived	reject-wal3-k-logstart0	wal3-java-cleaned	1	reject-wal3-k-logstart0
 file	reject-wal3-k-logstart0	x.wal.0000000000000002	1200509	3fe764c4c3d2af7fd025f23ea5c3bbbd37174168c518a3f27d69e44c48b60d83	1220d201d5f7d0c63242307c1633fd48bb2c48c3559d81b1bd0b2aede3e0ab8e
 file	reject-wal3-k-logstart0	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -408,9 +500,21 @@ post	reject-wal3-k-logstart0	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c899
 post	reject-wal3-k-logstart0	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-k-logstart0	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-k-logstart0	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-k-logstart0	java	ro	S8/K-bounds
+reopen	reject-wal3-k-logstart0	java	rw	S8/K-bounds
+reopen	reject-wal3-k-logstart0	rust	ro	S8/K-bounds
+reopen	reject-wal3-k-logstart0	rust	rw	S8/K-bounds
+reopen	reject-wal3-k-logstart0	zig	ro	S8/K-bounds
+reopen	reject-wal3-k-logstart0	zig	rw	S8/K-bounds
+family	reject-wal3-k-logstart0	java	ro	S8/K-bounds
+family	reject-wal3-k-logstart0	java	rw	S8/K-bounds
+family	reject-wal3-k-logstart0	rust	ro	S8/K-bounds
+family	reject-wal3-k-logstart0	rust	rw	S8/K-bounds
+family	reject-wal3-k-logstart0	zig	ro	S8/K-bounds
+family	reject-wal3-k-logstart0	zig	rw	S8/K-bounds
 edit	reject-wal3-k-logstart0	x.wal.0000000000000002	196	3348578a	aa410630
 edit	reject-wal3-k-logstart0	x.wal.0000000000000002	215	03	00
-fixture	reject-wal3-k-logstart-hi	reject	derived	b59ba58
+fixture	reject-wal3-k-logstart-hi	reject	derived	657f413
 derived	reject-wal3-k-logstart-hi	wal3-java-cleaned	1	reject-wal3-k-logstart-hi
 file	reject-wal3-k-logstart-hi	x.wal.0000000000000002	1200509	7363f988f82982b1d81023ec99f099b58c111a83bc2810d0d6e1a9a80074eddf	e7cfdf0778fc38525344862bbacfc44f918dd074fc6e61b37f89130850f39ccf
 file	reject-wal3-k-logstart-hi	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -433,9 +537,21 @@ post	reject-wal3-k-logstart-hi	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8
 post	reject-wal3-k-logstart-hi	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-k-logstart-hi	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-k-logstart-hi	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-k-logstart-hi	java	ro	S8/K-bounds
+reopen	reject-wal3-k-logstart-hi	java	rw	S8/K-bounds
+reopen	reject-wal3-k-logstart-hi	rust	ro	S8/K-bounds
+reopen	reject-wal3-k-logstart-hi	rust	rw	S8/K-bounds
+reopen	reject-wal3-k-logstart-hi	zig	ro	S8/K-bounds
+reopen	reject-wal3-k-logstart-hi	zig	rw	S8/K-bounds
+family	reject-wal3-k-logstart-hi	java	ro	S8/K-bounds
+family	reject-wal3-k-logstart-hi	java	rw	S8/K-bounds
+family	reject-wal3-k-logstart-hi	rust	ro	S8/K-bounds
+family	reject-wal3-k-logstart-hi	rust	rw	S8/K-bounds
+family	reject-wal3-k-logstart-hi	zig	ro	S8/K-bounds
+family	reject-wal3-k-logstart-hi	zig	rw	S8/K-bounds
 edit	reject-wal3-k-logstart-hi	x.wal.0000000000000002	196	3348578a	da2bf2bf
 edit	reject-wal3-k-logstart-hi	x.wal.0000000000000002	215	03	05
-fixture	reject-wal3-s2-lsn-regress	reject	derived	b59ba58
+fixture	reject-wal3-s2-lsn-regress	reject	derived	657f413
 derived	reject-wal3-s2-lsn-regress	wal3-java-cleaned	1	reject-wal3-s2-lsn-regress
 file	reject-wal3-s2-lsn-regress	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-s2-lsn-regress	x.wal.0000000000000003	65863	19141a06d327a82025c3625bb6e9f33aea3cb614d833cd71e9ee739e2a683281	96340d8d0311a622e40ec565dcf49be34b4356d72637328dc0fd95990e73437e
@@ -464,9 +580,15 @@ reopen	reject-wal3-s2-lsn-regress	rust	ro	S2
 reopen	reject-wal3-s2-lsn-regress	rust	rw	S2
 reopen	reject-wal3-s2-lsn-regress	zig	ro	S2
 reopen	reject-wal3-s2-lsn-regress	zig	rw	S2
+family	reject-wal3-s2-lsn-regress	java	ro	S2
+family	reject-wal3-s2-lsn-regress	java	rw	S2
+family	reject-wal3-s2-lsn-regress	rust	ro	S2
+family	reject-wal3-s2-lsn-regress	rust	rw	S2
+family	reject-wal3-s2-lsn-regress	zig	ro	S2
+family	reject-wal3-s2-lsn-regress	zig	rw	S2
 edit	reject-wal3-s2-lsn-regress	x.wal.0000000000000003	121	07	06
 edit	reject-wal3-s2-lsn-regress	x.wal.0000000000000003	130	23320f00	34491b43
-fixture	reject-wal3-s9-gap	reject	derived	b59ba58
+fixture	reject-wal3-s9-gap	reject	derived	657f413
 derived	reject-wal3-s9-gap	wal3-java-cleaned	1	reject-wal3-s9-gap
 file	reject-wal3-s9-gap	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-s9-gap	x.wal.0000000000000003	65863	a497166b78a9712de3241d097e6dab94c44c86c50fc3f105cb0ae2fec334bb43	95bdb07fed808c9ff338f5800f388fca4b66452d90b3cb0824d614b285743219
@@ -489,9 +611,21 @@ post	reject-wal3-s9-gap	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92
 post	reject-wal3-s9-gap	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-s9-gap	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-s9-gap	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-s9-gap	java	ro	S9
+reopen	reject-wal3-s9-gap	java	rw	S9
+reopen	reject-wal3-s9-gap	rust	ro	S9
+reopen	reject-wal3-s9-gap	rust	rw	S9
+reopen	reject-wal3-s9-gap	zig	ro	S9
+reopen	reject-wal3-s9-gap	zig	rw	S9
+family	reject-wal3-s9-gap	java	ro	S9
+family	reject-wal3-s9-gap	java	rw	S9
+family	reject-wal3-s9-gap	rust	ro	S9
+family	reject-wal3-s9-gap	rust	rw	S9
+family	reject-wal3-s9-gap	zig	ro	S9
+family	reject-wal3-s9-gap	zig	rw	S9
 edit	reject-wal3-s9-gap	x.wal.0000000000000003	121	07	08
 edit	reject-wal3-s9-gap	x.wal.0000000000000003	130	23320f00	fc8bc0d1
-fixture	reject-wal3-s4-midlog-crc	reject	derived	b59ba58
+fixture	reject-wal3-s4-midlog-crc	reject	derived	657f413
 derived	reject-wal3-s4-midlog-crc	wal3-java-cleaned	1	reject-wal3-s4-midlog-crc
 file	reject-wal3-s4-midlog-crc	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-s4-midlog-crc	x.wal.0000000000000003	65863	795ad8c97fc3ecbe5aea20bb81f67427a78950b369dee6daa74f63e768adbae2	3f662ea1382777a93ef8690a4e659dbf8228a9718aa9a5c2bd9b7b9fd5865ff7
@@ -514,8 +648,20 @@ post	reject-wal3-s4-midlog-crc	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8
 post	reject-wal3-s4-midlog-crc	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-s4-midlog-crc	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-s4-midlog-crc	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-s4-midlog-crc	java	ro	S4/mid-log
+reopen	reject-wal3-s4-midlog-crc	java	rw	S4/mid-log
+reopen	reject-wal3-s4-midlog-crc	rust	ro	S4/mid-log
+reopen	reject-wal3-s4-midlog-crc	rust	rw	S4/mid-log
+reopen	reject-wal3-s4-midlog-crc	zig	ro	S4/mid-log
+reopen	reject-wal3-s4-midlog-crc	zig	rw	S4/mid-log
+family	reject-wal3-s4-midlog-crc	java	ro	S4/mid-log
+family	reject-wal3-s4-midlog-crc	java	rw	S4/mid-log
+family	reject-wal3-s4-midlog-crc	rust	ro	S4/mid-log
+family	reject-wal3-s4-midlog-crc	rust	rw	S4/mid-log
+family	reject-wal3-s4-midlog-crc	zig	ro	S4/mid-log
+family	reject-wal3-s4-midlog-crc	zig	rw	S4/mid-log
 edit	reject-wal3-s4-midlog-crc	x.wal.0000000000000003	61	02	fd
-fixture	reject-wal3-r4-floor	reject	derived	b59ba58
+fixture	reject-wal3-r4-floor	reject	derived	657f413
 derived	reject-wal3-r4-floor	wal3-java-cleaned	1	reject-wal3-r4-floor
 file	reject-wal3-r4-floor	x.wal.0000000000000002	1200509	44d7a0cb99653af998d6b9a4653ae7da92d960bfc514a82fda86565b52e63463	90972a6529fa673118ff2c497fe2848a588d3a91ccbb068d5491bf4c56ea0849
 file	reject-wal3-r4-floor	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -538,9 +684,21 @@ post	reject-wal3-r4-floor	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb
 post	reject-wal3-r4-floor	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-r4-floor	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-r4-floor	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-r4-floor	java	ro	R4-floor
+reopen	reject-wal3-r4-floor	java	rw	R4-floor
+reopen	reject-wal3-r4-floor	rust	ro	R4-floor
+reopen	reject-wal3-r4-floor	rust	rw	R4-floor
+reopen	reject-wal3-r4-floor	zig	ro	R4-floor
+reopen	reject-wal3-r4-floor	zig	rw	R4-floor
+family	reject-wal3-r4-floor	java	ro	R4-floor
+family	reject-wal3-r4-floor	java	rw	R4-floor
+family	reject-wal3-r4-floor	rust	ro	R4-floor
+family	reject-wal3-r4-floor	rust	rw	R4-floor
+family	reject-wal3-r4-floor	zig	ro	R4-floor
+family	reject-wal3-r4-floor	zig	rw	R4-floor
 edit	reject-wal3-r4-floor	x.wal.0000000000000002	196	3348578a	ad2cc229
 edit	reject-wal3-r4-floor	x.wal.0000000000000002	215	03	04
-fixture	reject-wal3-r4-chain	reject	derived	b59ba58
+fixture	reject-wal3-r4-chain	reject	derived	657f413
 derived	reject-wal3-r4-chain	wal3-java-cleaned	1	reject-wal3-r4-chain
 file	reject-wal3-r4-chain	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-r4-chain	x.wal.0000000000000003	65863	15de3a48e824ce16f86de49975232901a047cd54d65c86565b1836ac2fbe8bf2	811aefde79f68b683f6ce78601f2d97478427dd1dbdaa98d7b37f186ba90e907
@@ -563,12 +721,24 @@ post	reject-wal3-r4-chain	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb
 post	reject-wal3-r4-chain	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-r4-chain	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-r4-chain	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-r4-chain	java	ro	R4-chain
+reopen	reject-wal3-r4-chain	java	rw	R4-chain
+reopen	reject-wal3-r4-chain	rust	ro	R4-chain
+reopen	reject-wal3-r4-chain	rust	rw	R4-chain
+reopen	reject-wal3-r4-chain	zig	ro	R4-chain
+reopen	reject-wal3-r4-chain	zig	rw	R4-chain
+family	reject-wal3-r4-chain	java	ro	R4-chain
+family	reject-wal3-r4-chain	java	rw	R4-chain
+family	reject-wal3-r4-chain	rust	ro	R4-chain
+family	reject-wal3-r4-chain	rust	rw	R4-chain
+family	reject-wal3-r4-chain	zig	ro	R4-chain
+family	reject-wal3-r4-chain	zig	rw	R4-chain
 edit	reject-wal3-r4-chain	x.wal.0000000000000003	31	06fadf2d6e	078dd81df8
 edit	reject-wal3-r4-chain	x.wal.0000000000000003	53	62446670258eb647	ab06633e4044b10c
 edit	reject-wal3-r4-chain	x.wal.0000000000000003	130	23320f0065588129	ea700a4e443e16b8
 edit	reject-wal3-r4-chain	x.wal.0000000000000003	159	aa20bec44ba55285	6362bb8aad7ace4d
 edit	reject-wal3-r4-chain	x.wal.0000000000000003	311	416654cadd058e15	88245184a8da2caa
-fixture	reject-wal3-r4-self	reject	derived	b59ba58
+fixture	reject-wal3-r4-self	reject	derived	657f413
 derived	reject-wal3-r4-self	wal3-java-cleaned	1	reject-wal3-r4-self
 file	reject-wal3-r4-self	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	reject-wal3-r4-self	x.wal.0000000000000003	65863	0bdd718195a0940e94c0219b2b1ddf72c6768badb7a007c3b379bbc071fb1268	9867d615c7e31bb62cf18db0e3ede71acc09b1b29cc8118ffe5c3a43ce027a42
@@ -591,9 +761,21 @@ post	reject-wal3-r4-self	rust	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb9
 post	reject-wal3-r4-self	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-r4-self	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	reject-wal3-r4-self	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	reject-wal3-r4-self	java	ro	R4-self
+reopen	reject-wal3-r4-self	java	rw	R4-self
+reopen	reject-wal3-r4-self	rust	ro	R4-self
+reopen	reject-wal3-r4-self	rust	rw	R4-self
+reopen	reject-wal3-r4-self	zig	ro	R4-self
+reopen	reject-wal3-r4-self	zig	rw	R4-self
+family	reject-wal3-r4-self	java	ro	R4-self
+family	reject-wal3-r4-self	java	rw	R4-self
+family	reject-wal3-r4-self	rust	ro	R4-self
+family	reject-wal3-r4-self	rust	rw	R4-self
+family	reject-wal3-r4-self	zig	ro	R4-self
+family	reject-wal3-r4-self	zig	rw	R4-self
 edit	reject-wal3-r4-self	x.wal.0000000000000004	44	0a	0b
 edit	reject-wal3-r4-self	x.wal.0000000000000004	53	180badc4	0f70b987
-fixture	reject-wal3-segment-at-direct	reject	derived	b59ba58
+fixture	reject-wal3-segment-at-direct	reject	derived	657f413
 derived	reject-wal3-segment-at-direct	wal3-java-cleaned	1	reject-wal3-segment-at-direct
 file	reject-wal3-segment-at-direct	x	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 applies	reject-wal3-segment-at-direct	java	rw
@@ -606,7 +788,10 @@ post	reject-wal3-segment-at-direct	java	rw	x.lock	created:0:e3b0c44298fc1c149afb
 reopen	reject-wal3-segment-at-direct	java	rw	direct-magic
 reopen	reject-wal3-segment-at-direct	rust	rw	direct-magic
 reopen	reject-wal3-segment-at-direct	zig	rw	direct-magic
-fixture	mut-wal3-torn-tail	wal3-namespace	derived	b59ba58
+family	reject-wal3-segment-at-direct	java	rw	direct-magic
+family	reject-wal3-segment-at-direct	rust	rw	direct-magic
+family	reject-wal3-segment-at-direct	zig	rw	direct-magic
+fixture	mut-wal3-torn-tail	wal3-namespace	derived	657f413
 derived	mut-wal3-torn-tail	wal3-java-tail	1	mut-wal3-torn-tail
 file	mut-wal3-torn-tail	x.wal.0000000000000001	1200537	c997af1d8c50bc48279dc2da73a63e0d36906c8e0b4862bf40230944f88e1112	68671699d3b646d609fecbc3dfd9b3a53bf2c8e27f2fd2aece6095d740c00e4d
 file	mut-wal3-torn-tail	x.wal.0000000000000002	213	982c5ac875f49bb2d666ffefdb152931d3533006bae1710ad6bf8195f7f4c4ca	32878db02a1252d0d8e3cad84bf53ff3fe9a2a99dc08a21854f4d50ec16f2016
@@ -634,7 +819,7 @@ post	mut-wal3-torn-tail	zig	rw	x.wal.0000000000000002	truncated:188:85af7e7eb70f
 post	mut-wal3-torn-tail	zig	rw	x.wal.0000000000000003	created:36:1e15f2bfc8cfe20d8ee74cc2d94b3ee0d0624b8c1b1bc50229440e7c83d10062
 post	mut-wal3-torn-tail	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	mut-wal3-torn-tail	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-fixture	mut-wal3-residue	wal3-namespace	derived	b59ba58
+fixture	mut-wal3-residue	wal3-namespace	derived	657f413
 derived	mut-wal3-residue	wal3-java-tail	1	mut-wal3-residue
 file	mut-wal3-residue	x.wal.0000000000000001	1200537	c997af1d8c50bc48279dc2da73a63e0d36906c8e0b4862bf40230944f88e1112	68671699d3b646d609fecbc3dfd9b3a53bf2c8e27f2fd2aece6095d740c00e4d
 file	mut-wal3-residue	x.wal.0000000000000002	188	85af7e7eb70f4091a86b523828c876d55f31327b75269e02d2e0ef7aeb6fa6f6	56769e54987952fbf95cf0f935ba7ef3f3c57d2f1892fb7bf725e89b663aeb1e
@@ -660,7 +845,7 @@ post	mut-wal3-residue	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb9242
 post	mut-wal3-residue	zig	rw	x.wal.0000000000000003	deleted
 post	mut-wal3-residue	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	mut-wal3-residue	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-fixture	mut-wal3-mark-then-refusal	wal3-namespace	derived	b59ba58
+fixture	mut-wal3-mark-then-refusal	wal3-namespace	derived	657f413
 derived	mut-wal3-mark-then-refusal	wal3-java-cleaned	1	mut-wal3-mark-then-refusal
 file	mut-wal3-mark-then-refusal	x.wal.0000000000000001	81	fb85a6cfb654f5e276ee042a33b7a5de98b7158d9104f1c923b4dc8b543332d3	9ef462f967fed0daa284ee357c7c64a312c96dc358490c9f5a3d381536b6a6af
 file	mut-wal3-mark-then-refusal	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
@@ -687,9 +872,18 @@ post	mut-wal3-mark-then-refusal	rust	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c
 post	mut-wal3-mark-then-refusal	zig	rw	x.wal.0000000000000001	deleted
 post	mut-wal3-mark-then-refusal	zig	rw	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 post	mut-wal3-mark-then-refusal	zig	ro	x.lock	created:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reopen	mut-wal3-mark-then-refusal	java	ro	R6-audit
+reopen	mut-wal3-mark-then-refusal	rust	ro	R6-audit
+reopen	mut-wal3-mark-then-refusal	zig	ro	R6-audit
+family	mut-wal3-mark-then-refusal	java	ro	R6-audit
+family	mut-wal3-mark-then-refusal	java	rw	R6-audit
+family	mut-wal3-mark-then-refusal	rust	ro	R6-audit
+family	mut-wal3-mark-then-refusal	rust	rw	R6-audit
+family	mut-wal3-mark-then-refusal	zig	ro	R6-audit
+family	mut-wal3-mark-then-refusal	zig	rw	R6-audit
 edit	mut-wal3-mark-then-refusal	x.wal.0000000000000003	134	6558812902	efd284ce03
 edit	mut-wal3-mark-then-refusal	x.wal.0000000000000003	140	80	82
-fixture	div-wal3-lsn-exhausted	wal3-namespace	derived	b59ba58
+fixture	div-wal3-lsn-exhausted	wal3-namespace	derived	657f413
 derived	div-wal3-lsn-exhausted	wal3-java-cleaned	1	div-wal3-lsn-exhausted
 file	div-wal3-lsn-exhausted	x.wal.0000000000000002	1200509	1f859eb7e4fb9fdf0da45e138f816c717ebedb062e99b8a7709292ffcef8fcbd	51af9439e14909e6754d942df07e091b5fa2e187f4ea8c0c3689ec5909cc92da
 file	div-wal3-lsn-exhausted	x.wal.0000000000000003	65863	d7ff624112b6b14ffb4b6518f84b9a631874736ca368b8bdf1d62d24c716b55f	df394b6ce267b8c8ad2a875b070b1ac5a02788768a3741c4399c8f7c84977e3e
@@ -720,6 +914,10 @@ reopen	div-wal3-lsn-exhausted	rust	ro	StoreFull
 reopen	div-wal3-lsn-exhausted	rust	rw	StoreFull
 reopen	div-wal3-lsn-exhausted	zig	ro	StoreFull
 reopen	div-wal3-lsn-exhausted	zig	rw	StoreFull
+family	div-wal3-lsn-exhausted	rust	ro	StoreFull
+family	div-wal3-lsn-exhausted	rust	rw	StoreFull
+family	div-wal3-lsn-exhausted	zig	ro	StoreFull
+family	div-wal3-lsn-exhausted	zig	rw	StoreFull
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000002	24	00000000000000039dcecda2	7ffffffffffffff88dfe8c14
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000002	37	0000000000000003	7ffffffffffffff8
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000002	53	c15572533ef0e746	709fd26ca809ca59
@@ -740,7 +938,7 @@ edit	div-wal3-lsn-exhausted	x.wal.0000000000000003	311	416654cadd058e15	833040e7
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000004	24	000000000000000a97080c8c	7fffffffffffffff6080603d
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000004	37	000000000000000a	7fffffffffffffff
 edit	div-wal3-lsn-exhausted	x.wal.0000000000000004	53	180badc4264b60d7	3cb64bcdd59cd017
-fixture	div-wal3-entry-recid0	wal3-namespace	derived	b59ba58
+fixture	div-wal3-entry-recid0	wal3-namespace	derived	657f413
 derived	div-wal3-entry-recid0	wal3-java-cleaned	1	div-wal3-entry-recid0
 file	div-wal3-entry-recid0	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	div-wal3-entry-recid0	x.wal.0000000000000003	65863	99008be5345509af17c010a9e76043f322504b74354aa1dbadcbd10cdd0a69c9	6e572fa860a4e674c99048592823bdd8c1e54fed3459a0a418c49fef9788c4c4
@@ -767,9 +965,13 @@ reopen	div-wal3-entry-recid0	rust	ro	DataCorruption
 reopen	div-wal3-entry-recid0	rust	rw	DataCorruption
 reopen	div-wal3-entry-recid0	zig	ro	DataCorruption
 reopen	div-wal3-entry-recid0	zig	rw	DataCorruption
+family	div-wal3-entry-recid0	rust	ro	DataCorruption
+family	div-wal3-entry-recid0	rust	rw	DataCorruption
+family	div-wal3-entry-recid0	zig	ro	DataCorruption
+family	div-wal3-entry-recid0	zig	rw	DataCorruption
 edit	div-wal3-entry-recid0	x.wal.0000000000000003	57	258eb647	a0bca4b3
 edit	div-wal3-entry-recid0	x.wal.0000000000000003	62	83	80
-fixture	div-wal3-packlong-overlong	wal3-namespace	derived	b59ba58
+fixture	div-wal3-packlong-overlong	wal3-namespace	derived	657f413
 derived	div-wal3-packlong-overlong	wal3-java-cleaned	1	div-wal3-packlong-overlong
 file	div-wal3-packlong-overlong	x.wal.0000000000000002	1200509	05baa3e70098e3be25b9524fedeefebd49c884782cf1912939712ec386a10f09	a754ff4e51fd4acdbdb79f8b7f5ec812b2b860c8ba84b92fe2f64f43164fc0d4
 file	div-wal3-packlong-overlong	x.wal.0000000000000003	65863	977e42735ceb92901e03c6153c0cc4978d160da11eb1db2ead8b2229b2173164	7b3527efc8a7abef9516acb481a1c38fb3b90fdd539c046f8c8873d16153e3da
@@ -796,5 +998,9 @@ reopen	div-wal3-packlong-overlong	rust	ro	DataCorruption
 reopen	div-wal3-packlong-overlong	rust	rw	DataCorruption
 reopen	div-wal3-packlong-overlong	zig	ro	DataCorruption
 reopen	div-wal3-packlong-overlong	zig	rw	DataCorruption
+family	div-wal3-packlong-overlong	rust	ro	DataCorruption
+family	div-wal3-packlong-overlong	rust	rw	DataCorruption
+family	div-wal3-packlong-overlong	zig	ro	DataCorruption
+family	div-wal3-packlong-overlong	zig	rw	DataCorruption
 edit	div-wal3-packlong-overlong	x.wal.0000000000000003	57	258eb647	c98c4995
 edit	div-wal3-packlong-overlong	x.wal.0000000000000003	62	83c0b175f87bfe8104870a8d109316991c9f22a528ab2eb134b73abd40c346c94ccf52d558db5ee164e76aed70f376f97cff82	0000000000000000000083c0a775f87bfe8104870a8d109316991c9f22a528ab2eb134b73abd40c346c94ccf52d558db5ee164

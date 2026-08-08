@@ -1314,93 +1314,11 @@ pub fn read_root_text(root: &Path, name: &str) -> String {
 /// Loads the v2 sample, verifying every blob's gz sha, raw length and raw sha
 /// BEFORE anything decodes or opens it. A dump taken from bytes that were
 /// never checked against their pins describes whatever happened to be on disk.
+///
+/// C8f f3: the frozen corpus MANIFEST carries sealed `family` rows; load it
+/// raw. The pre-f2 `inject_rust_family_rows` bridge is gone.
 pub fn load_sample_v2(root: &Path) -> SampleV2 {
     load_sample_v2_text(root, &read_root_text(root, "MANIFEST.tsv"))
-}
-
-/// Pre-f2 bridge: inject catalogue-derived `family` rows for every rust reject
-/// arm in `text`.
-///
-/// C8f f1 lands the consumer before f2 freezes `family` into the corpus
-/// MANIFEST. Full-suite paths call this so first-open grading is measurable;
-/// bare frozen loads stay fail-closed (no family row → red).
-///
-/// **Self-expiring:** refuses any input that already carries a rust `family`
-/// row (including a partial/mixed set). That stops the hand-pinned table from
-/// overwriting a sealed freeze after f2 and reporting green on wrong/missing
-/// oracle rows. At f2: drop every call site of this inject and load the raw
-/// frozen MANIFEST.
-pub fn inject_rust_family_rows(text: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut reject_arms: Vec<(String, String)> = Vec::new();
-    for line in text.split('\n') {
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() >= 3 && cols[0] == "family" && cols[2] == "rust" {
-            panic!(
-                "inject_rust_family_rows refuses input that already has rust family rows \
-                 (found `{line}`); drop the pre-f2 bridge after freeze — it must not \
-                 overwrite sealed family oracle rows"
-            );
-        }
-        if cols.len() >= 5 && cols[0] == "expect" && cols[2] == "rust" && cols[4] == "reject" {
-            reject_arms.push((cols[1].to_string(), cols[3].to_string()));
-        }
-        out.push(line.to_string());
-    }
-    assert!(
-        !reject_arms.is_empty(),
-        "inject_rust_family_rows found no rust reject arms to equip"
-    );
-    for (fid, mode) in reject_arms {
-        let fam = rust_reject_family_for_inject(&fid)
-            .unwrap_or_else(|| panic!("no catalogue family pinned for rust reject fixture {fid}"));
-        out.push(format!("family\t{fid}\trust\t{mode}\t{fam}"));
-    }
-    // Always end with a newline so a caller that does `format!("{injected}row\n")`
-    // cannot glue the new row onto the last family line.
-    let mut s = out.join("\n");
-    if !s.ends_with('\n') {
-        s.push('\n');
-    }
-    s
-}
-
-/// Loads the corpus root with [`inject_rust_family_rows`] applied (pre-f2).
-///
-/// Panics once the frozen root already carries rust `family` rows — that is
-/// the signal to delete this loader and use [`load_sample_v2`] instead.
-pub fn load_corpus_v2_with_family_rows(root: &Path) -> SampleV2 {
-    let text = read_root_text(root, "MANIFEST.tsv");
-    let injected = inject_rust_family_rows(&text);
-    load_sample_v2_text(root, &injected)
-}
-
-/// `catalogue.cell.family_for("rust")` for every reject fixture the frozen
-/// corpus still addresses to rust. Kept in lockstep with T1's fill until f2.
-fn rust_reject_family_for_inject(fixture: &str) -> Option<&'static str> {
-    Some(match fixture {
-        "reject-wal3-n6-barewal" => "N6",
-        "reject-wal3-d1-barebase" | "reject-wal3-d1-ckpt" => "D1",
-        "reject-wal3-h5-version" => "H5",
-        "reject-wal3-h6-flags" => "H6",
-        "reject-wal3-h7-seq" => "H7",
-        "reject-wal3-h9-firstlsn" => "H9",
-        "reject-wal3-k4-through" => "K4",
-        "reject-wal3-k-through0" | "reject-wal3-k-logstart0" | "reject-wal3-k-logstart-hi" => {
-            "S8/K-bounds"
-        }
-        "reject-wal3-s2-lsn-regress" => "S2",
-        "reject-wal3-s9-gap" => "S9",
-        "reject-wal3-s4-midlog-crc" => "S4/mid-log",
-        "reject-wal3-r4-floor" => "R4-floor",
-        "reject-wal3-r4-chain" => "R4-chain",
-        "reject-wal3-r4-self" => "R4-self",
-        "reject-wal3-segment-at-direct" => "direct-magic",
-        "mut-wal3-mark-then-refusal" => "R6-audit",
-        "div-wal3-lsn-exhausted" => "StoreFull",
-        "div-wal3-entry-recid0" | "div-wal3-packlong-overlong" => "DataCorruption",
-        _ => return None,
-    })
 }
 
 /// [`load_sample_v2`] over manifest text supplied by the caller, so a DOCTORED

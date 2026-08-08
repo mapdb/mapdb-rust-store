@@ -54,8 +54,8 @@ fn sample_v2_ro_cells_pass() {
 /// cell set, the write probe, and the probe's own firing.
 #[test]
 fn corpus_ro_cells_conform() {
-    // Pre-f2: inject family rows (frozen MANIFEST has none). See C8f f1 T3.
-    let sample = xfix::load_corpus_v2_with_family_rows(&xfix::v2_corpus_root());
+    // C8f f3: raw sealed MANIFEST (family rows frozen in corpus-v2).
+    let sample = xfix::load_sample_v2(&xfix::v2_corpus_root());
     let session = xfix::session_dir("xfix_corpus_ro");
     xfix::run_v2_corpus_cells(&sample, "ro", &session, &open_ro);
     let _ = std::fs::remove_dir_all(&session);
