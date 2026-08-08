@@ -526,10 +526,13 @@ fn a_malformed_entry_stream_is_refused() {
     let mut b_over = SegBuilder::new(1, 5, 0);
     b_over.push(xfix::TAG_SECTION, 5, &over.copy_bytes());
     let append_over_len = b_over.bytes();
-    xfix::assert_refused("a T_APPEND whose len overruns the section body", move || {
-        let seg = xfix::decode(&append_over_len, "append-over-len");
-        xfix::entries(&seg.sections[0], "append-over-len");
-    });
+    xfix::assert_refused(
+        "a T_APPEND whose len overruns the section body",
+        move || {
+            let seg = xfix::decode(&append_over_len, "append-over-len");
+            xfix::entries(&seg.sections[0], "append-over-len");
+        },
+    );
 
     // A 'K' body is a mark, not an entry stream, and must not be decoded as one.
     let mut b = SegBuilder::new(7, 4, 0);
