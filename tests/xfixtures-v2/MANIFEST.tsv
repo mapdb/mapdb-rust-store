@@ -1,7 +1,7 @@
 version	2
 fixture	wal3-java-tail	wal3-namespace	java	c3s-golden
 file	wal3-java-tail	x.wal.0000000000000001	5436	ba242762e264bce6dfa9bf2b00347ca13593de999c6c7bb0452aa51c888350e7	7bdd65d83d98b979f3cd829cebf294b163cf4aba1bc3efb273989732e0b1f6a9
-file	wal3-java-tail	x.wal.0000000000000002	427	36ffbf301b4e6fba11b948117afbaffcafebaf072b6171e109272567f5ad1f5a	89266cae776f3ac6b1f060069b772b65ef12e977c0cd74eba7d9f487d149026d
+file	wal3-java-tail	x.wal.0000000000000002	509	12bb2d24ff240a056028a948b13c6a4136657121b8731d5c304643a6b731b888	29808d0e5dce3e8868c806786e5aa89e8e85d8e57bb2c643c05a55c1c1f78709
 expect	wal3-java-tail	java	ro	accept	wal3	x
 expect	wal3-java-tail	java	rw	accept	wal3	x
 expect	wal3-java-tail	rust	ro	accept	wal3	x
@@ -21,6 +21,7 @@ recidrange	wal3-java-tail	r4_9	4	9	live	111	700
 recid	wal3-java-tail	r10	10	prealloc	0	0
 recid	wal3-java-tail	r11	11	live	0	0
 recid	wal3-java-tail	r12	12	null	105	32
+recid	wal3-java-tail	r13	13	live	106	24
 fixture	wal3-java-cleaned	wal3-namespace	java	c3s-golden
 file	wal3-java-cleaned	x.wal.0000000000000003	4502	af5cfd90c72255e7d34a34b8c2b760a2d51b8cea96cde9ae29a350d97bd1f5c1	618fce0a04e1f8e2884a941cbf54e0040f92f81683af859f9e6e653f559a8562
 file	wal3-java-cleaned	x.wal.0000000000000004	77	c790df30fb87a5899e9d5c07ecfa0f68ba5765f3d9e005236e508363d4d6da54	befed06b2ac3995778485bf36077b82e317810a3f34fcfe41d0c6539ed0b06cc

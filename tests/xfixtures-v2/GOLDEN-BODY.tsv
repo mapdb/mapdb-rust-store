@@ -3,6 +3,13 @@
 #
 #   sec  <bundle> <relName> <index> <tag> <entryCount>
 #   ent  <bundle> <relName> <index> <ord> <kind> <recid> <cap> <lenPlus> <contentSha256>
+#       Non-APPEND rows: 9 fields after the `ent` token (kind-dependent columns).
+#   ent  <bundle> <relName> <index> <ord> APPEND <recid> <delta> <baseLsn> <len> <contentSha256>
+#       APPEND-only: 10 fields after `ent`. Parsers BRANCH ON KIND.
+#       delta = wire packLong(sectionLsn - baseLsn); baseLsn = section.lsn - delta;
+#       len = wire append length (NOT RECORD's lenPlus); contentSha256 hashes the
+#       len payload bytes (empty-string sha when len==0). APPEND never reuses the
+#       cap/lenPlus column positions.
 #   mark <bundle> <relName> <index> <cleanedThroughSeq> <logStartLsn>
 #
 # GOLDEN-DECODE.tsv pins FRAMING and deliberately stops there: walfmt.py is a
@@ -61,6 +68,10 @@ sec	wal3-java-tail	x.wal.0000000000000002	4	S	1
 ent	wal3-java-tail	x.wal.0000000000000002	4	0	RECORD	12	48	33	a1c9453f99d108c6723b19c416b2861a12cb13103309bc033fef96f19d16658e
 sec	wal3-java-tail	x.wal.0000000000000002	5	S	1
 ent	wal3-java-tail	x.wal.0000000000000002	5	0	RECORD	12	0	0	-
+sec	wal3-java-tail	x.wal.0000000000000002	6	S	1
+ent	wal3-java-tail	x.wal.0000000000000002	6	0	RECORD	13	32	17	062d8315f1e75f2e1338e89195d6e8653cb82208de603dff3627bd8d5c60fca2
+sec	wal3-java-tail	x.wal.0000000000000002	7	S	1
+ent	wal3-java-tail	x.wal.0000000000000002	7	0	APPEND	13	1	9	8	5fb729565f09b38ab8118e36a3d3e544f64a9341cd1d14fe10e8007d77697e0f
 sec	wal3-zig-tail	x.wal.0000000000000001	0	S	3
 ent	wal3-zig-tail	x.wal.0000000000000001	0	0	RECORD	1	208	201	b3c9eed81f2ebdbd64e4d2f95b096207b1d2634fcb1b9c375ed894dabe19ea01
 ent	wal3-zig-tail	x.wal.0000000000000001	0	1	RECORD	2	912	901	df5aacf4253639876681bbe862f2eae16ccca0a89ddb20fedce49302bacf751e

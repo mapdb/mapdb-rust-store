@@ -112,6 +112,10 @@ fn sample_v2_body_matches_golden_body() {
         want.iter().any(|r| r.starts_with("mark\t")),
         "GOLDEN-BODY.tsv pins no mark"
     );
+    assert!(
+        want.iter().any(|r| r.contains("\tAPPEND\t")),
+        "GOLDEN-BODY.tsv pins no APPEND entry (C9a / O1)"
+    );
 }
 
 /// Nothing in the distributed v2 root may be unexplained.

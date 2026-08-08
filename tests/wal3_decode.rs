@@ -498,13 +498,23 @@ fn a_malformed_entry_stream_is_refused() {
         xfix::entries(&seg.sections[0], "unknown-tag");
     });
 
-    // T_APPEND is a real engine op that no fixture exercises and the body dump
-    // has no columns for. Refusing by name is the honest answer: decoding it
-    // into a row shape that was never designed would be a silent guess.
-    let append = one_section(xfix::TAG_SECTION, &tagged(xfix::T_APPEND, 1));
-    xfix::assert_refused("a T_APPEND entry", move || {
-        let seg = xfix::decode(&append, "append");
-        xfix::entries(&seg.sections[0], "append");
+    // Truncated T_APPEND (tag+recid only) fails mid-delta.
+    let append_trunc = one_section(xfix::TAG_SECTION, &tagged(xfix::T_APPEND, 1));
+    xfix::assert_refused("a truncated T_APPEND entry", move || {
+        let seg = xfix::decode(&append_trunc, "append-trunc");
+        xfix::entries(&seg.sections[0], "append-trunc");
+    });
+
+    // delta must be in [1, lsn-1]; at section LSN 1 no legal delta exists.
+    let mut bad = DataOutput2::new();
+    bad.write_u8(xfix::T_APPEND);
+    bad.pack_long(1);
+    bad.pack_long(1);
+    bad.pack_long(0);
+    let append_bad_delta = one_section(xfix::TAG_SECTION, &bad.copy_bytes());
+    xfix::assert_refused("a T_APPEND with delta outside [1, lsn-1]", move || {
+        let seg = xfix::decode(&append_bad_delta, "append-bad-delta");
+        xfix::entries(&seg.sections[0], "append-bad-delta");
     });
 
     // A 'K' body is a mark, not an entry stream, and must not be decoded as one.
@@ -515,6 +525,29 @@ fn a_malformed_entry_stream_is_refused() {
         let seg = xfix::decode(&k, "k-as-entries");
         xfix::entries(&seg.sections[0], "k-as-entries");
     });
+}
+
+/// Well-formed T_APPEND decodes the four O1 fields (C9a).
+#[test]
+fn append_entries_decode_four_fields() {
+    let mut o = DataOutput2::new();
+    o.write_u8(xfix::T_APPEND);
+    o.pack_long(7);
+    o.pack_long(1); // delta
+    o.pack_long(3); // len
+    o.write_all(&[10, 20, 30]);
+    let mut b = SegBuilder::new(1, 5, 0);
+    b.push(xfix::TAG_SECTION, 5, &o.copy_bytes());
+    let raw = b.bytes();
+    let es = xfix::entries(&xfix::decode(&raw, "append").sections[0], "append");
+    assert_eq!(es.len(), 1);
+    let e = &es[0];
+    assert_eq!(e.kind(), "APPEND");
+    assert_eq!(e.recid, 7);
+    assert_eq!(e.delta, Some(1));
+    assert_eq!(e.base_lsn, Some(4));
+    assert_eq!(e.append_len, Some(3));
+    assert_eq!(e.content.as_deref(), Some(&[10, 20, 30][..]));
 }
 
 /// `'C'` sections carry an ordinary entry stream.

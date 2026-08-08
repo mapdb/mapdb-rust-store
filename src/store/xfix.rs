@@ -126,6 +126,13 @@ pub const GOLDEN_BODY_HEADER: &[&str] = &[
     "#",
     "#   sec  <bundle> <relName> <index> <tag> <entryCount>",
     "#   ent  <bundle> <relName> <index> <ord> <kind> <recid> <cap> <lenPlus> <contentSha256>",
+    "#       Non-APPEND rows: 9 fields after the `ent` token (kind-dependent columns).",
+    "#   ent  <bundle> <relName> <index> <ord> APPEND <recid> <delta> <baseLsn> <len> <contentSha256>",
+    "#       APPEND-only: 10 fields after `ent`. Parsers BRANCH ON KIND.",
+    "#       delta = wire packLong(sectionLsn - baseLsn); baseLsn = section.lsn - delta;",
+    "#       len = wire append length (NOT RECORD's lenPlus); contentSha256 hashes the",
+    "#       len payload bytes (empty-string sha when len==0). APPEND never reuses the",
+    "#       cap/lenPlus column positions.",
     "#   mark <bundle> <relName> <index> <cleanedThroughSeq> <logStartLsn>",
     "#",
     "# GOLDEN-DECODE.tsv pins FRAMING and deliberately stops there: walfmt.py is a",
@@ -251,12 +258,22 @@ pub struct Section {
 /// **`len_plus` is RAW**: `Some(0)` is NULL content and `Some(1)` is
 /// zero-length content. Decoding it into a length collapses the two, and two
 /// readers that both collapse it agree forever.
+///
+/// `T_APPEND` carries [`Self::delta`], [`Self::base_lsn`], [`Self::append_len`]
+/// and the payload in [`Self::content`] (empty vec when `append_len == 0`).
+/// C9a / O1: these map to the four GOLDEN-BODY APPEND columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub tag: u8,
     pub recid: i64,
     pub cap: Option<i64>,
     pub len_plus: Option<i64>,
+    /// Wire `packLong(sectionLsn - baseLsn)` for `T_APPEND` only.
+    pub delta: Option<i64>,
+    /// Absolute `section.lsn - delta` for `T_APPEND` only.
+    pub base_lsn: Option<i64>,
+    /// Wire append length for `T_APPEND` only (not RECORD `len_plus`).
+    pub append_len: Option<i64>,
     pub content: Option<Vec<u8>>,
 }
 
@@ -273,6 +290,10 @@ impl Entry {
 
     pub fn is_record(&self) -> bool {
         self.tag == T_RECORD
+    }
+
+    pub fn is_append(&self) -> bool {
+        self.tag == T_APPEND
     }
 }
 
@@ -447,6 +468,9 @@ pub fn entries(s: &Section, where_: &str) -> Vec<Entry> {
             recid: 0,
             cap: None,
             len_plus: None,
+            delta: None,
+            base_lsn: None,
+            append_len: None,
             content: None,
         };
         e.recid = cur.packed();
@@ -460,10 +484,27 @@ pub fn entries(s: &Section, where_: &str) -> Vec<Entry> {
                     e.content = Some(cur.take((len_plus - 1) as usize));
                 }
             }
-            T_APPEND => panic!(
-                "{ctx}: T_APPEND is not decoded here — the C3 body dump has no columns for it \
-                 and no fixture exercises it; extend both together"
-            ),
+            T_APPEND => {
+                // Wire: tag | packLong(recid) | packLong(delta) | packLong(len) | bytes
+                // (StoreWAL.java:1878-1895). base_lsn = section.lsn - delta with
+                // 1 <= delta <= lsn - 1 (decodeBaseLsn). C9a / O1.
+                let delta = cur.packed();
+                assert!(
+                    delta >= 1 && delta < s.lsn,
+                    "{ctx}: append delta {delta} outside [1, {}] for section LSN {}",
+                    s.lsn - 1,
+                    s.lsn
+                );
+                e.delta = Some(delta);
+                e.base_lsn = Some(s.lsn - delta);
+                let len = cur.packed();
+                assert!(
+                    len >= 0 && (len as usize) <= s.body.len() - cur.pos,
+                    "{ctx}: append length {len} does not fit the section body"
+                );
+                e.append_len = Some(len);
+                e.content = Some(cur.take(len as usize));
+            }
             other => panic!("{ctx}: unknown entry tag {other} at {}", cur.pos - 1),
         }
         out.push(e);
@@ -1461,17 +1502,51 @@ pub fn render_body(sample: &SampleV2) -> Vec<String> {
                     e.recid
                 );
                 seen.insert(e.recid as u64);
-                out.push(format!(
-                    "ent\t{}\t{}\t{}\t{i}\t{}\t{}\t{}\t{}\t{}",
-                    f.fixture,
-                    f.rel,
-                    s.index,
-                    e.kind(),
-                    e.recid,
-                    e.cap.map_or("-".to_string(), |c| c.to_string()),
-                    e.len_plus.map_or("-".to_string(), |l| l.to_string()),
-                    content_sha(e, &format!("{where_} section {} entry {i}", s.index))
-                ));
+                let at = format!("{where_} section {} entry {i}", s.index);
+                if e.is_append() {
+                    let delta = e.delta.expect("APPEND carries delta");
+                    let base_lsn = e.base_lsn.expect("APPEND carries base_lsn");
+                    let len = e.append_len.expect("APPEND carries append_len");
+                    assert_eq!(
+                        base_lsn,
+                        s.lsn - delta,
+                        "{at}: base_lsn {base_lsn} != section.lsn {} - delta {delta}",
+                        s.lsn
+                    );
+                    assert!(
+                        delta >= 1 && delta < s.lsn,
+                        "{at}: delta {delta} outside [1, {}]",
+                        s.lsn - 1
+                    );
+                    let c = e.content.as_ref().expect("APPEND carries content vec");
+                    assert_eq!(
+                        c.len() as i64,
+                        len,
+                        "{at}: append content length {} != len {len}",
+                        c.len()
+                    );
+                    out.push(format!(
+                        "ent\t{}\t{}\t{}\t{i}\t{}\t{}\t{delta}\t{base_lsn}\t{len}\t{}",
+                        f.fixture,
+                        f.rel,
+                        s.index,
+                        e.kind(),
+                        e.recid,
+                        sha256_hex(c)
+                    ));
+                } else {
+                    out.push(format!(
+                        "ent\t{}\t{}\t{}\t{i}\t{}\t{}\t{}\t{}\t{}",
+                        f.fixture,
+                        f.rel,
+                        s.index,
+                        e.kind(),
+                        e.recid,
+                        e.cap.map_or("-".to_string(), |c| c.to_string()),
+                        e.len_plus.map_or("-".to_string(), |l| l.to_string()),
+                        content_sha(e, &at)
+                    ));
+                }
             }
         }
     }

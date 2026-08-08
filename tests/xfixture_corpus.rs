@@ -1577,7 +1577,8 @@ fn rootset_refuses_an_extra_file() {
     let msg = red_of(|| assert_corpus_rootset(&root, &sample))
         .unwrap_or_else(|| panic!("rootset accepted a root with an extra file"));
     assert!(
-        msg.contains("no `file` row accounts for") || msg.contains("assertion `left == right` failed"),
+        msg.contains("no `file` row accounts for")
+            || msg.contains("assertion `left == right` failed"),
         "rootset: got: {msg}"
     );
     let _ = std::fs::remove_dir_all(&session);
