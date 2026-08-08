@@ -323,8 +323,10 @@ fn rust_cell(sample: &xfix::SampleV2, fixture: &str, mode: &str) -> xfix::V2Expe
 
 /// Every `applies` row addressed to rust in `rw`, run, and exactly those.
 ///
-/// Pre-f2: injects `family` rows (frozen MANIFEST has none yet). After f2 the
-/// inject is a no-op re-emit of the same set and this stays green.
+/// Pre-f2: injects `family` rows (frozen MANIFEST has none yet). The inject is
+/// self-expiring — it panics if the frozen root already carries rust `family`
+/// rows — so f2 must switch this path to raw [`xfix::load_sample_v2`] rather
+/// than leaving a hand-pinned substitute in place.
 #[test]
 fn corpus_rw_cells_conform() {
     let sample = xfix::load_corpus_v2_with_family_rows(&xfix::v2_corpus_root());
@@ -348,6 +350,29 @@ fn frozen_manifest_without_family_rows_fails_closed() {
         "the frozen pre-f2 corpus with no family rows",
         &sample,
         "reject arm has no family row",
+    );
+}
+
+/// The pre-f2 inject must not overwrite sealed family rows after f2.
+///
+/// A single existing rust `family` row (even a wrong name) is enough: the
+/// bridge panics rather than drop-and-rebuild from the hand-pinned table.
+#[test]
+fn inject_rust_family_rows_refuses_input_that_already_has_family() {
+    let text = xfix::read_root_text(&xfix::v2_corpus_root(), "MANIFEST.tsv");
+    let with_one = format!("{text}family\treject-wal3-h5-version\trust\trw\tH99\n");
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = xfix::inject_rust_family_rows(&with_one);
+    }))
+    .expect_err("inject must refuse a manifest that already carries rust family rows");
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("inject panicked with a non-string payload"));
+    assert!(
+        msg.contains("already has rust family rows"),
+        "unexpected inject panic: {msg}"
     );
 }
 

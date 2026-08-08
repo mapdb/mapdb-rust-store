@@ -1325,21 +1325,32 @@ pub fn load_sample_v2(root: &Path) -> SampleV2 {
 /// MANIFEST. Full-suite paths call this so first-open grading is measurable;
 /// bare frozen loads stay fail-closed (no family row → red).
 ///
-/// f2 should make this a pure re-emit of rows already present; drop the bridge
-/// once the frozen root carries the bijection.
+/// **Self-expiring:** refuses any input that already carries a rust `family`
+/// row (including a partial/mixed set). That stops the hand-pinned table from
+/// overwriting a sealed freeze after f2 and reporting green on wrong/missing
+/// oracle rows. At f2: drop every call site of this inject and load the raw
+/// frozen MANIFEST.
 pub fn inject_rust_family_rows(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut reject_arms: Vec<(String, String)> = Vec::new();
     for line in text.split('\n') {
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() >= 3 && cols[0] == "family" && cols[2] == "rust" {
-            continue;
+            panic!(
+                "inject_rust_family_rows refuses input that already has rust family rows \
+                 (found `{line}`); drop the pre-f2 bridge after freeze — it must not \
+                 overwrite sealed family oracle rows"
+            );
         }
         if cols.len() >= 5 && cols[0] == "expect" && cols[2] == "rust" && cols[4] == "reject" {
             reject_arms.push((cols[1].to_string(), cols[3].to_string()));
         }
         out.push(line.to_string());
     }
+    assert!(
+        !reject_arms.is_empty(),
+        "inject_rust_family_rows found no rust reject arms to equip"
+    );
     for (fid, mode) in reject_arms {
         let fam = rust_reject_family_for_inject(&fid)
             .unwrap_or_else(|| panic!("no catalogue family pinned for rust reject fixture {fid}"));
@@ -1355,13 +1366,12 @@ pub fn inject_rust_family_rows(text: &str) -> String {
 }
 
 /// Loads the corpus root with [`inject_rust_family_rows`] applied (pre-f2).
+///
+/// Panics once the frozen root already carries rust `family` rows — that is
+/// the signal to delete this loader and use [`load_sample_v2`] instead.
 pub fn load_corpus_v2_with_family_rows(root: &Path) -> SampleV2 {
     let text = read_root_text(root, "MANIFEST.tsv");
     let injected = inject_rust_family_rows(&text);
-    assert_ne!(
-        injected, text,
-        "inject_rust_family_rows added nothing — frozen root already has family rows; drop the bridge"
-    );
     load_sample_v2_text(root, &injected)
 }
 
