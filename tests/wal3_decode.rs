@@ -517,6 +517,20 @@ fn a_malformed_entry_stream_is_refused() {
         xfix::entries(&seg.sections[0], "append-bad-delta");
     });
 
+    // Legal delta, overlong len: claims more payload than remains (C9a §4.3).
+    let mut over = DataOutput2::new();
+    over.write_u8(xfix::T_APPEND);
+    over.pack_long(1);
+    over.pack_long(1);
+    over.pack_long(100);
+    let mut b_over = SegBuilder::new(1, 5, 0);
+    b_over.push(xfix::TAG_SECTION, 5, &over.copy_bytes());
+    let append_over_len = b_over.bytes();
+    xfix::assert_refused("a T_APPEND whose len overruns the section body", move || {
+        let seg = xfix::decode(&append_over_len, "append-over-len");
+        xfix::entries(&seg.sections[0], "append-over-len");
+    });
+
     // A 'K' body is a mark, not an entry stream, and must not be decoded as one.
     let mut b = SegBuilder::new(7, 4, 0);
     b.push(xfix::TAG_MARK, 4, &mark_body(3, 4));
