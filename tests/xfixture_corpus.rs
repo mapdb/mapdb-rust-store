@@ -74,13 +74,18 @@
 //! # What the campaign measured and could NOT kill
 //!
 //! Named, because a campaign that reports only its kills is a campaign whose
-//! coverage claim nothing checks. Each of these was applied and the whole suite
-//! stayed green:
+//! coverage claim nothing checks.
 //!
-//! - ~~`ran == want` / `ro_probed` / rootset / distseal / profile /
-//!   capture_isfile~~ — **C9m measured all six** (see the `C9m` section and
-//!   `todo/store-wal3/wal3-c9-plan.md`). Under-run seam, skip-probe-record,
-//!   wrong-artifact roots, oracle-bearing static sample, subdirectory capture.
+//! **C9m measured the six historical unmeasured leaves** (`capture_isfile`,
+//! `distseal`, `rootset`, `profile`, `ranwant`, `roset`) — see the `C9m`
+//! section and `todo/store-wal3/wal3-c9-plan.md`. They are campaign cases now,
+//! not survivors. `capture_isfile` is option (a) weaker-signal (directory
+//! input; deletion changes the red to `read_named`/`cannot read`), not
+//! subsumption-by-deletion. `ranwant` is also weaker-signal after deletion
+//! (oracle-addressing guard).
+//!
+//! Still unkillable on green paths:
+//!
 //! - **the REOPEN's `assert_family` call** (`familycall`, which was a case until
 //!   C5t). Round 1's finding 2 moved the family grading onto the reject arm's
 //!   OWN refusal and kept the reopen's as the STABILITY check; for any store
@@ -89,19 +94,13 @@
 //!   one no conforming implementation can falsify. **It is a trade, not an
 //!   oversight**: before it, every `mode=ro` row's family was graded by a
 //!   WRITABLE retry and so was never graded at all.
-//! - `capture`'s "not a regular file" assertion. Not a leaf but SUBSUMED:
-//!   deleting it leaves `read_named` failing on the same input with a worse
-//!   message, so what the assertion buys is the diagnosis, not the refusal.
 //!
-//! **Two** sites are killed only by the WEAKER signal "it failed for another
-//! reason" — the doctored case's own check noticing that a DIFFERENT rule
-//! fired. They are the "a wal3 cell with no post rows" guard, whose input also
-//! trips the file-set rule one step later, and the `bytes` range check, whose
-//! input then panics in the slice instead. The runner names the exact
-//! replacement red so both stay falsifiable, and
-//! `grep -c "^case_ .*it failed for another reason"` on it is the count. **The
-//! anchor is load-bearing** — the unanchored form counts the runner's own
-//! explanatory header and returns three, which round 3 caught.
+//! **Weaker-signal kills** (doctored case notices a DIFFERENT rule fired):
+//! historical `postguard` and `bytesrange` (`grep -c "^case_ .*it failed for
+//! another reason"`), plus C9m `capture_isfile` / `ranwant` (named replacement
+//! reds in `mutants_r.sh`). **The anchor is load-bearing** — the unanchored
+//! form counts the runner's own explanatory header and returns three, which
+//! round 3 caught.
 //!
 //! Round 3 also showed the `postguard` residue is not inherent: a doctored cell
 //! with a pre-existing `x.lock` INPUT reaches the guard without the file-set
