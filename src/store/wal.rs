@@ -3045,6 +3045,76 @@ mod tests {
         s.close().unwrap();
     }
 
+    /// Above P7's hard ceiling (`log > 2 × cleaning_target`), a commit's
+    /// writer participates with multiple budgeted slices until the log is
+    /// back under the ceiling. Contrasts with
+    /// `a_commit_crossing_the_trigger_pays_one_slice_not_the_whole_pass`,
+    /// which stays below the ceiling and must retire at most two segments.
+    ///
+    /// Java has no dedicated IT for this branch (the production
+    /// `while (cleaningUrgent())` loop is the authority). Clock is cleared
+    /// so multi-slice progress is not a measure of host IO speed.
+    #[test]
+    fn a_commit_above_the_hard_ceiling_participates_until_under() {
+        let dir = scratch("hard_ceiling");
+        let base = dir.join("s.db");
+        // 64 KiB segments + one 60 KiB record: each rewrite lands alone.
+        // Live footprint is page-granular (~2 MiB for a tiny store), so the
+        // ceiling is ~4 MiB — the one-slice pin's 60 rewrites stay under it.
+        // ~120 rewrites push the log past twice the target.
+        let s = StoreWAL::open_segment_bytes(&base, 64 << 10).unwrap();
+        s.test_set_foreground_clean_nanos(0);
+        s.set_min_log_bytes(0).unwrap();
+        let r = s.put(&vec![1u8; 60_000], &RawBytes).unwrap();
+        s.commit().unwrap();
+        for i in 1..=120u16 {
+            s.update(r, Some(&vec![(i & 0xff) as u8; 60_000]), &RawBytes)
+                .unwrap();
+            s.commit().unwrap();
+        }
+
+        s.set_min_log_bytes(1).unwrap();
+        s.set_space_amplification(1).unwrap();
+        let (log_before, target, segs_before) = {
+            let st = s.st.read();
+            (
+                st.segs.log_bytes(),
+                st.cleaning_target(),
+                st.segs.segments().len(),
+            )
+        };
+        let ceiling = target.saturating_mul(2);
+        assert!(
+            log_before > ceiling,
+            "precondition: log must be past the hard ceiling: log {log_before} \
+             ceiling {ceiling} (target {target})"
+        );
+        assert!(
+            segs_before >= 16,
+            "precondition: many segments, was {segs_before}"
+        );
+
+        s.update(r, Some(&vec![255u8; 60_000]), &RawBytes).unwrap();
+        s.commit().unwrap();
+
+        let (log_after, segs_after) = {
+            let st = s.st.read();
+            (st.segs.log_bytes(), st.segs.segments().len())
+        };
+        assert!(
+            log_after <= ceiling,
+            "writer must participate until under the ceiling: log was \
+             {log_before}, now {log_after}, ceiling {ceiling}"
+        );
+        let retired = segs_before.saturating_sub(segs_after);
+        assert!(
+            retired > 2,
+            "above the ceiling a commit must retire more than one slice: \
+             retired {retired} of {segs_before} (after {segs_after})"
+        );
+        s.close().unwrap();
+    }
+
     #[test]
     fn w10_refuses_the_mark_when_a_record_was_not_re_homed() {
         // The check that cannot be deferred past the unlink: the evidence is
