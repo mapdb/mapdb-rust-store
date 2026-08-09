@@ -227,6 +227,13 @@ struct WalState {
     /// Lifetime cleaner accounting, both halves — bytes re-emitted, bytes retired.
     cleaner_bytes_written: i64,
     cleaner_bytes_retired: i64,
+    /// Budget inline cleaning actually runs under. [`FOREGROUND_BUDGET`] unless a
+    /// test replaces its soft wall-clock via [`StoreWAL::test_set_foreground_clean_nanos`].
+    ///
+    /// Exists because `max_nanos` makes any assertion about how much cleaning a
+    /// commit achieves a function of how fast the machine is. Accounting and
+    /// width-search pins must not also depend on host IO speed.
+    foreground_budget: Budget,
     /// Fault injection, and the only reason it exists: W10 is a check on phase
     /// 1's loop, so a suite that cannot make that loop DROP a record cannot tell
     /// a working W10 from one that passes because nothing ever fails it.
@@ -367,6 +374,7 @@ impl StoreWAL {
                 futile_records: 0,
                 cleaner_bytes_written: 0,
                 cleaner_bytes_retired: 0,
+                foreground_budget: FOREGROUND_BUDGET,
                 #[cfg(test)]
                 drop_recid_from_publish: 0,
             })),
@@ -516,6 +524,29 @@ impl StoreWAL {
     pub fn cleaner_bytes(&self) -> (i64, i64) {
         let st = self.st.read();
         (st.cleaner_bytes_written, st.cleaner_bytes_retired)
+    }
+
+    /// Test hook: replace the SOFT WALL-CLOCK ceiling on inline cleaning; 0 removes it.
+    ///
+    /// Only `max_nanos` moves — the record and byte limits stay exactly as
+    /// [`FOREGROUND_BUDGET`] sets them, so a test that clears the clock still
+    /// exercises the real per-tick work limits.
+    ///
+    /// Why this exists: the 500 µs soft wall makes cleaning-volume assertions
+    /// host-IO dependent. Java's
+    /// `minimum_size_segments_do_not_put_cleaning_on_a_treadmill` passed on the
+    /// author's tmpfs and failed on hosted CI from the first run; shrinking the
+    /// bound to 20 µs reproduced the failure locally. Pins of accounting and
+    /// width search must not assert the host's disk speed.
+    #[cfg(test)]
+    pub fn test_set_foreground_clean_nanos(&self, max_nanos: u64) {
+        let mut st = self.st.write();
+        let b = FOREGROUND_BUDGET;
+        st.foreground_budget = Budget {
+            max_records: b.max_records,
+            max_bytes: b.max_bytes,
+            max_nanos,
+        };
     }
 
     /// The store's base path: its segments are `<base>.wal.<16 hex>`.
@@ -1400,11 +1431,7 @@ impl WalState {
             // give width back only when it pays HANDSOMELY.
             let cost = self.cleaner_bytes_written - self.cycle_written_at;
             let gain = self.cleaner_bytes_retired - self.cycle_retired_at - cost;
-            if gain <= cost >> 3 {
-                self.cycle_width = CYCLE_WIDTH_CAP.min(self.cycle_width.max(1) * 2);
-            } else if gain > cost >> 1 {
-                self.cycle_width = (self.cycle_width / 2).max(1);
-            }
+            self.cycle_width = next_cycle_width(self.cycle_width, cost, gain);
             self.last_cycle_saturated = self.cycle_saturated;
         }
         Ok(written)
@@ -1427,8 +1454,10 @@ impl WalState {
         // hold for the whole pass: the per-tick budget would bound an internal
         // iteration while the commit that triggered it still paid for all of
         // them, consecutively, with every reader and writer waiting.
+        // Copy so clean_tick can borrow &mut self without overlapping the field.
+        let budget = self.foreground_budget;
         if self.cleaner.is_some() || self.begin_cycle_if_due(closed)? {
-            self.clean_tick(closed, &FOREGROUND_BUDGET)?;
+            self.clean_tick(closed, &budget)?;
         }
         // The exception is the hard ceiling. Once the log has run away — past
         // twice its target — the writer participates until it is back under, and
@@ -1437,7 +1466,7 @@ impl WalState {
         while self.cleaning_urgent()
             && (self.cleaner.is_some() || self.begin_cycle_if_due(closed)?)
         {
-            self.clean_tick(closed, &FOREGROUND_BUDGET)?;
+            self.clean_tick(closed, &budget)?;
         }
         Ok(())
     }
@@ -1621,6 +1650,25 @@ impl Cleaner {
 /// terminal is never reached.
 fn paid_for_itself(retired: i64, written: i64) -> bool {
     retired - written > (written >> 3)
+}
+
+/// After a closed cycle: widen when gain is poor, hold when modest, halve when
+/// handsome. THREE bands, not two — halving on any gain oscillates around the
+/// break-even width (widths 4 and 8 alternating while a single wide pass would
+/// pay handsomely), because a cycle that barely pays is not evidence the width
+/// is too big.
+fn next_cycle_width(width: usize, cost: i64, gain: i64) -> usize {
+    // Reachable widths are always 1..=CYCLE_WIDTH_CAP (init/reset to 1; every
+    // transition preserves that). Modest band holds the input literally —
+    // including the unreachable 0 case — so this matches Java's inlined
+    // assignment (no-op on modest) over the whole domain.
+    if gain <= cost >> 3 {
+        CYCLE_WIDTH_CAP.min(width.max(1) * 2)
+    } else if gain > cost >> 1 {
+        (width / 2).max(1)
+    } else {
+        width
+    }
 }
 
 /// Walks up to `max_steps` entries of the retiring range, handing each entry's
@@ -2711,6 +2759,94 @@ mod tests {
         );
         assert!(paid_for_itself(113, 100));
         assert!(paid_for_itself(1000, 100));
+    }
+
+    #[test]
+    fn next_cycle_width_three_bands() {
+        // Poor gain (≤ cost/8): double.
+        assert_eq!(next_cycle_width(1, 100, 0), 2);
+        assert_eq!(next_cycle_width(4, 100, 12), 8); // 12 == 100>>3: still poor
+                                                     // Modest gain (between cost/8 and cost/2]: hold.
+        assert_eq!(next_cycle_width(8, 100, 13), 8);
+        assert_eq!(next_cycle_width(8, 100, 50), 8); // 50 == cost>>1: not handsome
+                                                     // Handsome gain (> cost/2): halve, floor 1.
+        assert_eq!(next_cycle_width(8, 100, 51), 4);
+        assert_eq!(next_cycle_width(1, 100, 100), 1);
+        assert_eq!(next_cycle_width(2, 100, 100), 1);
+    }
+
+    #[test]
+    fn next_cycle_width_caps_at_cycle_width_cap() {
+        assert_eq!(
+            next_cycle_width(CYCLE_WIDTH_CAP, 100, 0),
+            CYCLE_WIDTH_CAP,
+            "poor gain at the cap must not overflow it"
+        );
+        assert_eq!(
+            next_cycle_width(CYCLE_WIDTH_CAP / 2, 100, 0),
+            CYCLE_WIDTH_CAP
+        );
+    }
+
+    /// Port of Java `minimum_size_segments_do_not_put_cleaning_on_a_treadmill`.
+    ///
+    /// Pins file-byte cleaner accounting + the three-band width search (double /
+    /// hold / halve). Clock is cleared so segsAfter−segsBefore is not a measure
+    /// of host IO speed (the 500 µs FOREGROUND_BUDGET soft wall made the Java
+    /// original fail on CI while passing on the author's tmpfs).
+    #[test]
+    fn minimum_size_segments_do_not_put_cleaning_on_a_treadmill() {
+        const BUILD: usize = 20_000;
+        const DRIVE: usize = 600;
+
+        let dir = scratch("treadmill");
+        let base = dir.join("s.db");
+        let s = StoreWAL::open_segment_bytes(&base, MIN_SEGMENT_BYTES).unwrap();
+        // Drop the inline cleaner's soft wall-clock; record/byte limits stay.
+        s.test_set_foreground_clean_nanos(0);
+        s.set_min_log_bytes(0).unwrap(); // no cleaning while building
+        for _ in 0..BUILD {
+            s.preallocate().unwrap();
+            s.commit().unwrap();
+        }
+
+        s.set_min_log_bytes(1).unwrap();
+        s.set_space_amplification(1).unwrap();
+        let (log_before, target, segs_before) = {
+            let st = s.st.read();
+            (
+                st.segs.log_bytes(),
+                st.cleaning_target(),
+                st.segs.segments().len(),
+            )
+        };
+        assert!(
+            log_before > target,
+            "the trigger must be live: log {log_before} target {target}"
+        );
+
+        for _ in 0..DRIVE {
+            s.preallocate().unwrap();
+            s.commit().unwrap();
+        }
+
+        let (written, retired) = s.cleaner_bytes();
+        let gained = retired - written;
+        assert!(
+            gained > written / 8,
+            "cleaning must pay for itself: retired {retired} for {written} written"
+        );
+        let segs_after = s.segment_seqs().len();
+        assert!(
+            segs_after < segs_before + DRIVE / 4,
+            "the segment count must not climb with the commit count: \
+             {segs_before} -> {segs_after} over {DRIVE} commits"
+        );
+        assert!(
+            !s.cleaning_exhausted(),
+            "cleaning is working here, so nothing is unachievable"
+        );
+        s.close().unwrap();
     }
 
     #[test]
