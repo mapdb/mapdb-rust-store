@@ -549,6 +549,32 @@ impl StoreWAL {
         };
     }
 
+    /// Test hook: end the current episode as if it had retired exactly what it
+    /// re-emitted, arming the futility latch through the real path rather than
+    /// by field assignment.
+    ///
+    /// A genuinely futile episode is not reachable from the public API
+    /// (`liveDataBytes` always exceeds a compacted log, so the trigger quiets
+    /// first). What this pins is the **release** rule. Matches Java
+    /// `StoreWAL.testArmFutility`.
+    #[cfg(test)]
+    pub fn test_arm_futility(&self, records_re_emitted: i64) {
+        let mut st = self.st.write();
+        st.clean_floor_seq = st.segs.active().expect("writable store").seq;
+        st.episode_retired = st.cleaner_bytes_retired;
+        st.episode_written = st.cleaner_bytes_written;
+        st.episode_records = records_re_emitted;
+        // Only a whole-range cycle may arm; see end_episode.
+        st.last_cycle_saturated = true;
+        st.end_episode();
+    }
+
+    /// Test hook: the cleaning trigger's current target.
+    #[cfg(test)]
+    pub fn test_cleaning_target(&self) -> u64 {
+        self.st.read().cleaning_target()
+    }
+
     /// The store's base path: its segments are `<base>.wal.<16 hex>`.
     pub fn base(&self) -> &Path {
         &self.base
@@ -2845,6 +2871,176 @@ mod tests {
         assert!(
             !s.cleaning_exhausted(),
             "cleaning is working here, so nothing is unachievable"
+        );
+        s.close().unwrap();
+    }
+
+    /// Port of Java `a_material_target_drop_releases_the_futility_latch`.
+    ///
+    /// The latch releases on EITHER side of the ratio. Waiting only for the log
+    /// to grow wedges the delete direction: a large delete drops the live
+    /// footprint and makes images reclaimable without the log moving. Ordinary
+    /// allocator jitter on one update must not release.
+    #[test]
+    fn a_material_target_drop_releases_the_futility_latch() {
+        const RECS: usize = 20;
+        const SIZE: usize = 60_000;
+
+        let dir = scratch("latch_drop");
+        let base = dir.join("s.db");
+        let s = StoreWAL::open_segment_bytes(&base, 128 << 10).unwrap();
+        s.set_min_log_bytes(0).unwrap();
+        let mut r = Vec::with_capacity(RECS);
+        for i in 0..RECS {
+            r.push(s.put(&vec![(i & 0xff) as u8; SIZE], &RawBytes).unwrap());
+        }
+        s.commit().unwrap();
+        for w in 1..=6 {
+            for (i, recid) in r.iter().enumerate() {
+                s.update(*recid, Some(&vec![((i + w) & 0xff) as u8; SIZE]), &RawBytes)
+                    .unwrap();
+            }
+            s.commit().unwrap();
+        }
+        s.set_min_log_bytes(1).unwrap();
+        s.set_space_amplification(1).unwrap();
+        let log = s.log_bytes().unwrap();
+        let target = s.test_cleaning_target();
+        assert!(
+            log > target,
+            "the trigger must be live or a latch means nothing: log {log} target {target}"
+        );
+
+        // Large re-emitted count keeps the staleness (churn) rule out of this
+        // test: only the TARGET release is under pin.
+        s.test_arm_futility(1_000);
+        assert!(
+            s.cleaning_exhausted(),
+            "the hook must arm through the real path"
+        );
+
+        s.update(r[0], Some(&vec![99u8; SIZE]), &RawBytes).unwrap();
+        s.commit().unwrap();
+        assert!(
+            s.cleaning_exhausted(),
+            "allocator jitter is not a smaller store: the latch must survive an ordinary commit"
+        );
+
+        let before = s.log_bytes().unwrap();
+        for recid in r.iter().skip(1) {
+            s.delete(*recid).unwrap();
+        }
+        s.commit().unwrap(); // log grew; store shrank ~40%
+        assert!(
+            !s.cleaning_exhausted(),
+            "a delete makes the log reclaimable without the log moving: \
+             the latch must release on the target, not only on growth"
+        );
+
+        s.update(r[0], Some(&vec![100u8; SIZE]), &RawBytes).unwrap();
+        s.commit().unwrap();
+        let after = s.log_bytes().unwrap();
+        assert!(
+            after < before,
+            "released, so cleaning must actually run: log was {before}, now {after}"
+        );
+        s.close().unwrap();
+    }
+
+    /// Port of Java `a_state_only_churn_releases_the_futility_latch`.
+    ///
+    /// A mass delete of records that own no data extent obsoletes every image
+    /// while moving neither log size nor target. The third release rule is the
+    /// store's state-change count: retry once per live-set's worth of commits.
+    #[test]
+    fn a_state_only_churn_releases_the_futility_latch() {
+        const RECS: i64 = 24;
+
+        let dir = scratch("latch_churn");
+        let base = dir.join("s.db");
+        let s = StoreWAL::open_segment_bytes(&base, 128 << 10).unwrap();
+        s.set_min_log_bytes(0).unwrap();
+        let mut r = Vec::with_capacity(RECS as usize);
+        for i in 0..RECS {
+            r.push(s.put(&vec![i as u8; 60_000], &RawBytes).unwrap());
+        }
+        s.commit().unwrap();
+        for w in 1..=4 {
+            for (i, recid) in r.iter().enumerate() {
+                s.update(*recid, Some(&vec![(i as i64 + w) as u8; 60_000]), &RawBytes)
+                    .unwrap();
+            }
+            s.commit().unwrap();
+        }
+        s.set_min_log_bytes(1).unwrap();
+        s.set_space_amplification(1).unwrap();
+        let log = s.log_bytes().unwrap();
+        let target = s.test_cleaning_target();
+        assert!(
+            log > target,
+            "the trigger must be live or a latch means nothing: log {log} target {target}"
+        );
+
+        s.test_arm_futility(RECS); // as if a whole-range episode had gained nothing
+        assert!(s.cleaning_exhausted());
+        let log_at_arming = s.log_bytes().unwrap();
+        let target_at_arming = s.test_cleaning_target();
+
+        // PREALLOCATE, one per commit: self-contained, no data extent — footprint
+        // does not fall; log grows by dozens of bytes, not a target's worth.
+        for _ in 0..RECS {
+            s.preallocate().unwrap();
+            s.commit().unwrap();
+        }
+        let log_now = s.log_bytes().unwrap();
+        let target_now = s.test_cleaning_target();
+        assert!(
+            log_now < log_at_arming + target_at_arming,
+            "this traffic must not trip the GROWTH rule: {log_at_arming} -> {log_now} \
+             against target {target_at_arming}"
+        );
+        assert!(
+            target_now > target_at_arming - (target_at_arming >> 3),
+            "nor the TARGET rule: {target_at_arming} -> {target_now}"
+        );
+        assert!(
+            !s.cleaning_exhausted(),
+            "a live-set's worth of state changes must invalidate the proof"
+        );
+        s.close().unwrap();
+    }
+
+    /// Port of Java `a_commit_crossing_the_trigger_pays_one_slice_not_the_whole_pass`.
+    ///
+    /// A commit that crosses the trigger pays ONE bounded slice, not a whole
+    /// pass (hold is inside the write lock). Hard ceiling is far above here.
+    #[test]
+    fn a_commit_crossing_the_trigger_pays_one_slice_not_the_whole_pass() {
+        let dir = scratch("one_slice");
+        let base = dir.join("s.db");
+        let s = StoreWAL::open_segment_bytes(&base, 64 << 10).unwrap();
+        s.set_min_log_bytes(0).unwrap();
+        let r = s.put(&vec![1u8; 60_000], &RawBytes).unwrap();
+        s.commit().unwrap();
+        for i in 1..=60u8 {
+            s.update(r, Some(&vec![i; 60_000]), &RawBytes).unwrap();
+            s.commit().unwrap();
+        }
+        let segs_before = s.segment_seqs().len();
+        assert!(
+            segs_before >= 8,
+            "precondition: many segments, was {segs_before}"
+        );
+
+        s.set_min_log_bytes(1).unwrap();
+        s.set_space_amplification(1).unwrap();
+        s.update(r, Some(&vec![255u8; 60_000]), &RawBytes).unwrap();
+        s.commit().unwrap();
+        let segs_after = s.segment_seqs().len();
+        assert!(
+            segs_before.saturating_sub(segs_after) <= 2,
+            "one commit retired {} segments of {segs_before}: that is a whole pass, not a slice",
+            segs_before.saturating_sub(segs_after)
         );
         s.close().unwrap();
     }
