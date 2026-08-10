@@ -1662,9 +1662,13 @@ fn rootset_refuses_an_extra_file() {
     std::fs::write(root.join("EXTRA_NOT_IN_MANIFEST"), b"x").unwrap();
     let msg = red_of(|| assert_corpus_rootset(&root, &sample))
         .unwrap_or_else(|| panic!("rootset accepted a root with an extra file"));
+    // The custom message ALONE. `assert_eq!` with a custom message emits both
+    // it and the generic `assertion `left == right` failed` line, so the second
+    // disjunct admitted nothing this one does not — except a red from some
+    // OTHER `assert_eq!`, which is the failure mode a red-check exists to
+    // exclude (r1 §5).
     assert!(
-        msg.contains("no `file` row accounts for")
-            || msg.contains("assertion `left == right` failed"),
+        msg.contains("no `file` row accounts for"),
         "rootset: got: {msg}"
     );
     let _ = std::fs::remove_dir_all(&session);
@@ -1692,9 +1696,9 @@ fn distseal_refuses_a_flipped_blob() {
     std::fs::write(root.join(blob), &b).unwrap();
     let msg = red_of(|| assert_corpus_distseal(&root))
         .unwrap_or_else(|| panic!("distseal accepted a root whose bytes differ from DIST_SEAL"));
+    // The custom message alone; see `rootset_refuses_an_extra_file`.
     assert!(
-        msg.contains("not todo/store-cross/corpus-v2")
-            || msg.contains("assertion `left == right` failed"),
+        msg.contains("not todo/store-cross/corpus-v2"),
         "distseal: got: {msg}"
     );
     let _ = std::fs::remove_dir_all(&session);
