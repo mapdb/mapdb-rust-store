@@ -233,6 +233,14 @@ struct WalState {
     /// Exists because `max_nanos` makes any assertion about how much cleaning a
     /// commit achieves a function of how fast the machine is. Accounting and
     /// width-search pins must not also depend on host IO speed.
+    ///
+    /// NOT `#[cfg(test)]`-gated, unlike `drop_recid_from_publish` below, because
+    /// the field is READ on a production path — `auto_clean_locked` takes its
+    /// slice budget from here on every commit. Only the SETTER is test-only, so
+    /// a release build carries the field holding exactly [`FOREGROUND_BUDGET`]
+    /// with no way to change it; gating the field would mean two spellings of
+    /// `auto_clean_locked`, which is the shape that lets a test build and a
+    /// release build clean differently.
     foreground_budget: Budget,
     /// Fault injection, and the only reason it exists: W10 is a check on phase
     /// 1's loop, so a suite that cannot make that loop DROP a record cannot tell
@@ -3013,12 +3021,29 @@ mod tests {
     /// Port of Java `a_commit_crossing_the_trigger_pays_one_slice_not_the_whole_pass`.
     ///
     /// A commit that crosses the trigger pays ONE bounded slice, not a whole
-    /// pass (hold is inside the write lock). Hard ceiling is far above here.
+    /// pass (the hold is inside the write lock). Both directions are asserted:
+    /// a slice happened, and it was a slice.
+    ///
+    /// **Counting segments is not counting retirements.** The episode's first
+    /// cycle rolls the active segment to give itself a floor
+    /// (`begin_cycle_if_due`), so a slice that retires exactly one segment
+    /// leaves `segment_seqs().len()` exactly where it was. The r1 review
+    /// instrumented the previous revision of this test and measured that
+    /// difference at ZERO — 31 segments before, 31 after — which is why its
+    /// `retired <= 2` survived deleting `auto_clean_locked` outright. Retirement
+    /// is read as a SET difference over the sequence numbers instead: a rolled-in
+    /// successor carries a new `seq` and cannot mask a retired predecessor.
     #[test]
     fn a_commit_crossing_the_trigger_pays_one_slice_not_the_whole_pass() {
+        use std::collections::BTreeSet;
+
         let dir = scratch("one_slice");
         let base = dir.join("s.db");
         let s = StoreWAL::open_segment_bytes(&base, 64 << 10).unwrap();
+        // Cleared for the reason the hard-ceiling pin clears it: how much a
+        // slice achieves must not be a measure of the host's IO speed. The
+        // record and byte limits — the ones that make a slice a slice — stay.
+        s.test_set_foreground_clean_nanos(0);
         s.set_min_log_bytes(0).unwrap();
         let r = s.put(&vec![1u8; 60_000], &RawBytes).unwrap();
         s.commit().unwrap();
@@ -3026,21 +3051,46 @@ mod tests {
             s.update(r, Some(&vec![i; 60_000]), &RawBytes).unwrap();
             s.commit().unwrap();
         }
-        let segs_before = s.segment_seqs().len();
-        assert!(
-            segs_before >= 8,
-            "precondition: many segments, was {segs_before}"
-        );
 
         s.set_min_log_bytes(1).unwrap();
         s.set_space_amplification(1).unwrap();
+        let seqs_before: BTreeSet<i64> = s.segment_seqs().into_iter().collect();
+        let (log_before, target) = {
+            let st = s.st.read();
+            (st.segs.log_bytes(), st.cleaning_target())
+        };
+        let ceiling = target.saturating_mul(2);
+        assert!(
+            log_before > target,
+            "precondition: the trigger must be live: log {log_before} target {target}"
+        );
+        assert!(
+            log_before <= ceiling,
+            "precondition: BELOW the hard ceiling, or the writer is entitled to more \
+             than one slice and this test is measuring the other branch: log {log_before} \
+             ceiling {ceiling} (target {target})"
+        );
+        assert!(
+            seqs_before.len() >= 8,
+            "precondition: many segments, was {}",
+            seqs_before.len()
+        );
+
         s.update(r, Some(&vec![255u8; 60_000]), &RawBytes).unwrap();
         s.commit().unwrap();
-        let segs_after = s.segment_seqs().len();
+
+        let seqs_after: BTreeSet<i64> = s.segment_seqs().into_iter().collect();
+        let retired = seqs_before.difference(&seqs_after).count();
         assert!(
-            segs_before.saturating_sub(segs_after) <= 2,
-            "one commit retired {} segments of {segs_before}: that is a whole pass, not a slice",
-            segs_before.saturating_sub(segs_after)
+            retired >= 1,
+            "a commit that crosses the trigger must clean: it retired nothing of \
+             {} segments",
+            seqs_before.len()
+        );
+        assert!(
+            retired <= 2,
+            "one commit retired {retired} segments of {}: that is a whole pass, not a slice",
+            seqs_before.len()
         );
         s.close().unwrap();
     }
