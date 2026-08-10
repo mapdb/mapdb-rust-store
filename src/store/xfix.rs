@@ -2820,24 +2820,42 @@ fn k4_matches(msg: &str) -> bool {
     signed_digits(seg) && signed_digits(through) && tail.is_empty()
 }
 
+/// The `'K'` mark-body rules (`wal_recover.rs::read_mark`), all FOUR of them.
+///
+/// **Every disjunct is tried.** The r1 review found the previous revision
+/// returning `false` from inside the first arm, which short-circuited the rest:
+/// two production refusals share the `": clean mark body is "` marker —
+/// `"... is 9 bytes, not 16"` and `"... is truncated"` — so the arm that failed
+/// to parse a byte count refused the message outright instead of letting the
+/// next form look at it, and a genuine `truncated` refusal graded not-S8. An
+/// arm that does not match now falls THROUGH.
+///
+/// K4 is a neighbour on the same mark and must keep failing this predicate.
 fn s8_matches(msg: &str) -> bool {
-    // Three disjuncts on the 'K' body. K4 is a neighbour on the same mark.
     if let Some(rest) = after_wal_segment(msg, ": clean mark body is ") {
-        if let Some((n, tail)) = rest.split_once(" bytes, not 16") {
-            return signed_digits(n) && tail.is_empty();
+        // `read_mark`'s first two refusals, in wire order.
+        if rest == "truncated" {
+            return true;
         }
-        return false;
+        if let Some((n, tail)) = rest.split_once(" bytes, not 16") {
+            if signed_digits(n) && tail.is_empty() {
+                return true;
+            }
+        }
     }
     if let Some(rest) = after_wal_segment(msg, ": clean mark attests cleanedThroughSeq ") {
-        return signed_digits(rest);
+        if signed_digits(rest) {
+            return true;
+        }
     }
     if let Some(rest) = after_wal_segment(msg, ": clean mark attests logStartLsn ") {
-        let Some((start, rest)) =
+        if let Some((start, rest)) =
             rest.split_once(", which is not an LSN at or below the mark's own ")
-        else {
-            return false;
-        };
-        return signed_digits(start) && signed_digits(rest);
+        {
+            if signed_digits(start) && signed_digits(rest) {
+                return true;
+            }
+        }
     }
     false
 }
@@ -2855,25 +2873,46 @@ fn s9_matches(msg: &str) -> bool {
     signed_digits(lsn) && digits(off) && signed_digits(prev)
 }
 
+/// Both S4 holds `scan_segment` raises for a body-CRC mismatch: the non-final
+/// one (corruption by construction — W3 sealed that segment) and the ACTIVE one,
+/// where a valid follower is what proves the damage is not a torn tail
+/// (`wal_recover.rs:632-651`).
+///
+/// **The section-HEADER damage forms are deliberately not here.** They are rule
+/// S3, not S4 — production labels the two branches that way (`wal_recover.rs`
+/// `// S3.` at :575 against `// S4.` at :633), Java's reference predicates
+/// `S4_NONFINAL`/`S4_MIDLOG` are body-CRC only, and `catalogue.py::FAMILIES`
+/// names no S3, so an S3 refusal grades as the unrefined `DataCorruption`
+/// family — which is a real grading, not a gap. Widening S4 to swallow it would
+/// take those refusals OUT of `DataCorruption` (the arm is stated as an
+/// exclusion over `refined_family_matches`) in this port alone.
+///
+/// **Every disjunct is tried**, and that is what makes the pair safe: the active
+/// mid-log message EMBEDS the non-final marker (`": section body CRC mismatch at
+/// offset "` occurs inside `": mid-log corruption: section body CRC mismatch at
+/// offset "`), so an arm that returned `false` on a failed tail parse could
+/// refuse a genuine mid-log refusal purely on arm order. Falling through instead
+/// makes the predicate order-independent.
 fn s4_matches(msg: &str) -> bool {
-    // Active mid-log FIRST: its wording embeds ": section body CRC mismatch at
-    // offset ", which is also the non-final marker — checking non-final first
-    // would take the mid-log message, fail the non-final tail, and refuse a
-    // genuine mid-log refusal.
-    if let Some(rest) = after_wal_segment(
-        msg,
-        ": mid-log corruption: section body CRC mismatch at offset ",
-    ) {
-        let Some((off, tail)) = rest.split_once(" but valid sections follow") else {
-            return false;
-        };
-        return digits(off) && tail.is_empty();
-    }
-    if let Some(rest) = after_wal_segment(msg, ": section body CRC mismatch at offset ") {
-        let Some((off, tail)) = rest.split_once(" in a non-final segment") else {
-            return false;
-        };
-        return digits(off) && tail.is_empty();
+    for (marker, tail_marker) in [
+        (
+            ": mid-log corruption: section body CRC mismatch at offset ",
+            " but valid sections follow",
+        ),
+        (
+            ": section body CRC mismatch at offset ",
+            " in a non-final segment",
+        ),
+    ] {
+        if let Some(rest) = after_wal_segment(msg, marker) {
+            if let Some((off, tail)) = rest.split_once(tail_marker) {
+                // The offset is a `u64` in the engine: no refusal it renders can
+                // put a minus sign there, so `-1` is something else entirely.
+                if digits(off) && tail.is_empty() {
+                    return true;
+                }
+            }
+        }
     }
     false
 }

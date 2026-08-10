@@ -928,12 +928,17 @@ fn the_reopen_family_predicate_discriminates() {
     // matrix is a true diagonal (with the extra columns that prove opacity /
     // generic-arm membership for samples no refined family claims).
     //
+    // r1 §7 found that claim false by one row: R6-audit had an accept control
+    // and no column, so it was never shown refusing anything, and the arm
+    // `payload.is_some()` would have passed. All 18 members of
+    // `catalogue.py::FAMILIES` now have a row and a column.
+    //
     // C8f f0: N6 is now a graded family and is excluded from DataCorruption.
     // D1 still refuses N6 (neighbour on the legacy-boundary loop).
     let migrate = "no migration to v3 — open it with the release that wrote it and copy the \
                    data across, or move it aside";
     // Sample order is the accepts-string column order below.
-    let samples: [(&str, DbError); 20] = [
+    let samples: [(&str, DbError); 21] = [
         (
             "direct",
             DbError::corrupt("not a MapDB StoreDirect file (bad magic)"),
@@ -1039,28 +1044,41 @@ fn the_reopen_family_predicate_discriminates() {
                  leading sections are gone",
             ),
         ),
+        // R6-audit is the one refusal in this set that does NOT wear the
+        // `WAL segment <name>: ` prefix — it is the replay audit's verdict over
+        // the whole log, not one segment's. That is exactly why it needs a
+        // column: a predicate whose only test is its own accept control has
+        // never been shown to refuse a neighbour.
+        (
+            "r6",
+            DbError::corrupt(
+                "WAL replay skipped 1 append(s) whose base image is absent and which no later \
+                 entry superseded (recid 4): the log is missing sections it depends on",
+            ),
+        ),
     ];
-    // Columns: direct d1 d1c n6 corrupt s2 s2c s2neg full h5 h6 h7 h9 k4 s8 s9 s4 r4f r4c r4s
+    // Columns: direct d1 d1c n6 corrupt s2 s2c s2neg full h5 h6 h7 h9 k4 s8 s9 s4 r4f r4c r4s r6
     // DataCorruption accepts: corrupt + s2-negative-offset only among refined-unclaimed.
     for (family, accepts) in [
-        ("direct-magic", "ynnnnnnnnnnnnnnnnnnn"),
-        ("D1", "nyynnnnnnnnnnnnnnnnn"),
-        ("N6", "nnnynnnnnnnnnnnnnnnn"),
+        ("direct-magic", "ynnnnnnnnnnnnnnnnnnnn"),
+        ("D1", "nyynnnnnnnnnnnnnnnnnn"),
+        ("N6", "nnnynnnnnnnnnnnnnnnnn"),
         // DataCorruption: corrupt(4)+s2-neg(7); N6(3)/S2(5,6) excluded as refined.
-        ("DataCorruption", "nnnnynnynnnnnnnnnnnn"),
-        ("S2", "nnnnnyynnnnnnnnnnnnn"),
-        ("StoreFull", "nnnnnnnnynnnnnnnnnnn"),
-        ("H5", "nnnnnnnnnynnnnnnnnnn"),
-        ("H6", "nnnnnnnnnnynnnnnnnnn"),
-        ("H7", "nnnnnnnnnnnynnnnnnnn"),
-        ("H9", "nnnnnnnnnnnnynnnnnnn"),
-        ("K4", "nnnnnnnnnnnnnynnnnnn"),
-        ("S8/K-bounds", "nnnnnnnnnnnnnnynnnnn"),
-        ("S9", "nnnnnnnnnnnnnnnynnnn"),
-        ("S4/mid-log", "nnnnnnnnnnnnnnnnynnn"),
-        ("R4-floor", "nnnnnnnnnnnnnnnnnynn"),
-        ("R4-chain", "nnnnnnnnnnnnnnnnnnyn"),
-        ("R4-self", "nnnnnnnnnnnnnnnnnnny"),
+        ("DataCorruption", "nnnnynnynnnnnnnnnnnnn"),
+        ("S2", "nnnnnyynnnnnnnnnnnnnn"),
+        ("StoreFull", "nnnnnnnnynnnnnnnnnnnn"),
+        ("H5", "nnnnnnnnnynnnnnnnnnnn"),
+        ("H6", "nnnnnnnnnnynnnnnnnnnn"),
+        ("H7", "nnnnnnnnnnnynnnnnnnnn"),
+        ("H9", "nnnnnnnnnnnnynnnnnnnn"),
+        ("K4", "nnnnnnnnnnnnnynnnnnnn"),
+        ("S8/K-bounds", "nnnnnnnnnnnnnnynnnnnn"),
+        ("S9", "nnnnnnnnnnnnnnnynnnnn"),
+        ("S4/mid-log", "nnnnnnnnnnnnnnnnynnnn"),
+        ("R4-floor", "nnnnnnnnnnnnnnnnnynnn"),
+        ("R4-chain", "nnnnnnnnnnnnnnnnnnynn"),
+        ("R4-self", "nnnnnnnnnnnnnnnnnnnyn"),
+        ("R6-audit", "nnnnnnnnnnnnnnnnnnnny"),
     ] {
         assert_eq!(accepts.len(), samples.len(), "accepts for {family}");
         for ((name, e), want) in samples.iter().zip(accepts.chars()) {
@@ -1077,15 +1095,12 @@ fn the_reopen_family_predicate_discriminates() {
             }
         }
     }
-    // R6-audit and S8/S4 extra disjuncts (not every disjunct needs a matrix column).
-    xfix::assert_family(
-        "R6-audit control",
-        "R6-audit",
-        &DbError::corrupt(
-            "WAL replay skipped 1 append(s) whose base image is absent and which no later entry \
-             superseded (recid 4): the log is missing sections it depends on",
-        ),
-    );
+    // ---- extra disjuncts, and the negatives that make the diagonal true ----
+    //
+    // Not every disjunct needs a matrix column, but every disjunct needs to be
+    // shown ACCEPTED, and every predicate needs to be shown REFUSING a
+    // plausible-but-wrong variant of its own sentence. A predicate exercised
+    // only against the message it was written from is a check that cannot fail.
     xfix::assert_family(
         "S8 logStart",
         "S8/K-bounds",
@@ -1093,6 +1108,31 @@ fn the_reopen_family_predicate_discriminates() {
             "WAL segment x.wal.4: clean mark attests logStartLsn 0, which is not an LSN at or \
              below the mark's own 10",
         ),
+    );
+    // r1 defect 2: `read_mark` renders TWO refusals under `clean mark body is `,
+    // and the predicate's first arm used to `return false` when the byte-count
+    // parse failed — so `truncated`, a real production refusal
+    // (wal_recover.rs:753), short-circuited to not-S8. Neither form had a test.
+    xfix::assert_family(
+        "S8 body truncated",
+        "S8/K-bounds",
+        &DbError::corrupt("WAL segment x.wal.4: clean mark body is truncated"),
+    );
+    xfix::assert_family(
+        "S8 body wrong length",
+        "S8/K-bounds",
+        &DbError::corrupt("WAL segment x.wal.4: clean mark body is 9 bytes, not 16"),
+    );
+    // ...and neither arm may degenerate into "anything after `body is `".
+    refused(
+        "an unknown clean-mark-body complaint as S8",
+        "S8/K-bounds",
+        DbError::corrupt("WAL segment x.wal.4: clean mark body is missing"),
+    );
+    refused(
+        "a clean-mark body length that is not a number, as S8",
+        "S8/K-bounds",
+        DbError::corrupt("WAL segment x.wal.4: clean mark body is nine bytes, not 16"),
     );
     xfix::assert_family(
         "S4 mid-log active",
@@ -1108,6 +1148,52 @@ fn the_reopen_family_predicate_discriminates() {
         DbError::corrupt(
             "WAL segment x.wal.4: clean mark in segment 4 authorizes removing segment 4, \
              including itself",
+        ),
+    );
+    // S3 is a NEIGHBOUR of S4, not a member. `scan_segment` labels the
+    // header-damage branch S3 (wal_recover.rs:575) and the body-CRC branch S4
+    // (:633); `catalogue.py::FAMILIES` names no S3; java's `S4_NONFINAL` /
+    // `S4_MIDLOG` are body-CRC only. So an S3 refusal grades as the unrefined
+    // `DataCorruption` family — a real grading, not a gap — and S4 must refuse
+    // it. Both halves are asserted, which is what makes the exclusion a
+    // decision rather than an omission (r1 §7 proposed widening S4 to swallow
+    // these; that would take them out of `DataCorruption` in this port alone).
+    for (what, msg) in [
+        (
+            "S3 mid-log header damage",
+            "WAL segment x.wal.5: mid-log corruption: section header damaged at offset 100 but \
+             valid sections follow (not a torn tail)",
+        ),
+        (
+            "S3 non-final header damage",
+            "WAL segment x.wal.3: section header damaged at offset 100 in a non-final segment",
+        ),
+    ] {
+        refused(
+            &format!("{what} as S4"),
+            "S4/mid-log",
+            DbError::corrupt(msg),
+        );
+        xfix::assert_family(what, "DataCorruption", &DbError::corrupt(msg));
+    }
+    // R6-audit's diagonal is the column above; these are the plausible-but-
+    // wrong variants of its own sentence. The recid is a `u64` in the engine,
+    // so a minus sign there is a message no engine renders — the same lesson
+    // the S2 offset sign taught, restated where it can fire.
+    refused(
+        "an R6-audit refusal with a signed recid",
+        "R6-audit",
+        DbError::corrupt(
+            "WAL replay skipped 1 append(s) whose base image is absent and which no later entry \
+             superseded (recid -4): the log is missing sections it depends on",
+        ),
+    );
+    refused(
+        "the R6-audit wording with a trailing clause",
+        "R6-audit",
+        DbError::corrupt(
+            "WAL replay skipped 1 append(s) whose base image is absent and which no later entry \
+             superseded (recid 4): the log is missing sections it depends on, and more",
         ),
     );
 }
