@@ -1507,24 +1507,14 @@ pub fn render_body(sample: &SampleV2) -> Vec<String> {
                     let delta = e.delta.expect("APPEND carries delta");
                     let base_lsn = e.base_lsn.expect("APPEND carries base_lsn");
                     let len = e.append_len.expect("APPEND carries append_len");
-                    assert_eq!(
-                        base_lsn,
-                        s.lsn - delta,
-                        "{at}: base_lsn {base_lsn} != section.lsn {} - delta {delta}",
-                        s.lsn
-                    );
-                    assert!(
-                        delta >= 1 && delta < s.lsn,
-                        "{at}: delta {delta} outside [1, {}]",
-                        s.lsn - 1
-                    );
                     let c = e.content.as_ref().expect("APPEND carries content vec");
-                    assert_eq!(
-                        c.len() as i64,
-                        len,
-                        "{at}: append content length {} != len {len}",
-                        c.len()
-                    );
+                    // `base_lsn == s.lsn - delta`, `1 <= delta < s.lsn` and
+                    // `c.len() == len` are all established in `entries` — by
+                    // assertion for the delta range, by construction for the
+                    // other two — so restating them here checks this function
+                    // against nothing. What the row IS checked against is
+                    // GOLDEN-BODY.tsv, which java authored with the frozen
+                    // reader; that comparison is the oracle.
                     out.push(format!(
                         "ent\t{}\t{}\t{}\t{i}\t{}\t{}\t{delta}\t{base_lsn}\t{len}\t{}",
                         f.fixture,
@@ -2728,7 +2718,6 @@ fn s2_matches(msg: &str) -> bool {
     let Some((off, prev)) = rest.split_once(" does not follow ") else {
         return false;
     };
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
     // The two LSNs are SIGNED and the offset is NOT, and the asymmetry is the
     // engine's, not a convenience: an LSN is `i64` on disk, so a CRC-valid
     // section carrying a negative one is a real input this rule can be shown,
@@ -2736,7 +2725,12 @@ fn s2_matches(msg: &str) -> bool {
     // minus sign there. Round 3 found one sign predicate covering all three,
     // which accepted `at offset -2` as S2 — a message no engine produces, so a
     // refusal wearing it is something else entirely and must not be graded here.
-    let signed = |s: &str| digits(s.strip_prefix('-').unwrap_or(s));
+    //
+    // The two predicates are the module-level `digits`/`signed_digits`, bound to
+    // the short names the paragraph above reads by. They used to be re-spelled
+    // here as closures with identical bodies — one copy to keep in step for
+    // nothing (r1 §8).
+    let (digits, signed) = (digits, signed_digits);
     signed(lsn) && digits(off) && signed(prev)
 }
 
@@ -2744,8 +2738,8 @@ fn s2_matches(msg: &str) -> bool {
 /// `": "` or newlines). Returns the remainder after the last matching marker.
 fn after_wal_segment<'a>(msg: &'a str, marker: &str) -> Option<&'a str> {
     let rest = msg.strip_prefix("WAL segment ")?;
-    let (_name, rest) = rest.rsplit_once(marker)?;
-    if _name.is_empty() {
+    let (name, rest) = rest.rsplit_once(marker)?;
+    if name.is_empty() {
         return None;
     }
     Some(rest)
@@ -2925,13 +2919,13 @@ fn r4_floor_matches(msg: &str) -> bool {
     let Some((lsn, rest)) = rest.split_once(" in ") else {
         return false;
     };
-    let Some((_name, rest)) = rest.rsplit_once(" but ") else {
+    let Some((name, rest)) = rest.rsplit_once(" but ") else {
         return false;
     };
-    let Some((_why, tail)) = rest.rsplit_once(": sections below it are gone") else {
+    let Some((why, tail)) = rest.rsplit_once(": sections below it are gone") else {
         return false;
     };
-    signed_digits(lsn) && tail.is_empty() && !_name.is_empty() && !_why.is_empty()
+    signed_digits(lsn) && tail.is_empty() && !name.is_empty() && !why.is_empty()
 }
 
 fn r4_chain_matches(msg: &str) -> bool {
@@ -2939,22 +2933,22 @@ fn r4_chain_matches(msg: &str) -> bool {
     let Some(rest) = msg.strip_prefix("WAL segment ") else {
         return false;
     };
-    let Some((_name, rest)) = rest.rsplit_once(" states it begins at LSN ") else {
+    let Some((name, rest)) = rest.rsplit_once(" states it begins at LSN ") else {
         return false;
     };
-    if _name.is_empty() {
+    if name.is_empty() {
         return false;
     }
     let Some((stated, rest)) = rest.split_once(" but ") else {
         return false;
     };
-    let Some((_prev, rest)) = rest.rsplit_once(" accounts for LSNs up to ") else {
+    let Some((prev, rest)) = rest.rsplit_once(" accounts for LSNs up to ") else {
         return false;
     };
     let Some((upto, tail)) = rest.split_once(": sections between them are gone") else {
         return false;
     };
-    signed_digits(stated) && signed_digits(upto) && tail.is_empty() && !_prev.is_empty()
+    signed_digits(stated) && signed_digits(upto) && tail.is_empty() && !prev.is_empty()
 }
 
 fn r4_self_matches(msg: &str) -> bool {
@@ -2962,10 +2956,10 @@ fn r4_self_matches(msg: &str) -> bool {
     let Some(rest) = msg.strip_prefix("WAL segment ") else {
         return false;
     };
-    let Some((_name, rest)) = rest.rsplit_once(" states it begins at LSN ") else {
+    let Some((name, rest)) = rest.rsplit_once(" states it begins at LSN ") else {
         return false;
     };
-    if _name.is_empty() {
+    if name.is_empty() {
         return false;
     }
     let Some((stated, rest)) = rest.split_once(" but its first section is ") else {
