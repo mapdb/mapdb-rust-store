@@ -836,7 +836,17 @@ impl WalState {
             )));
         }
         self.staged.clear();
-        self.auto_clean_locked(closed)
+        // Inline cleaning runs after the section is forced, applied and no
+        // longer staged. If it fails, returning an error with this handle open
+        // would let the caller retry a transaction that already committed.
+        // Close the handle and preserve the cleaner's original error; reopening
+        // is the only way to inspect the durable result. A pre-force refusal
+        // above still leaves the handle and staged transaction intact.
+        if let Err(e) = self.auto_clean_locked(closed) {
+            self.fail_closed(closed);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Applies one committed section's ops and moves the identities by the SAME
@@ -2590,6 +2600,62 @@ mod tests {
             assert_eq!(s.get(a, &L).unwrap(), Some(11), "{kind:?}");
             s.verify().unwrap();
         }
+    }
+
+    #[test]
+    fn cleaner_lsn_exhaustion_after_durable_commit_closes_handle() {
+        use crate::store::wal_recover::{build_mark_body, build_sec_hdr};
+        use crate::store::wal_segments::build_header;
+
+        let dir = scratch("commit_clean_lsn");
+        let base = dir.join("s.db");
+        let first = i64::MAX - 3;
+        // A valid mark permits the retained log to start near LSN exhaustion.
+        let low = build_header(1, 1);
+        std::fs::write(dir.join(seg_name(&base, 1)), low).unwrap();
+        let high = build_header(2, first);
+        let body = build_mark_body(1, first);
+        let hdr = build_sec_hdr(&high, SEG_HDR, TAG_MARK, first, &body);
+        let mut bytes = high.to_vec();
+        bytes.extend_from_slice(&hdr);
+        bytes.extend_from_slice(&body);
+        std::fs::write(dir.join(seg_name(&base, 2)), bytes).unwrap();
+
+        let s = StoreWAL::open_segment_bytes(&base, MIN_SEGMENT_BYTES).unwrap();
+        assert_eq!(s.st.read().next_lsn, i64::MAX - 2);
+        s.set_min_log_bytes(1).unwrap();
+        s.set_space_amplification(1).unwrap();
+        let recid = s.put(&vec![0u8; 2 << 20], &RawBytes).unwrap();
+        s.commit().unwrap();
+        s.update(recid, Some(&vec![1u8; 2 << 20]), &RawBytes)
+            .unwrap();
+        let result = s.commit();
+        assert!(matches!(result, Err(DbError::StoreFull)), "{result:?}");
+        assert!(s.is_closed(), "a post-commit cleaner error is terminal");
+        assert!(matches!(s.commit(), Err(DbError::StoreClosed)));
+        assert!(matches!(
+            s.update(recid, Some(&vec![2u8; 2 << 20]), &RawBytes),
+            Err(DbError::StoreClosed)
+        ));
+        s.close().unwrap();
+        let reopened = StoreWAL::open(&base).unwrap();
+        assert_eq!(
+            reopened.get(recid, &RawBytes).unwrap(),
+            Some(vec![1u8; 2 << 20])
+        );
+        // This refusal occurs before a write. The handle remains usable and
+        // rollback drops the staged update; an empty commit needs no LSN.
+        reopened
+            .update(recid, Some(&vec![3u8; 2 << 20]), &RawBytes)
+            .unwrap();
+        assert!(matches!(reopened.commit(), Err(DbError::StoreFull)));
+        assert!(!reopened.is_closed());
+        reopened.rollback().unwrap();
+        reopened.commit().unwrap();
+        assert_eq!(
+            reopened.get(recid, &RawBytes).unwrap(),
+            Some(vec![1u8; 2 << 20])
+        );
     }
 
     #[test]

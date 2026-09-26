@@ -72,6 +72,12 @@ record bytes. Writes can grow the index beyond the default; a later reopen
 then needs the explicit override. See [PORTING-GAPS.md](PORTING-GAPS.md) for
 the recovery-ordering caveat.
 
+For `StoreWAL`, an error from `commit()` can occur after its section is durable
+if inline log cleaning fails. In that case the handle closes; reopen the store
+to inspect the committed value before deciding what to do next. A refusal while
+reserving the user commit's own LSN, before its section is written, leaves the
+handle open and its transaction staged.
+
 ## Build and test
 
 ```sh
