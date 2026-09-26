@@ -32,9 +32,9 @@ pub enum DbError {
     DataCorruption(Corruption),
     /// A capacity ceiling was reached with nothing damaged: the allocator hit
     /// the 44-bit volume ceiling, the backing store is full, or a WAL segment
-    /// namespace has no sequence number left to create (Java throws a plain
-    /// `DBException` for that last one — the port refuses to call an intact
-    /// store corrupt).
+    /// namespace has no sequence number left to create, or WAL recovery exceeds
+    /// its configured dense-index budget. Java throws a plain `DBException` for
+    /// WAL sequence exhaustion; the recovery budget is specific to this port.
     StoreFull,
     /// Operation attempted on a closed store.
     StoreClosed,

@@ -72,6 +72,7 @@ const T_TRANSIENT: u8 = 0;
 /// Default streaming-replay window (bytes); the ctor override forces refill
 /// edges in tests.
 const DEFAULT_REPLAY_BUF: usize = 1 << 20;
+const DEFAULT_RECOVERY_INDEX_BYTES: u64 = 64 << 20;
 
 /// Default segment size. The writer seals and rolls PAST this, at a section
 /// boundary, so one section may exceed it and an oversize section gets a segment
@@ -142,6 +143,7 @@ pub(crate) struct WalOptions {
     /// Streaming window for replay and for the cleaner's scan; a tiny value
     /// forces refill edges in tests.
     pub(crate) replay_buf: usize,
+    pub(crate) recovery_index_bytes: u64,
     pub(crate) wal_io: Option<Arc<dyn WalIo>>,
 }
 
@@ -152,6 +154,7 @@ impl Default for WalOptions {
             read_only: false,
             segment_bytes: DEFAULT_SEGMENT_BYTES,
             replay_buf: DEFAULT_REPLAY_BUF,
+            recovery_index_bytes: DEFAULT_RECOVERY_INDEX_BYTES,
             wal_io: None,
         }
     }
@@ -277,6 +280,23 @@ impl StoreWAL {
         Self::open_cfg(base, WalOptions::default())
     }
 
+    /// Open with an explicit ceiling for the dense in-memory index built by
+    /// WAL recovery. Increase this for a legitimate snapshot with a high recid
+    /// and few retained records; the default is 64 MiB. A limit reached during
+    /// recovery returns `StoreFull` without allocating the rejected page.
+    /// This limits only the dense index built during recovery, not total heap
+    /// use, live record bytes, or later writes. A store whose recids grow past
+    /// the default must be reopened with a larger limit.
+    pub fn open_with_recovery_index_limit(base: &Path, max_index_bytes: u64) -> Result<StoreWAL> {
+        Self::open_cfg(
+            base,
+            WalOptions {
+                recovery_index_bytes: max_index_bytes,
+                ..Default::default()
+            },
+        )
+    }
+
     pub fn open_ts(base: &Path, thread_safe: bool) -> Result<StoreWAL> {
         Self::open_cfg(
             base,
@@ -313,6 +333,9 @@ impl StoreWAL {
     }
 
     pub(crate) fn open_cfg(base: &Path, opts: WalOptions) -> Result<StoreWAL> {
+        if opts.recovery_index_bytes < super::volume::SLICE_SIZE {
+            return Err(DbError::StoreFull);
+        }
         if opts.segment_bytes < MIN_SEGMENT_BYTES {
             return Err(DbError::wrong_config(format!(
                 "WAL segment size {} is below the {MIN_SEGMENT_BYTES}-byte minimum (a segment \
@@ -344,7 +367,12 @@ impl StoreWAL {
         let Recovered {
             next_lsn,
             identities,
-        } = match recover(&mut segs, &inner, opts.replay_buf) {
+        } = match recover(
+            &mut segs,
+            &inner,
+            opts.replay_buf,
+            opts.recovery_index_bytes,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 segs.close();

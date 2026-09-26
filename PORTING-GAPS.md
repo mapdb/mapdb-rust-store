@@ -121,6 +121,17 @@ you — it is the honest limits list for this port.
   old atomic clone can coexist with a fresh handle after rollback (same stale-recid
   hazard as delete, above).
 
+## WAL recovery resource limit
+
+The Rust port defaults to a 64 MiB dense-index budget during WAL replay. A
+valid sparse snapshot above that limit returns `StoreFull` until opened with
+`StoreWAL::open_with_recovery_index_limit` or
+`DBMaker::wal_recovery_index_limit`. The writer can grow past the default, so
+the next default reopen may require an explicit larger limit. This is an index
+limit, not a bound on total recovery memory. Recovery may prune superseded WAL
+segments before replay reaches the limit refusal, following the existing
+recovery order; a failed open does not promise an untouched namespace.
+
 ## External crash tier (`ci/crash/`, `tools/crash-harness/`)
 
 Ported from the io-uring engine's crash harness. The harness is a separate

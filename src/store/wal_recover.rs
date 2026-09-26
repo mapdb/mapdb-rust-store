@@ -1007,6 +1007,7 @@ fn pass2(
     inner: &StoreDirect,
     ids: &mut Identities,
     replay_buf: usize,
+    recovery_index_bytes: u64,
 ) -> Result<()> {
     let file = handle(seg);
     let mut input = SecIn::new(file, replay_buf);
@@ -1042,6 +1043,7 @@ fn pass2(
                 body_start + body_len as u64,
                 lsn,
                 ids,
+                recovery_index_bytes,
             )?;
         }
         pos = body_start + body_len as u64;
@@ -1077,6 +1079,7 @@ fn apply_section(
     end: u64,
     lsn: i64,
     ids: &mut Identities,
+    recovery_index_bytes: u64,
 ) -> Result<()> {
     input.reset(start, end);
     // At most one entry per recid per section, for 'C' sections as well as 'S'.
@@ -1089,6 +1092,7 @@ fn apply_section(
         match ty {
             T_PREALLOC => {
                 let recid = entry_recid(&mut seen, input.unpack_long()?)?;
+                StoreDirect::check_recovery_index_limit(recid, recovery_index_bytes)?;
                 // wal_prealloc no-ops on ANY set slot, so applying it to a
                 // content-live record would silently leave a record that is
                 // still there while the identities describe a preallocated one.
@@ -1113,6 +1117,7 @@ fn apply_section(
             }
             T_RECORD => {
                 let recid = entry_recid(&mut seen, input.unpack_long()?)?;
+                StoreDirect::check_recovery_index_limit(recid, recovery_index_bytes)?;
                 let cap = input.unpack_long()?;
                 let len_plus = input.unpack_long()?;
                 let mut data: Option<Vec<u8>> = None;
@@ -1261,6 +1266,7 @@ pub(crate) fn recover(
     set: &mut WalSegmentSet,
     inner: &StoreDirect,
     replay_buf: usize,
+    recovery_index_bytes: u64,
 ) -> Result<Recovered> {
     let read_only = set.read_only();
     if set.segments().is_empty() {
@@ -1340,7 +1346,13 @@ pub(crate) fn recover(
         }
         let is_active = i == n - 1;
         set.segments_mut()[i].ensure_open()?;
-        let applied = pass2(&set.segments()[i], inner, &mut ids, replay_buf);
+        let applied = pass2(
+            &set.segments()[i],
+            inner,
+            &mut ids,
+            replay_buf,
+            recovery_index_bytes,
+        );
         if !is_active {
             set.segments_mut()[i].release();
         }
@@ -1624,7 +1636,7 @@ mod tests {
     fn try_recover(base: &Path, read_only: bool, replay_buf: usize) -> Result<Recovery> {
         let mut set = WalSegmentSet::open(base, read_only)?;
         let inner = StoreDirect::new_heap_ts(true)?;
-        let rec = recover(&mut set, &inner, replay_buf)?;
+        let rec = recover(&mut set, &inner, replay_buf, 64 << 20)?;
         Ok(Recovery { set, inner, rec })
     }
 
@@ -1815,6 +1827,47 @@ mod tests {
         // and the entry decoder.
         let r = try_recover(&base, false, 64).expect("opens");
         assert_eq!(content(&r, 10), Some(big));
+    }
+
+    #[test]
+    fn recovery_index_budget_refuses_before_dense_growth_and_can_be_raised() {
+        let dir = scratch("index_budget");
+        let base = base_in(&dir);
+        // The first recid beyond the zero page needs exactly one extra page.
+        let sparse_recid = 65_529;
+        SegImage::new(1, 1)
+            .commit(1, Body::new().record(sparse_recid, Some(b"sparse")))
+            .write(&base);
+        assert!(matches!(
+            super::super::wal::StoreWAL::open_with_recovery_index_limit(&base, 1 << 20),
+            Err(DbError::StoreFull)
+        ));
+        let store = super::super::wal::StoreWAL::open_with_recovery_index_limit(&base, 2 << 20)
+            .expect("explicit budget admits the valid sparse image");
+        assert_eq!(
+            store
+                .get(
+                    std::num::NonZeroU64::new(sparse_recid).unwrap(),
+                    &crate::ser::families::BYTE_ARRAY_NOSIZE,
+                )
+                .unwrap(),
+            Some(b"sparse".to_vec())
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn tiny_crc_valid_wal_cannot_request_unbounded_index_pages() {
+        let dir = scratch("huge_recid");
+        let base = base_in(&dir);
+        SegImage::new(1, 1)
+            .commit(1, Body::new().prealloc(1 << 40))
+            .write(&base);
+        assert!(matches!(
+            super::super::wal::StoreWAL::open(&base),
+            Err(DbError::StoreFull)
+        ));
+        assert_eq!(on_disk(&base), vec![1]);
     }
 
     // ------------------------------------------------------ table S

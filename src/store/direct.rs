@@ -64,7 +64,8 @@ pub(crate) const STATE_LIVE: i32 = 2;
 
 pub struct StoreDirect {
     vol: Volume,
-    /// Offsets of non-zero index pages, in chain order; copy-on-write.
+    /// Offsets of non-zero index pages, strictly increasing in chain order;
+    /// copy-on-write. The ordering makes membership checks logarithmic.
     index_pages: ArcSwap<Vec<u64>>,
     thread_safe: bool,
     structural_lock: Mutex<()>,
@@ -223,6 +224,11 @@ impl StoreDirect {
             if page % PAGE_SIZE != 0 || page >= file_tail {
                 return Err(DbError::corrupt("bad index page pointer"));
             }
+            // Writer allocation always appends at fileTail. Preserve that
+            // invariant on open so extent validation can binary-search pages.
+            if pages.last().is_some_and(|last| page <= *last) {
+                return Err(DbError::corrupt("index page chain is not increasing"));
+            }
             pages.push(page);
             if pages.len() > (1 << 24) {
                 return Err(DbError::corrupt("index page chain loop"));
@@ -320,6 +326,19 @@ impl StoreDirect {
     fn ensure_index_capacity_locked(&self, recid: u64) -> Result<()> {
         while self.recid_to_offset(recid).is_none() {
             self.allocate_new_index_page_locked()?;
+        }
+        Ok(())
+    }
+
+    /// Check the dense index cost of a replayed recid before allocating pages.
+    /// Cleaned WALs may contain only a high recid, so WAL byte count and entry
+    /// count cannot bound this cost. Wide arithmetic also handles u64::MAX.
+    pub(crate) fn check_recovery_index_limit(recid: u64, max_bytes: u64) -> Result<()> {
+        let extra = recid.saturating_sub(RECIDS_PER_ZERO_PAGE) as u128;
+        let pages = 1 + extra.div_ceil(RECIDS_PER_PAGE as u128);
+        let needed = pages * PAGE_SIZE as u128;
+        if needed > max_bytes as u128 {
+            return Err(DbError::StoreFull);
         }
         Ok(())
     }
@@ -673,11 +692,8 @@ impl StoreDirect {
         let mut total: u64 = 0;
         loop {
             let cap_bytes = cap_units * 16;
-            if off < PAGE_SIZE || off & 15 != 0 {
-                return Err(DbError::corrupt("linked chunk offset in header/misaligned"));
-            }
             // header (len i32 + next u64) then the chunk's data must be in-slice.
-            self.vol.check_range(off, cap_bytes)?;
+            self.check_release_extent(off, cap_bytes)?;
             let len = self.vol.get_i32(off);
             if len < 0 || LINKED_CHUNK_HDR as u64 + len as u64 > cap_bytes {
                 return Err(DbError::corrupt("linked chunk length out of range"));
@@ -767,31 +783,63 @@ impl StoreDirect {
         if cap == iv::CAP_NULL || cap == iv::CAP_DELETED {
             return Ok(());
         }
+        if !(1..=iv::CAP_MAX_UNITS).contains(&cap) {
+            return Err(DbError::corrupt("record capacity out of range"));
+        }
         if iv::is_linked(ivval) {
             let chunks = self.linked_chain(ivval)?;
+            // Validate the whole chain before putting any chunk on a free list.
+            // A late corrupt chunk must not leave the earlier ones released.
+            for (off, _, cap_bytes) in &chunks {
+                self.check_release_extent(*off, *cap_bytes as u64)?;
+            }
             let _s = self.structural();
             for (off, _len, cap_bytes) in chunks {
                 self.release_data_locked(cap_bytes as u64, off)?;
             }
         } else {
+            let off = iv::offset(ivval);
+            self.check_release_extent(off, cap as u64 * 16)?;
             let _s = self.structural();
-            self.release_data_locked(cap as u64 * 16, iv::offset(ivval))?;
+            self.release_data_locked(cap as u64 * 16, off)?;
         }
         Ok(())
     }
 
-    /// Read record content of a non-linked live iv, validating `used`. The
-    /// offset comes from a possibly-corrupt index value, so both the 4-byte
-    /// header and the `[off, off+4+used)` extent are range-checked before any
-    /// raw volume access (D4/D5).
+    /// An index-derived extent must fit its size class, one data page, and
+    /// fileTail before it can be returned to the allocator.
+    fn check_release_extent(&self, off: u64, size: u64) -> Result<()> {
+        let end = off
+            .checked_add(size)
+            .ok_or_else(|| DbError::corrupt("record extent arithmetic overflow"))?;
+        if off < PAGE_SIZE
+            || off & 15 != 0
+            || size < 16
+            || size & 15 != 0
+            || size / 16 > MAX_CAP_UNITS
+            || (off % PAGE_SIZE) + size > PAGE_SIZE
+            || end > self.file_tail()?
+        {
+            return Err(DbError::corrupt("record extent out of range"));
+        }
+        if self
+            .index_pages
+            .load()
+            .binary_search(&(off - off % PAGE_SIZE))
+            .is_ok()
+        {
+            return Err(DbError::corrupt("record extent points into index page"));
+        }
+        self.vol.check_range(off, size)
+    }
+
+    /// Read record content of a non-linked live iv, validating its full
+    /// capacity and `used` before any raw volume access (D4/D5).
     fn read_used(&self, ivval: u64) -> Result<(u64, usize)> {
         let off = iv::offset(ivval);
-        if off < PAGE_SIZE || off & 15 != 0 {
-            return Err(DbError::corrupt("record offset in header/misaligned"));
-        }
-        self.vol.check_range(off, 4)?;
-        let used = self.vol.get_i32(off);
         let cap_bytes = iv::cap_units(ivval) as i64 * 16;
+        self.check_release_extent(off, cap_bytes as u64)?;
+        let used = self.vol.get_i32(off);
         if used < 0 || 4 + used as i64 > cap_bytes {
             return Err(DbError::corrupt("used beyond capacity"));
         }
@@ -1754,10 +1802,7 @@ impl StoreDirect {
             // point `off` at header/allocator words and this write would silently
             // clobber them (later stamped clean by close). D4/D5.
             let off = iv::offset(ivval);
-            if off < PAGE_SIZE || off & 15 != 0 {
-                return Err(DbError::corrupt("record offset in header/misaligned"));
-            }
-            self.vol.check_range(off, old_cap as u64 * 16)?;
+            self.check_release_extent(off, old_cap as u64 * 16)?;
             self.vol.put_i32(off, buf.len() as i32);
             self.vol.put_data(off + 4, buf);
             self.index_set(recid, iv::compose(old_cap, off, 0));
@@ -1820,5 +1865,79 @@ impl StoreDelta for StoreDirect {
         headroom: usize,
     ) -> Result<()> {
         self.update_with_headroom_opt(recid, Some(value), ser, headroom)
+    }
+}
+
+#[cfg(test)]
+mod corrupt_index_release_tests {
+    use super::*;
+    use crate::ser::serializers::BYTE_ARRAY;
+
+    fn corrupt_store(offset: u64, cap_units: u32) -> StoreDirect {
+        let store = StoreDirect::new_heap().unwrap();
+        let recid = store.put(&vec![1u8; 8], &BYTE_ARRAY).unwrap();
+        assert_eq!(recid.get(), 1);
+        store.index_set(1, iv::compose(cap_units, offset, 0));
+        store
+    }
+
+    #[test]
+    fn corrupt_plain_extent_is_rejected_before_release() {
+        // Header offset, aligned offset past fileTail, and a page-crossing extent.
+        for (offset, cap) in [(0, 1), (PAGE_SIZE * 2, 1), (PAGE_SIZE * 2 - 16, 2)] {
+            for operation in 0..4 {
+                let store = corrupt_store(offset, cap);
+                let before_slot = store.raw_index_get(1);
+                let before_free = store.free_data_bytes.load(Ordering::Relaxed);
+                let recid = nz(1);
+                let result = match operation {
+                    0 => store.delete(recid),
+                    1 => store.update(recid, None::<&Vec<u8>>, &BYTE_ARRAY),
+                    2 => store.wal_put(1, 0, None),
+                    _ => store.wal_delete(1),
+                };
+                assert!(
+                    matches!(result, Err(DbError::DataCorruption(_))),
+                    "{result:?}"
+                );
+                assert_eq!(store.raw_index_get(1), before_slot);
+                assert_eq!(store.free_data_bytes.load(Ordering::Relaxed), before_free);
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_plain_extent_in_index_page_is_not_freed() {
+        let store = corrupt_store(0, 1);
+        {
+            let _s = store.structural();
+            store
+                .ensure_index_capacity_locked(RECIDS_PER_ZERO_PAGE + 1)
+                .unwrap();
+        }
+        let index_page = store.index_pages.load()[0];
+        store.index_set(1, iv::compose(1, index_page + 16, 0));
+        let before_slot = store.raw_index_get(1);
+        let before_free = store.free_data_bytes.load(Ordering::Relaxed);
+        assert!(matches!(
+            store.delete(nz(1)),
+            Err(DbError::DataCorruption(_))
+        ));
+        assert_eq!(store.raw_index_get(1), before_slot);
+        assert_eq!(store.free_data_bytes.load(Ordering::Relaxed), before_free);
+        assert!(matches!(
+            store.update(
+                nz(1),
+                Some(&vec![7u8]),
+                &crate::ser::families::BYTE_ARRAY_NOSIZE,
+            ),
+            Err(DbError::DataCorruption(_))
+        ));
+        assert_eq!(store.raw_index_get(1), before_slot);
+        assert!(matches!(
+            store.append(nz(1), &[7]),
+            Err(DbError::DataCorruption(_))
+        ));
+        assert_eq!(store.raw_index_get(1), before_slot);
     }
 }

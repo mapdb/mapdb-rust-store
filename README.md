@@ -46,6 +46,32 @@ depending on any behaviour that matters to you. The headline ones:
 - Linux or macOS. The crash-tier scripts under `ci/crash/` are Linux-only and
   the privileged tier needs root, device-mapper and `xfsprogs`.
 
+## WAL recovery index limit
+
+WAL replay builds a dense in-memory recid index. The default limit is 64 MiB;
+opening a log that needs more returns `DbError::StoreFull`. A valid store can
+reach a high recid even when cleaning leaves only a few records. Set a larger
+limit before opening it:
+
+```rust
+use mapdb_rust_store::{db::DBMaker, store::{Store, StoreWAL}};
+use std::path::Path;
+
+let base = Path::new("store.db");
+let wal = StoreWAL::open_with_recovery_index_limit(base, 256 << 20)?;
+wal.close()?;
+// Or, through the DB facade:
+let db = DBMaker::file_db(base)
+    .transaction_enable()
+    .wal_recovery_index_limit(256 << 20)
+    .make()?;
+```
+
+The limit applies only to replay's dense index, not total heap use or live
+record bytes. Writes can grow the index beyond the default; a later reopen
+then needs the explicit override. See [PORTING-GAPS.md](PORTING-GAPS.md) for
+the recovery-ordering caveat.
+
 ## Build and test
 
 ```sh

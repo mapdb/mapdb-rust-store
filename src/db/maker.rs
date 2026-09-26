@@ -30,6 +30,7 @@ pub struct DBMaker {
     read_only: bool,
     delete_after_close: bool,
     delete_after_open: bool,
+    wal_recovery_index_bytes: Option<u64>,
 }
 
 impl DBMaker {
@@ -40,6 +41,7 @@ impl DBMaker {
             read_only: false,
             delete_after_close: false,
             delete_after_open: false,
+            wal_recovery_index_bytes: None,
         }
     }
 
@@ -83,6 +85,13 @@ impl DBMaker {
     /// Enable WAL transactions (file-only). Java `transactionEnable()`.
     pub fn transaction_enable(mut self) -> Self {
         self.transaction_enable = true;
+        self
+    }
+    /// Set the dense in-memory WAL recovery index limit in bytes. The default
+    /// is 64 MiB; a valid store with a high recid may need a larger limit to
+    /// reopen. This option requires a file DB with transactions enabled.
+    pub fn wal_recovery_index_limit(mut self, bytes: u64) -> Self {
+        self.wal_recovery_index_bytes = Some(bytes);
         self
     }
     /// Open read-only (Java `readOnly()`).
@@ -139,6 +148,11 @@ impl DBMaker {
         if self.transaction_enable && !is_file {
             return Err(DbError::wrong_config(
                 "transactionEnable requires a file DB",
+            ));
+        }
+        if self.wal_recovery_index_bytes.is_some() && !self.transaction_enable {
+            return Err(DbError::wrong_config(
+                "walRecoveryIndexLimit requires transactionEnable",
             ));
         }
         if self.delete_after_open && !is_file {
@@ -199,7 +213,10 @@ impl DBMaker {
                     // cleanup instead would delete after the lock was released,
                     // where a second opener can already have acquired the
                     // namespace, and would miss every segment besides.
-                    let wal = StoreWAL::open(path)?;
+                    let wal = match self.wal_recovery_index_bytes {
+                        Some(bytes) => StoreWAL::open_with_recovery_index_limit(path, bytes)?,
+                        None => StoreWAL::open(path)?,
+                    };
                     if self.delete_after_close {
                         wal.set_delete_on_close(true);
                     }
@@ -259,5 +276,42 @@ fn remove_file(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(DbError::Io(e)),
+    }
+}
+
+#[cfg(test)]
+mod recovery_limit_tests {
+    use super::*;
+
+    #[test]
+    fn db_maker_passes_wal_recovery_limit_before_open() {
+        let path = std::env::temp_dir().join(format!(
+            "mapdb_wal_index_limit_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(matches!(
+            DBMaker::file_db(&path)
+                .transaction_enable()
+                .wal_recovery_index_limit(0)
+                .make(),
+            Err(DbError::StoreFull)
+        ));
+        assert!(matches!(
+            DBMaker::file_db(&path)
+                .wal_recovery_index_limit(2 << 20)
+                .make(),
+            Err(DbError::WrongConfiguration(_))
+        ));
+        let db = DBMaker::file_db(&path)
+            .transaction_enable()
+            .wal_recovery_index_limit(2 << 20)
+            .file_delete_after_close()
+            .make()
+            .unwrap();
+        db.close().unwrap();
     }
 }
