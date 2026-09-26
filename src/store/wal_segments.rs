@@ -211,8 +211,8 @@ impl Segment {
 enum HeaderVerdict {
     /// Valid v3 header (H8 included: a header-only segment is legitimate).
     Ok,
-    /// H1-H4: the *torn-create* shapes. Residue when this is the highest name,
-    /// corruption anywhere below it.
+    /// H1-H4: the *torn-create* shapes. Residue only when this is the highest
+    /// name and the file is no longer than the header.
     Torn(String),
     /// H5-H7/H9: a CRC-valid header carrying wrong content — a writer defect or
     /// a copied file, never a torn create. Corruption wherever it appears.
@@ -573,10 +573,10 @@ impl WalSegmentSet {
     /// directory entry can never alias a segment a later create reuses.
     ///
     /// The asymmetry in table H is the whole point: a torn create produces an
-    /// invalid `headerCrc` with overwhelming probability, so an invalid header
-    /// on the **highest** name is an ordinary crash artifact, while the same
-    /// bytes anywhere else are corruption — something above it exists, so its
-    /// creation completed once.
+    /// invalid `headerCrc` with overwhelming probability. Only a highest-name
+    /// file no longer than the header can be a torn create: the writer forces
+    /// the header before appending sections. A longer invalid-header file may
+    /// hold committed data and must be preserved as corruption.
     fn classify(&mut self, found: &[i64]) -> Result<()> {
         let max_observed = found.iter().copied().max().unwrap_or(0);
         // A namespace that has run out of sequence numbers is exhausted, not
@@ -622,14 +622,19 @@ impl WalSegmentSet {
                     )))
                 }
                 HeaderVerdict::Torn(fault) => {
-                    if Some(seq) == highest {
-                        // H1-H4 on the highest name: the create crashed. A
-                        // read-only open excludes it from the set but keeps the
-                        // file — the next writable open removes it.
+                    if Some(seq) == highest && len <= SEG_HDR {
+                        // H1-H4 on a header-sized highest name: the create
+                        // crashed. A read-only open excludes it but keeps the
+                        // file; the next writable open removes it.
                         residue.push(seq);
                     } else {
+                        let why = if Some(seq) != highest {
+                            "not the highest segment, so its create completed"
+                        } else {
+                            "longer than the segment header, so it may contain committed sections"
+                        };
                         return Err(DbError::corrupt_msg(format!(
-                            "WAL segment {}: {fault} (not the highest segment, so its create completed)",
+                            "WAL segment {}: {fault} ({why})",
                             file_name(&path)
                         )));
                     }
@@ -1416,7 +1421,7 @@ mod tests {
 
     // ---------------------------------------------------------------- H: header table
 
-    /// H1-H4 on the highest name are create-crash residue: a writable open
+    /// H1-H4 on a header-sized highest name are create-crash residue: a writable open
     /// unlinks them, and W6 has already burnt the sequence number so the fresh
     /// segment cannot reuse it.
     #[test]
@@ -1432,6 +1437,56 @@ mod tests {
             assert!(!seg_path(&base, 2).exists(), "{tag}: residue is unlinked");
             assert_eq!(3, set.next_seq(), "{tag}: W6 burnt the residue's number");
         }
+    }
+
+    #[test]
+    fn damaged_nonempty_highest_header_refuses_and_preserves_bytes() {
+        for read_only in [false, true] {
+            let dir = scratch(if read_only {
+                "h3-nonempty-ro"
+            } else {
+                "h3-nonempty-rw"
+            });
+            let base = base_in(&dir);
+            write_segment(&base, 1, &header_image(1, 1));
+            let mut damaged = header_image(2, 1);
+            damaged.extend_from_slice(&[0x53; 40]);
+            damaged[30] ^= 1;
+            write_segment(&base, 2, &damaged);
+            assert!(is_corrupt(WalSegmentSet::open(&base, read_only)));
+            assert_eq!(std::fs::read(seg_path(&base, 2)).unwrap(), damaged);
+            assert_eq!(
+                std::fs::read(seg_path(&base, 1)).unwrap(),
+                header_image(1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn crc_valid_wrong_magic_on_nonempty_highest_refuses() {
+        let dir = scratch("h4-nonempty");
+        let base = base_in(&dir);
+        let mut damaged = header_image(1, 1);
+        damaged.extend_from_slice(&[0x53; 25]);
+        damaged[0] ^= 1;
+        reseal(&mut damaged[..SEG_HDR as usize]);
+        write_segment(&base, 1, &damaged);
+        let msg = corrupt_msg(WalSegmentSet::open(&base, false));
+        assert!(msg.contains("not a mapdb WAL segment"), "{msg}");
+        assert_eq!(std::fs::read(seg_path(&base, 1)).unwrap(), damaged);
+    }
+
+    #[test]
+    fn damaged_header_only_highest_is_still_residue() {
+        let dir = scratch("h3-header-only");
+        let base = base_in(&dir);
+        write_segment(&base, 1, &header_image(1, 1));
+        let mut damaged = header_image(2, 1);
+        damaged[30] ^= 1;
+        write_segment(&base, 2, &damaged);
+        let set = WalSegmentSet::open(&base, false).expect("header-only residue");
+        assert_eq!(seq_list(&set), vec![1]);
+        assert!(!seg_path(&base, 2).exists());
     }
 
     /// R2's residue removal is a REPORTED operation, like W5's — Java emits

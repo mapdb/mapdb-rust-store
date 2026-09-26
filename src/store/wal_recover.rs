@@ -572,10 +572,10 @@ fn scan_segment(
         let body_start = pos + SEC_HDR as u64;
 
         if hdr_crc(seg, pos, &hdr) != stored_hdr_crc || !valid_tag(tag) {
-            // S3. The declared bodyLen is UNTRUSTED — it lives in the bytes that
-            // just failed their own checksum — so proving corruption needs a
-            // section at exactly the declared end carrying exactly the LSN the
-            // damaged one would have been followed by.
+            // S3. Every byte of the failed header, including bodyLen, is
+            // untrusted. Search independently from the next byte for a section
+            // carrying the exact successor LSN. A bounded scan that runs out
+            // of body-check budget also refuses recovery.
             if !is_active {
                 hold(
                     seg,
@@ -583,22 +583,12 @@ fn scan_segment(
                 );
                 return Ok(seg_through);
             }
-            if body_len >= 0
-                && body_len as u64 <= len - body_start
-                && any_valid_section_from(
-                    seg,
-                    body_start + body_len as u64,
-                    len,
-                    look_last,
-                    true,
-                    replay_buf,
-                )?
-            {
+            if later_section_or_scan_limit(seg, pos + 1, len, look_last, replay_buf)? {
                 hold(
                     seg,
                     format!(
-                        "mid-log corruption: section header damaged at offset {pos} but valid \
-                         sections follow (not a torn tail)"
+                        "mid-log corruption: section header damaged at offset {pos} \
+                         (later section or scan limit)"
                     ),
                 );
             }
@@ -639,7 +629,7 @@ fn scan_segment(
                     );
                     return Ok(seg_through);
                 }
-                if any_valid_section_from(seg, body_end, len, look_last, false, replay_buf)? {
+                if any_valid_section_from(seg, body_end, len, look_last, replay_buf)? {
                     hold(
                         seg,
                         format!(
@@ -785,10 +775,8 @@ fn read_mark(
 /// deliberately NOT checked here — a port that calls its complete section
 /// validator classifies torn tails differently from the reference.
 ///
-/// With `exact_next` (untrusted anchor: the damaged section's own bodyLen) the
-/// candidate must carry EXACTLY `last_lsn + 2`, the damaged section having been
-/// `last_lsn + 1`; otherwise (trusted anchor) any strictly future LSN counts.
-/// Both reject "embedded fake" patterns from user data holding copies of earlier
+/// This is the trusted-boundary S4 walk: any strictly future LSN counts.
+/// It rejects "embedded fake" patterns from user data holding copies of earlier
 /// sections: stale copies carry old LSNs, and under the CRC domain a copied
 /// section fails its checksums at any other offset anyway.
 ///
@@ -798,7 +786,6 @@ fn any_valid_section_from(
     from: u64,
     limit: u64,
     last_lsn: i64,
-    exact_next: bool,
     replay_buf: usize,
 ) -> Result<bool> {
     let mut pos = from;
@@ -820,11 +807,7 @@ fn any_valid_section_from(
         // Wrapping, like the reference: `last_lsn` is a number read off a disk
         // that may hold anything, and a candidate LSN that matches the wrapped
         // value is a legitimate (if unreachable) answer, where a panic is not.
-        let lsn_ok = if exact_next {
-            lsn == last_lsn.wrapping_add(2)
-        } else {
-            lsn > last_lsn.wrapping_add(1)
-        };
+        let lsn_ok = lsn > last_lsn.wrapping_add(1);
         if lsn_ok {
             match body_crc(seg, pos, body_start, body_end, replay_buf)? {
                 Some(c) if c == stored_body_crc => return Ok(true),
@@ -833,6 +816,66 @@ fn any_valid_section_from(
             }
         }
         pos = body_end;
+    }
+    Ok(false)
+}
+
+/// S3's untrusted-header successor search. Windows overlap by SEC_HDR-1 bytes,
+/// so a candidate header crossing a window edge is still tested at its actual
+/// offset. Header-valid candidates with a bad body CRC can overlap heavily;
+/// aggregate body reads are limited to the searched remainder. Exhausting that
+/// budget is a conservative corruption verdict, never a reason to truncate.
+fn later_section_or_scan_limit(
+    seg: &Segment,
+    from: u64,
+    limit: u64,
+    last_lsn: i64,
+    replay_buf: usize,
+) -> Result<bool> {
+    const WINDOW: usize = 64 * 1024;
+    let mut window = [0u8; WINDOW];
+    let mut budget = limit - from;
+    let mut pos = from;
+    while limit - pos >= SEC_HDR as u64 {
+        let count = (limit - pos).min(WINDOW as u64) as usize;
+        if read_at_opt(handle(seg), &mut window[..count], pos)?.is_none() {
+            return Ok(false);
+        }
+        let candidates = count - SEC_HDR + 1;
+        for i in 0..candidates {
+            let hdr: &[u8; SEC_HDR] = window[i..i + SEC_HDR].try_into().expect("header width");
+            let (tag, lsn, body_len, stored_hdr_crc, stored_body_crc) = parse_sec_hdr(hdr);
+            if !valid_tag(tag) || lsn != last_lsn.wrapping_add(2) {
+                continue;
+            }
+            let section_pos = pos + i as u64;
+            let body_start = section_pos + SEC_HDR as u64;
+            if body_len < 0 || body_len as u64 > limit - body_start {
+                continue;
+            }
+            if hdr_crc(seg, section_pos, hdr) != stored_hdr_crc {
+                continue;
+            }
+            let body_len = body_len as u64;
+            if body_len > budget {
+                return Ok(true);
+            }
+            budget -= body_len;
+            if let Some(c) = body_crc(
+                seg,
+                section_pos,
+                body_start,
+                body_start + body_len,
+                replay_buf,
+            )? {
+                if c == stored_body_crc {
+                    return Ok(true);
+                }
+            } else {
+                return Ok(false);
+            }
+        }
+        pos += candidates as u64;
     }
     Ok(false)
 }
@@ -1853,6 +1896,71 @@ mod tests {
         let msg = corrupt_msg(open_rw(&base));
         assert!(msg.contains("mid-log corruption"), "{msg}");
         assert!(msg.contains("header damaged"), "{msg}");
+    }
+
+    #[test]
+    fn damaged_body_length_cannot_hide_later_commits() {
+        for read_only in [false, true] {
+            let dir = scratch(if read_only { "s3-len-ro" } else { "s3-len-rw" });
+            let base = base_in(&dir);
+            let mut image = SegImage::new(1, 1)
+                .commit(1, Body::new().record(10, Some(b"a")))
+                .commit(2, Body::new().record(11, Some(b"b")))
+                .commit(3, Body::new().record(12, Some(b"c")));
+            image.bytes[SEG_HDR as usize + 16] ^= 1;
+            let before = image.bytes.clone();
+            image.write(&base);
+            let msg = corrupt_msg(try_recover(&base, read_only, 1 << 20));
+            assert!(msg.contains("mid-log corruption"), "{msg}");
+            assert_eq!(std::fs::read(seg_path(&base, 1)).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn damaged_length_finds_successor_across_scan_window() {
+        let dir = scratch("s3-window");
+        let base = base_in(&dir);
+        let mut extra = 65_400usize;
+        let mut image = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(&vec![7; extra])))
+            .commit(2, Body::new().record(11, Some(b"b")));
+        let target = SEG_HDR + 1 + 64 * 1024 - 12;
+        extra += (target - image.off(1)) as usize;
+        image = SegImage::new(1, 1)
+            .commit(1, Body::new().record(10, Some(&vec![7; extra])))
+            .commit(2, Body::new().record(11, Some(b"b")));
+        assert_eq!(image.off(1), target);
+        image.bytes[SEG_HDR as usize + 16] ^= 1;
+        let before = image.bytes.clone();
+        image.write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("mid-log corruption"), "{msg}");
+        assert_eq!(std::fs::read(seg_path(&base, 1)).unwrap(), before);
+    }
+
+    #[test]
+    fn forged_overlapping_candidates_exhaust_body_budget_without_truncating() {
+        let dir = scratch("s3-budget");
+        let base = base_in(&dir);
+        let mut image =
+            SegImage::new(1, 1).commit(1, Body::new().record(10, Some(&vec![7; 130_000])));
+        for at in [128u64, 256] {
+            let candidate = seal_sec_hdr(
+                &image.bytes[..SEG_HDR as usize].try_into().unwrap(),
+                at,
+                TAG_SECTION,
+                2,
+                100_000,
+                0,
+            );
+            image.bytes[at as usize..at as usize + SEC_HDR].copy_from_slice(&candidate);
+        }
+        image.bytes[SEG_HDR as usize + 16] ^= 1;
+        let before = image.bytes.clone();
+        image.write(&base);
+        let msg = corrupt_msg(open_rw(&base));
+        assert!(msg.contains("scan limit"), "{msg}");
+        assert_eq!(std::fs::read(seg_path(&base, 1)).unwrap(), before);
     }
 
     #[test]

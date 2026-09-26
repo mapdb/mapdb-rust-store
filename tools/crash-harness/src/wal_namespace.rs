@@ -38,8 +38,8 @@
 //! - **unlinkThrough** (phase 3 of a cleaning cycle, and recovery's R5 replay
 //!   of one) removes a low run: every removed name is below every survivor;
 //! - **residue deletion** (R2) removes the HIGHEST name, and only when its
-//!   header is unreadable — a create that crashed between `CREATE_NEW` and the
-//!   forced header.
+//!   header is unreadable and the file is no longer than 36 bytes — a create
+//!   that crashed between `CREATE_NEW` and the forced header.
 //!
 //! Everything an implementation could get wrong here — reusing a burnt name,
 //! unlinking a segment the mark did not authorize, leaving a residue file for
@@ -547,18 +547,18 @@ impl Namespace {
         // section, so a segment with bytes past its header need not hold a
         // valid one, and its successor may legitimately state the same LSN.
         self.check_common("crash image", false)?;
-        // R2: an unreadable header is create-crash residue, which can only ever
-        // be the highest name — a create writes the header before anything
-        // below it can be superseded, and no other operation truncates a
-        // segment to nothing.
+        // R2: an unreadable header can be create-crash residue only at the
+        // highest name and only through the 36-byte header. The writer forces
+        // that header before any section, so a longer file may hold commits.
         for b in self.bad() {
-            if b.seq != self.hi() {
+            if b.seq != self.hi() || b.len > SEG_HDR_LEN as u64 {
                 return Err(format!(
-                    "crash image: segment {:016x} has an unreadable header ({}) but is not the \
-                     highest name ({:016x}) — only a crashed create may leave residue",
+                    "crash image: segment {:016x} has an unreadable header ({}) at length {}; \
+                     only a highest-name file no longer than the {}-byte header can be create residue",
                     b.seq,
                     b.bad.unwrap_or("?"),
-                    self.hi()
+                    b.len,
+                    SEG_HDR_LEN
                 ));
             }
         }
@@ -931,7 +931,20 @@ mod tests {
         let err = ns
             .check_image()
             .expect_err("residue below the highest name");
-        assert!(err.contains("not the highest name"), "{err}");
+        assert!(err.contains("only a highest-name file"), "{err}");
+
+        // A highest-name file with body bytes cannot be discarded as residue.
+        std::fs::remove_file(&top).unwrap();
+        std::fs::remove_file(base.with_file_name(format!(
+            "{}.wal.{:016x}",
+            base.file_name().unwrap().to_str().unwrap(),
+            3
+        )))
+        .unwrap();
+        std::fs::write(&top, [0u8; SEG_HDR_LEN + 1]).unwrap();
+        let ns = scan(&base).expect("scan");
+        let err = ns.check_image().expect_err("nonempty damaged header");
+        assert!(err.contains("length 37"), "{err}");
     }
 
     #[test]
