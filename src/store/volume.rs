@@ -27,12 +27,22 @@ pub const SLICE_SHIFT: u32 = 20;
 pub const SLICE_SIZE: u64 = 1 << SLICE_SHIFT; // 1 MiB
 pub const SLICE_MASK: u64 = SLICE_SIZE - 1;
 
-/// Owns the backing allocation so `Slice::ptr` stays valid; the bytes are
-/// reached through the pointer, so the fields are intentionally "unread".
-#[allow(dead_code)]
+/// Owns the backing allocation so `Slice::ptr` stays valid. Heap ownership is
+/// transferred to a raw pointer to avoid unique Box retags when its owner moves.
 enum SliceBacking {
-    Heap(Box<[u8]>),
+    Heap(*mut [u8]),
     Mmap(MmapMut),
+}
+
+impl Drop for SliceBacking {
+    fn drop(&mut self) {
+        if let Self::Heap(allocation) = self {
+            // SAFETY: heap() transfers one Box allocation here with into_raw. This
+            // owner is never cloned; Slice/Arc lifetime keeps all accesses alive,
+            // and drop reconstructs the Box exactly once after those accesses end.
+            unsafe { drop(Box::from_raw(*allocation)) };
+        }
+    }
 }
 
 /// One 1 MiB slice. `ptr` addresses the start of the backing region (stable:
@@ -49,11 +59,11 @@ unsafe impl Sync for Slice {}
 
 impl Slice {
     fn heap() -> Slice {
-        let mut b = vec![0u8; SLICE_SIZE as usize].into_boxed_slice();
-        let ptr = b.as_mut_ptr();
+        let allocation = Box::into_raw(vec![0u8; SLICE_SIZE as usize].into_boxed_slice());
+        let ptr = allocation.cast::<u8>();
         Slice {
             ptr,
-            backing: SliceBacking::Heap(b),
+            backing: SliceBacking::Heap(allocation),
         }
     }
 
@@ -367,5 +377,23 @@ impl Volume {
             f.sync_all()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn heap_slice_pointer_survives_owner_moves_and_drop() {
+        let slice = Arc::new(Slice::heap());
+        slice.write_bytes(17, &[1, 2, 3]);
+        assert_eq!(slice.as_slice(17, 3), &[1, 2, 3]);
+        let moved = vec![slice];
+        moved[0].write_u8(18, 4);
+        let mut bytes = [0; 3];
+        moved[0].read_bytes(17, &mut bytes);
+        assert_eq!(bytes, [1, 4, 3]);
+        drop(moved);
     }
 }
