@@ -142,10 +142,11 @@ mapdb5's durability model:
   backend and a WAL backend, because both were power-cut recoverable. mapdb5's
   `StoreDirect` is non-transactional: `commit()` fsyncs data then stamps a header
   checksum over the allocator words, and `open_file` *rejects* a store whose
-  recomputed checksum disagrees ("store was not closed cleanly"). Any uncommitted
-  in-place mutation bumps those words, so after a crash at a random cut point a
-  reopen refuses rather than recovering to the last committed state — it can never
-  satisfy a recover-to-acked-state oracle. Only `StoreWAL` (log replay, torn-tail
+  recomputed checksum disagrees ("store was not closed cleanly"). In-place updates
+  need not change those allocator words: an unclean reopen can accept uncommitted
+  or partially persisted record contents. Direct offers neither general crash
+  detection nor recovery to the last committed state, so it cannot guarantee a
+  recover-to-acked-state oracle. Only `StoreWAL` (log replay, torn-tail
   tolerant, `.ckpt` crash-during-checkpoint recovery) is exercised. A separate
   graceful-restart consistency test could cover Direct; it is not a crash test.
 - **No transaction id → committed progress marker.** The source read

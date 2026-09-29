@@ -108,9 +108,10 @@ oracle is a write-ahead intent journal on a *different* filesystem: intents are
 the backend's durability barrier returns, so a recovered state that lost an
 acknowledged write fails the round.
 
-**Only `StoreWAL` is crash-recoverable.** `StoreDirect` is non-transactional: an
-uncommitted in-place mutation makes a reopen fail the header checksum by design,
-so at a random cut point it cannot recover to the last acknowledged state. The
+**Only `StoreWAL` is crash-recoverable.** `StoreDirect` is non-transactional: its
+header checksum covers allocator metadata, so an in-place update can leave the
+checksum valid and an unclean reopen can accept uncommitted or partially persisted
+record contents. It cannot guarantee recovery to the last acknowledged state. The
 crash tier therefore exercises WAL only, and that is not an oversight.
 
 The tooling lives in `tools/crash-harness/`, a separate workspace member that is
