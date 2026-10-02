@@ -80,9 +80,9 @@ pub fn search_from_java(v: i64) -> SearchResult {
 ///
 /// Re-entry: stores may call these methods while holding their own locks
 /// (`get` and `compare_and_swap` do). A callback may query the same store's
-/// lock-free metrics — `get_current_size`, `is_closed`, `is_tx`,
-/// `is_read_only`, `is_thread_safe`, `structural_generation` — but must not
-/// call any other method of that store, which can deadlock.
+/// re-entry-safe metrics — `get_current_size` (approximate), `is_closed`,
+/// `is_tx`, `is_read_only`, `is_thread_safe`, `structural_generation` — but
+/// must not call any other method of that store, which can deadlock.
 pub trait Serializer<A> {
     /// Serialize `value` to `out`.
     fn serialize(&self, out: &mut DataOutput2, value: &A);

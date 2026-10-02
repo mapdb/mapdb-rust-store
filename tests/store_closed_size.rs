@@ -4,11 +4,14 @@
 //! `Serializer` re-entry contract: a callback may query its store's metrics
 //! (plan T3b) without deadlocking, under `get` and `compare_and_swap`.
 
+use mapdb_rust_store::db::ConfiguredStore;
 use mapdb_rust_store::error::Result;
 use mapdb_rust_store::io::{DataInput2, DataOutput2};
 use mapdb_rust_store::ser::serializers::LongSer;
 use mapdb_rust_store::ser::Serializer;
-use mapdb_rust_store::store::{Store, StoreDirect, StoreWAL};
+use mapdb_rust_store::store::{
+    Store, StoreByteArray, StoreDirect, StoreOnHeap, StoreReadOnlyWrapper, StoreWAL,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -286,4 +289,54 @@ fn direct_heap_callback_metrics_under_cas() {
 #[test]
 fn direct_file_callback_metrics_under_cas() {
     callback_metrics_under_cas(StoreDirect::open_file(&tmp("direct_cas")).unwrap());
+}
+
+#[test]
+fn bytearray_callback_metrics_under_cas() {
+    callback_metrics_under_cas(StoreByteArray::new(true));
+}
+
+#[test]
+fn heap_callback_metrics_under_cas() {
+    callback_metrics_under_cas(StoreOnHeap::new(true));
+}
+
+#[test]
+fn configured_wal_callback_metrics_under_cas() {
+    callback_metrics_under_cas(ConfiguredStore::Wal(
+        StoreWAL::open(&tmp("cfg_wal_cas")).unwrap(),
+    ));
+}
+
+#[test]
+fn configured_bytearray_callback_metrics_under_cas() {
+    callback_metrics_under_cas(ConfiguredStore::ByteArray(StoreByteArray::new(true)));
+}
+
+/// The read-only wrapper has no CAS; its `get` runs the delegate's serializer
+/// call, and the callback queries the wrapper's metrics.
+#[test]
+fn readonly_callback_metrics_under_get() {
+    let direct = StoreDirect::new_heap().unwrap();
+    let recid = direct.put(&5i64, &LongSer).unwrap();
+    let store = Arc::new(StoreReadOnlyWrapper::new(direct));
+    let (done_tx, done_rx) = mpsc::channel();
+    {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let probe = MetricsProbe {
+                store: store.clone(),
+                calls: AtomicU64::new(0),
+            };
+            let v = store.get(recid, &probe).unwrap();
+            done_tx
+                .send((v, probe.calls.load(Ordering::Relaxed)))
+                .unwrap();
+        });
+    }
+    let (v, calls) = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("metric query inside a read-only get callback deadlocked");
+    assert_eq!(v, Some(5));
+    assert!(calls > 0, "the probe ran");
 }
