@@ -162,7 +162,9 @@ impl Default for WalOptions {
 
 /// The lock-guarded mutable state (Java's single ReadWriteLock covers all of it).
 struct WalState {
-    inner: StoreDirect,
+    /// Shared with [`StoreWAL::inner_stats`]; all mutation still happens under
+    /// the state lock.
+    inner: Arc<StoreDirect>,
     segs: WalSegmentSet,
     staged: HashMap<u64, Staged>,
     /// Next section LSN — exactly consecutive within a segment.
@@ -260,6 +262,12 @@ pub struct StoreWAL {
     /// one variant of the DB layer's store enum, where an inline copy would size
     /// every other variant with it.
     st: RwLock<Box<WalState>>,
+    /// The inner store, for size/stat reads that must not take `st`:
+    /// serializer callbacks run under `st` (read in `get`, write in CAS) and
+    /// may query the size, and a nested `st.read()` deadlocks (behind a queued
+    /// writer, or outright under CAS's write guard). The inner store
+    /// synchronizes its own size read and reports 0 once closed.
+    inner_stats: Arc<StoreDirect>,
     /// The store's BASE path — `<base>.wal.<hex>` are its segments. Absolutized
     /// by the namespace layer; this is the caller's spelling.
     base: PathBuf,
@@ -360,7 +368,7 @@ impl StoreWAL {
                     .to_string(),
             ));
         }
-        let inner = StoreDirect::new_heap_ts(opts.thread_safe)?;
+        let inner = Arc::new(StoreDirect::new_heap_ts(opts.thread_safe)?);
         let mut segs = WalSegmentSet::open_with_io(base, opts.read_only, opts.wal_io.clone())?;
         // A failed recovery drops `segs`, which releases the store lock — Java's
         // `finally { closeQuietly() }`.
@@ -381,6 +389,7 @@ impl StoreWAL {
             }
         };
         Ok(StoreWAL {
+            inner_stats: Arc::clone(&inner),
             st: RwLock::new(Box::new(WalState {
                 inner,
                 segs,
@@ -2162,8 +2171,12 @@ impl Store for StoreWAL {
     }
 
     fn get_current_size(&self) -> u64 {
-        let st = self.st.read();
-        st.inner.get_current_size()
+        // Not `st`: see `inner_stats`. close() publishes `closed` before it
+        // closes the inner store, so check it here for an immediate 0.
+        if self.closed.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.inner_stats.get_current_size()
     }
 
     fn is_tx(&self) -> bool {

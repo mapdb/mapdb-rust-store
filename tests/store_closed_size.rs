@@ -1,6 +1,8 @@
 //! `get_current_size()` after `close()` reports 0 (owner ruling 2026-10-02,
 //! plan T3) on StoreDirect (heap and file) and StoreWAL: after a single close,
-//! after repeated closes, and while another thread closes the store.
+//! after repeated closes, and while another thread closes the store. Also the
+//! `Serializer` re-entry contract: a callback may query its store's metrics
+//! (plan T3b) without deadlocking, under `get` and `compare_and_swap`.
 
 use mapdb_rust_store::error::Result;
 use mapdb_rust_store::io::{DataInput2, DataOutput2};
@@ -101,6 +103,18 @@ fn wal_concurrent_close() {
     stress(|| StoreWAL::open(&tmp("wal_c")).unwrap());
 }
 
+/// Every metric the `Serializer` contract lets a callback query on its store.
+fn query_metrics(s: &impl Store) {
+    let _ = (
+        s.get_current_size(),
+        s.is_closed(),
+        s.is_tx(),
+        s.is_read_only(),
+        s.is_thread_safe(),
+        s.structural_generation(),
+    );
+}
+
 /// Serializer whose `deserialize` reports when it is running, waits for the
 /// go signal, then queries the store's size from inside the callback.
 struct SizeProbe<S> {
@@ -117,6 +131,7 @@ impl<S: Store> Serializer<i64> for SizeProbe<S> {
     fn deserialize(&self, input: &mut dyn DataInput2, size: Option<usize>) -> Result<i64> {
         self.inside.lock().unwrap().send(()).unwrap();
         self.go.lock().unwrap().recv().unwrap();
+        query_metrics(&*self.store);
         self.seen
             .store(self.store.get_current_size(), Ordering::Release);
         LongSer.deserialize(input, size)
@@ -183,4 +198,92 @@ fn direct_heap_callback_size_query_with_waiting_close() {
 #[test]
 fn direct_file_callback_size_query_with_waiting_close() {
     callback_size_query_with_waiting_close(StoreDirect::open_file(&tmp("direct_cb")).unwrap());
+}
+
+#[test]
+fn wal_callback_size_query_with_waiting_close() {
+    callback_size_query_with_waiting_close(StoreWAL::open(&tmp("wal_cb")).unwrap());
+}
+
+/// Serializer whose every callback queries the store's metrics.
+struct MetricsProbe<S> {
+    store: Arc<S>,
+    calls: AtomicU64,
+}
+
+impl<S: Store> Serializer<i64> for MetricsProbe<S> {
+    fn serialize(&self, out: &mut DataOutput2, value: &i64) {
+        query_metrics(&*self.store);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        LongSer.serialize(out, value)
+    }
+    fn deserialize(&self, input: &mut dyn DataInput2, size: Option<usize>) -> Result<i64> {
+        query_metrics(&*self.store);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        LongSer.deserialize(input, size)
+    }
+    fn compare(&self, a: &i64, b: &i64) -> std::cmp::Ordering {
+        a.cmp(b)
+    }
+    fn equals(&self, a: &i64, b: &i64) -> bool {
+        query_metrics(&*self.store);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        a == b
+    }
+}
+
+/// compare_and_swap runs the serializer under the store's exclusive lock
+/// (StoreWAL's state write guard); a metric query from that callback must not
+/// try to take the same lock. Covers staged and committed records.
+fn callback_metrics_under_cas<S: Store + Send + Sync + 'static>(store: S) {
+    let store = Arc::new(store);
+    let staged = store.put(&1i64, &LongSer).unwrap();
+    let committed = store.put(&2i64, &LongSer).unwrap();
+    store.commit().unwrap();
+    let staged2 = store.put(&3i64, &LongSer).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let probe = MetricsProbe {
+                store: store.clone(),
+                calls: AtomicU64::new(0),
+            };
+            let r = (
+                store
+                    .compare_and_swap(committed, Some(&2), Some(&20), &probe)
+                    .unwrap(),
+                store
+                    .compare_and_swap(staged2, Some(&3), Some(&30), &probe)
+                    .unwrap(),
+                store
+                    .compare_and_swap(staged, Some(&9), Some(&10), &probe)
+                    .unwrap(),
+                store.get(committed, &probe).unwrap(),
+            );
+            done_tx
+                .send((r, probe.calls.load(Ordering::Relaxed)))
+                .unwrap();
+        });
+    }
+    let (r, calls) = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("metric query inside a compare_and_swap callback deadlocked");
+    assert_eq!(r, (true, true, false, Some(20)));
+    assert!(calls > 0, "the probe ran");
+}
+
+#[test]
+fn wal_callback_metrics_under_cas() {
+    callback_metrics_under_cas(StoreWAL::open(&tmp("wal_cas")).unwrap());
+}
+
+#[test]
+fn direct_heap_callback_metrics_under_cas() {
+    callback_metrics_under_cas(StoreDirect::new_heap().unwrap());
+}
+
+#[test]
+fn direct_file_callback_metrics_under_cas() {
+    callback_metrics_under_cas(StoreDirect::open_file(&tmp("direct_cas")).unwrap());
 }
