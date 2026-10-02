@@ -185,7 +185,7 @@ pub trait Store {
     }
 
     /// Approximate byte footprint (for byte-budget cache eviction). Must
-    /// decrease on delete. `0` = unsupported.
+    /// decrease on delete. `0` = unsupported, and `0` after `close()`.
     fn get_current_size(&self) -> u64 {
         0
     }

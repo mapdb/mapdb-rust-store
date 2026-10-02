@@ -1748,6 +1748,12 @@ impl Store for StoreDirect {
     }
 
     fn get_current_size(&self) -> u64 {
+        // A closed store reports 0. The shared commit barrier excludes close
+        // (which holds it exclusively while it empties the volume), so the
+        // closed re-check under it cannot race a concurrent close.
+        let Ok(_c) = self.mutate_enter() else {
+            return 0;
+        };
         let _s = self.structural();
         let ft = self.file_tail().unwrap_or(0) as i64;
         (ft - self.free_data_bytes.load(Ordering::Relaxed)).max(0) as u64
