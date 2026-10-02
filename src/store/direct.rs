@@ -1687,8 +1687,12 @@ impl Store for StoreDirect {
         if stamp {
             let tail = self.file_tail()?;
             self.stamp_header_durable()?;
+            // Structural lock (commit -> structural order) while the volume is
+            // emptied: get_current_size reads it under this lock alone.
+            let _s = self.structural();
             self.vol.close(Some(tail))?;
         } else {
+            let _s = self.structural();
             self.vol.close(None)?;
         }
         self.index_pages.store(Arc::new(Vec::new()));
@@ -1748,13 +1752,16 @@ impl Store for StoreDirect {
     }
 
     fn get_current_size(&self) -> u64 {
-        // A closed store reports 0. The shared commit barrier excludes close
-        // (which holds it exclusively while it empties the volume), so the
-        // closed re-check under it cannot race a concurrent close.
-        let Ok(_c) = self.mutate_enter() else {
-            return 0;
-        };
+        // A closed store reports 0. close() publishes `closed` before it takes
+        // the structural lock to empty the volume, so `closed` read false
+        // under that lock means the slices stay until it is released. No
+        // commit barrier here: serializer callbacks run under its read side
+        // and may query the size, and a nested read queues behind a waiting
+        // close()/commit() writer (deadlock).
         let _s = self.structural();
+        if self.closed.load(Ordering::Acquire) {
+            return 0;
+        }
         let ft = self.file_tail().unwrap_or(0) as i64;
         (ft - self.free_data_bytes.load(Ordering::Relaxed)).max(0) as u64
     }
